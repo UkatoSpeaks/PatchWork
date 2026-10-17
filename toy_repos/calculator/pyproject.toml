@@ -1,0 +1,9 @@
+[project]
+name = "calculator"
+version = "0.1.0"
+description = "Toy package with planted bugs, used to exercise the Patchwork coder agent."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
