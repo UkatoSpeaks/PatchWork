@@ -130,11 +130,14 @@ class Agent:
         max_steps: int = 25,
         max_tokens: int = 60_000,
         max_output_tokens: int = 1024,
-        tool_choice: str | None = "required",
+        tool_choice: str | None = "auto",
         keep_recent_tool_results: int = 3,
         max_tool_output_chars: int = 8_000,
+        verify_finish: Callable[[], str | None] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
+        """``verify_finish`` checks a claimed success independently of the model:
+        it returns None to accept, or a reason that is fed back to the model."""
         names = [t.name for t in tools]
         if FINISH_TOOL in names:
             raise ValueError(f"'{FINISH_TOOL}' is reserved")
@@ -151,6 +154,7 @@ class Agent:
         self.tool_choice = tool_choice
         self.keep_recent_tool_results = keep_recent_tool_results
         self.max_tool_output_chars = max_tool_output_chars
+        self.verify_finish = verify_finish
         self.on_event = on_event
         self._schemas = [t.schema() for t in tools] + [FINISH.schema()]
 
@@ -176,6 +180,7 @@ class Agent:
                 stop_reason=reason,
             )
 
+        text_only_streak = 0
         while step < self.max_steps:
             if usage.total_tokens >= self.max_tokens:
                 return result(
@@ -191,29 +196,57 @@ class Agent:
                     tool_choice=self.tool_choice,
                     max_tokens=self.max_output_tokens,
                 )
-            except MalformedToolCall:
-                self._emit(step, usage, "notice", summary="malformed tool call rejected by provider; retrying", is_error=True)
-                messages.append({"role": "user", "content": "Your last tool call was malformed. Call one tool with valid JSON arguments."})
-                continue
+            except MalformedToolCall as exc:
+                if exc.failed_generation is None:
+                    self._emit(step, usage, "notice", summary="malformed tool call rejected by provider; retrying", is_error=True)
+                    messages.append({"role": "user", "content": "Your last tool call was malformed. Call one tool with valid JSON arguments."})
+                    continue
+                # Handle what the model actually wrote like any text-only reply.
+                response = LLMResponse(model=self.model, content=exc.failed_generation)
             except Exception as exc:
                 self._emit(step, usage, "notice", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
 
             usage = usage + response.usage
-            if response.content and response.content.strip():
-                self._emit(step, usage, "thought", summary=_preview(response.content))
             messages.append(response.to_message())
+            text = (response.content or "").strip()
 
             if not response.tool_calls:
-                messages.append({"role": "user", "content": f"Respond with a tool call. Call `{FINISH_TOOL}` when you are done."})
+                text_only_streak += 1
+                finish = _finish_from_text(text)
+                if finish is not None:
+                    rejection = self._reject_finish(finish)
+                    if rejection is None:
+                        self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=finish.summary, is_error=not finish.success)
+                        return result(finish.success, finish.summary, "finished")
+                    self._emit(step, usage, "notice", summary=f"finish rejected: {rejection}", is_error=True)
+                    messages.append({"role": "user", "content": f"finish rejected: {rejection}"})
+                    continue
+                if text and text_only_streak >= 2:
+                    # Some models (e.g. gpt-oss) end with a prose answer instead of
+                    # calling finish. Accept it, but success comes from the verifier.
+                    success = self.verify_finish is not None and self.verify_finish() is None
+                    self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=_preview(text), is_error=not success)
+                    return result(success, text, "finished")
+                if text:
+                    self._emit(step, usage, "thought", summary=_preview(text))
+                messages.append({"role": "user", "content": f"If the task is done, call `{FINISH_TOOL}`. Otherwise call the next tool."})
                 continue
 
+            text_only_streak = 0
+            if text:
+                self._emit(step, usage, "thought", summary=_preview(text))
             for call in response.tool_calls:
                 if call.name == FINISH_TOOL and call.parse_error is None:
                     try:
                         finish = FinishArgs.model_validate(call.arguments)
                     except ValidationError as exc:
                         messages.append(_tool_message(call.id, f"ERROR: {_format_validation(exc)}"))
+                        continue
+                    rejection = self._reject_finish(finish)
+                    if rejection is not None:
+                        self._emit(step, usage, "notice", summary=f"finish rejected: {rejection}", is_error=True)
+                        messages.append(_tool_message(call.id, f"ERROR: finish rejected: {rejection}"))
                         continue
                     self._emit(step, usage, "finish", tool=FINISH_TOOL, arguments=call.arguments, summary=finish.summary, is_error=not finish.success)
                     return result(finish.success, finish.summary, "finished")
@@ -234,6 +267,12 @@ class Agent:
                 )
 
         return result(False, f"Stopped: reached the limit of {self.max_steps} steps.", "max_steps")
+
+    def _reject_finish(self, finish: FinishArgs) -> str | None:
+        """Why a claimed success is not accepted, or None to accept the finish."""
+        if finish.success and self.verify_finish is not None:
+            return self.verify_finish()
+        return None
 
     async def _execute(self, name: str, arguments: dict[str, Any], parse_error: str | None) -> ToolOutput:
         tool = self.tools.get(name)
@@ -299,9 +338,26 @@ def _shrink_call(call: dict[str, Any], limit: int = 200) -> dict[str, Any]:
     return {**call, "function": {**call["function"], "arguments": json.dumps(shrunk)}}
 
 
+def _finish_from_text(text: str) -> FinishArgs | None:
+    """Recognise finish arguments written as plain JSON text instead of a tool call."""
+    candidate = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    if not candidate.startswith("{"):
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and data.get("name") == FINISH_TOOL:
+        data = data.get("arguments") or data.get("parameters") or {}
+    try:
+        return FinishArgs.model_validate(data)
+    except ValidationError:
+        return None
+
+
 def _preview(text: str, limit: int = 160) -> str:
     flat = " ".join(text.split())
-    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
 def _format_validation(exc: ValidationError) -> str:

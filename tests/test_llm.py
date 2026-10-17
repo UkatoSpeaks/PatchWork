@@ -112,8 +112,21 @@ def test_groq_tool_use_failed_becomes_malformed_tool_call():
     exc = Exception("GroqException - {'code': 'tool_use_failed'}")
     exc.status_code = 400
     client, _ = make_client([exc])
-    with pytest.raises(MalformedToolCall):
+    with pytest.raises(MalformedToolCall) as info:
         asyncio.run(client.complete("m", []))
+    assert info.value.failed_generation is None
+
+
+def test_tool_use_failed_exposes_failed_generation():
+    exc = Exception(
+        'litellm.BadRequestError: GroqException - {"error":{"message":"Tool choice is required",'
+        '"code":"tool_use_failed","failed_generation":"All tests pass."}}\n LiteLLM Retried: 3 times'
+    )
+    exc.status_code = 400
+    client, _ = make_client([exc])
+    with pytest.raises(MalformedToolCall) as info:
+        asyncio.run(client.complete("m", []))
+    assert info.value.failed_generation == "All tests pass."
 
 
 def test_parses_tool_calls_and_tracks_tokens():

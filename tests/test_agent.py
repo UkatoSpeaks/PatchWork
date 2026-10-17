@@ -149,6 +149,49 @@ def test_text_only_reply_gets_nudged():
     assert events[0].kind == "thought"
 
 
+def test_finish_written_as_json_text_is_accepted():
+    llm = ScriptedLLM([reply(content='```json\n{"success": true, "summary": "fixed it"}\n```')])
+    result = run(make_agent(llm))
+    assert (result.success, result.summary, result.stop_reason) == (True, "fixed it", "finished")
+
+
+def test_repeated_prose_is_taken_as_final_answer_and_verified():
+    for verified, expected in [(True, True), (False, False)]:
+        llm = ScriptedLLM([reply(content="All tests pass now."), reply(content="Done: fixed subtract.")])
+        result = run(make_agent(llm, verify_finish=lambda: None if verified else "tests not run"))
+        assert result.stop_reason == "finished"
+        assert result.summary == "Done: fixed subtract."
+        assert result.success is expected
+
+
+def test_verifier_rejects_claimed_success_and_agent_continues():
+    gate = {"ok": False}
+
+    def fix(args: EchoArgs) -> str:
+        gate["ok"] = True
+        return "fixed"
+
+    tools = [Tool(name="fix", description="Fix.", args_model=EchoArgs, handler=fix)]
+    llm = ScriptedLLM([finish(), reply(("fix", {"text": "x"})), finish()])
+    result = run(make_agent(llm, tools=tools, verify_finish=lambda: None if gate["ok"] else "not fixed yet"))
+    assert result.success
+    assert result.steps_used == 3
+    assert llm.requests[1][-1]["content"] == "ERROR: finish rejected: not fixed yet"
+
+
+def test_verifier_does_not_block_reporting_failure():
+    llm = ScriptedLLM([finish(success=False, summary="stuck")])
+    result = run(make_agent(llm, verify_finish=lambda: "never verified"))
+    assert (result.success, result.summary) == (False, "stuck")
+
+
+def test_rejected_generation_is_used_as_the_reply():
+    exc = MalformedToolCall("tool_use_failed", failed_generation='{"success": true, "summary": "done via text"}')
+    llm = ScriptedLLM([exc])
+    result = run(make_agent(llm))
+    assert (result.success, result.summary) == (True, "done via text")
+
+
 def test_malformed_tool_call_from_provider_is_retried():
     llm = ScriptedLLM([MalformedToolCall("tool_use_failed"), finish()])
     result = run(make_agent(llm))
@@ -198,14 +241,20 @@ def test_coder_agent_fixes_toy_repo_with_scripted_llm(tmp_path: Path):
         ),
         reply(("run_tests", {"path": "tests/test_ops.py::test_subtract"})),
         reply(("run_tests", {"path": "tests/test_ops.py"})),
-        finish(summary="fixed subtract and divide"),
+        # Only a subset has passed so far, so a claimed success is rejected...
+        finish(summary="too early"),
+        reply(("edit_file", {"path": "calculator/stats.py", "old": "len(values) - 1", "new": "len(values)"})),
+        reply(("run_tests", {})),
+        # ...and accepted once the full suite passes.
+        finish(summary="fixed subtract, divide and mean"),
     ])
     settings = Settings(_env_file=None, max_steps_per_agent=10)
     agent = build_coder(repo=repo, settings=settings, llm=llm)
     result = asyncio.run(agent.run(build_task(repo, "subtract is wrong")))
 
     assert result.success
-    assert result.files_changed == ["calculator/ops.py"]
+    assert result.summary == "fixed subtract, divide and mean"
+    assert result.files_changed == ["calculator/ops.py", "calculator/stats.py"]
     tool_results = [m["content"] for m in llm.requests[-1] if m["role"] == "tool"]
     assert tool_results[0] == "calculator/ops.py:9: def subtract(a, b):"
     assert "return b - a" in tool_results[1]
@@ -213,5 +262,7 @@ def test_coder_agent_fixes_toy_repo_with_scripted_llm(tmp_path: Path):
     assert tool_results[3] == "edited calculator/ops.py at line 23"
     assert tool_results[4].startswith("PASSED: 1 passed")
     assert tool_results[5].startswith("PASSED: 5 passed")
+    assert tool_results[6].startswith("ERROR: finish rejected: the full test suite has not passed")
+    assert tool_results[8].startswith("PASSED: 8 passed")
     source = (repo / "calculator" / "ops.py").read_text()
     assert "return a - b" in source and "return a / b" in source

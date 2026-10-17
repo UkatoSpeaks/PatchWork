@@ -54,17 +54,35 @@ class RunTestsArgs(BaseModel):
     path: str | None = Field(default=None, description="optional test file, dir or node id; default runs all")
 
 
-def build_tools(repo: Path, test_command: str, test_timeout: float) -> list[Tool]:
+class TestGate:
+    """Success counts only if the full suite passed after the last file change."""
+
+    __test__ = False  # not a pytest test class
+
+    def __init__(self) -> None:
+        self.verified = False
+
+    def check(self) -> str | None:
+        if self.verified:
+            return None
+        return "the full test suite has not passed since your last edit; call run_tests with no path"
+
+
+def build_tools(repo: Path, test_command: str, test_timeout: float, gate: TestGate | None = None) -> list[Tool]:
+    gate = gate or TestGate()
+
     def read_file(args: ReadFileArgs) -> ToolOutput:
         text = fs.read_file(repo, args.path, offset=args.offset)
         return ToolOutput(content=text, summary=text.rsplit("\n", 1)[-1].strip("[]"))
 
     def write_file(args: WriteFileArgs) -> ToolOutput:
         message = fs.write_file(repo, args.path, args.content)
+        gate.verified = False
         return ToolOutput(content=message, files_changed=[fs.to_relative(repo, args.path)])
 
     def edit_file(args: EditFileArgs) -> ToolOutput:
         message = fs.edit_file(repo, args.path, args.old, args.new)
+        gate.verified = False
         return ToolOutput(content=message, files_changed=[fs.to_relative(repo, args.path)])
 
     def list_dir(args: ListDirArgs) -> ToolOutput:
@@ -83,11 +101,13 @@ def build_tools(repo: Path, test_command: str, test_timeout: float) -> list[Tool
 
     def run_tests(args: RunTestsArgs) -> ToolOutput:
         extra = []
-        if args.path:
+        if args.path and args.path.strip() not in ("", "."):
             # Allow pytest node ids (file.py::test_name); only the file part is a path.
             file_part, sep, node = args.path.partition("::")
             extra = [fs.to_relative(repo, file_part) + sep + node]
         result = shell.run_tests(repo, test_command, timeout=test_timeout, extra_args=extra)
+        if not extra:
+            gate.verified = result.passed
         return ToolOutput(content=result.render(), summary=result.summary_line(), is_error=not result.passed)
 
     return [
@@ -109,11 +129,13 @@ def build_coder(
     on_event: EventCallback | None = None,
 ) -> Agent:
     repo = Path(repo).resolve(strict=True)
+    gate = TestGate()
     return Agent(
         role=ROLE,
         model=settings.model_for(ROLE),
         system_prompt=SYSTEM_PROMPT,
-        tools=build_tools(repo, test_command or settings.test_command, settings.test_timeout_seconds),
+        tools=build_tools(repo, test_command or settings.test_command, settings.test_timeout_seconds, gate),
+        verify_finish=gate.check,
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,
