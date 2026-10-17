@@ -22,10 +22,10 @@ class Settings(BaseSettings):
     groq_api_key: SecretStr | None = None
 
     # One model per agent role, so models can be swapped without code changes.
-    lead_model: str = "groq/llama-3.3-70b-versatile"
-    coder_model: str = "groq/llama-3.3-70b-versatile"
-    tester_model: str = "groq/llama-3.1-8b-instant"
-    reviewer_model: str = "groq/llama-3.3-70b-versatile"
+    lead_model: str = "groq/openai/gpt-oss-120b"
+    coder_model: str = "groq/openai/gpt-oss-120b"
+    tester_model: str = "groq/openai/gpt-oss-20b"
+    reviewer_model: str = "groq/openai/gpt-oss-120b"
 
     # Agent budgets
     max_steps_per_agent: int = Field(default=25, ge=1)

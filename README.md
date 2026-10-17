@@ -18,7 +18,7 @@ All settings are read from `.env` (or real environment variables). See `.env.exa
 | Variable | Default | Purpose |
 |---|---|---|
 | `GROQ_API_KEY` | none | Required for `groq/` models |
-| `LEAD_MODEL` / `CODER_MODEL` / `TESTER_MODEL` / `REVIEWER_MODEL` | `groq/llama-3.3-70b-versatile` (tester: `groq/llama-3.1-8b-instant`) | Model for each role, as LiteLLM model strings. Only `CODER_MODEL` is used today. |
+| `LEAD_MODEL` / `CODER_MODEL` / `TESTER_MODEL` / `REVIEWER_MODEL` | `groq/openai/gpt-oss-120b` (tester: `groq/openai/gpt-oss-20b`) | Model for each role, as LiteLLM model strings. Only `CODER_MODEL` is used today. |
 | `MAX_STEPS_PER_AGENT` | 25 | LLM turns before the agent gives up |
 | `MAX_TOKENS_PER_RUN` | 60000 | Prompt + completion token budget for one agent run |
 | `MAX_OUTPUT_TOKENS` | 1024 | `max_tokens` for each LLM call |
