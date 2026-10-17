@@ -1,4 +1,4 @@
-"""Agent roles. Milestone 1 ships only the coder."""
+"""Agent roles: lead, tester, coder and reviewer."""
 
 from patchwork.agents.base import Agent, AgentEvent, AgentResult, Tool, ToolOutput
 

@@ -1,49 +1,18 @@
 """Agent loop tests with a scripted (mocked) LLM."""
 
 import asyncio
-import copy
 import shutil
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel
 
 from patchwork.agents.base import ELIDED_MARK, Agent, AgentEvent, Tool, ToolOutput
 from patchwork.agents.coder import build_coder, build_task
 from patchwork.config import Settings
-from patchwork.llm import LLMResponse, MalformedToolCall, TokenUsage, ToolCall
+from patchwork.llm import LLMResponse, MalformedToolCall, ToolCall
 
 from conftest import TOY_CALCULATOR
-
-
-class ScriptedLLM:
-    """Returns pre-baked responses in order and records what it was sent."""
-
-    def __init__(self, responses: list[LLMResponse | Exception]):
-        self.responses = list(responses)
-        self.requests: list[list[dict[str, Any]]] = []
-        self.tools_sent: list[list[dict[str, Any]]] = []
-
-    async def complete(self, model, messages, tools=None, *, tool_choice=None, max_tokens=None):
-        self.requests.append(copy.deepcopy(messages))
-        self.tools_sent.append(tools)
-        item = self.responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-
-def reply(*calls: tuple[str, dict[str, Any]], content: str | None = None, prompt=100, completion=10) -> LLMResponse:
-    return LLMResponse(
-        model="fake",
-        content=content,
-        tool_calls=[ToolCall(id=f"call_{i}", name=name, arguments=args) for i, (name, args) in enumerate(calls)],
-        usage=TokenUsage(prompt_tokens=prompt, completion_tokens=completion),
-    )
-
-
-def finish(success=True, summary="done") -> LLMResponse:
-    return reply(("finish", {"success": success, "summary": summary}))
+from scripted import ScriptedLLM, finish, reply
 
 
 class EchoArgs(BaseModel):

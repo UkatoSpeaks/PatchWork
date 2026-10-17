@@ -1,0 +1,9 @@
+[project]
+name = "stats"
+version = "0.1.0"
+description = "Toy package with a passing suite and a feature request, used to exercise the Patchwork crew."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

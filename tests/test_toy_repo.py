@@ -6,7 +6,7 @@ from pathlib import Path
 from patchwork.tools import fs
 from patchwork.tools.shell import run_tests
 
-from conftest import TOY_CALCULATOR
+from conftest import TOY_CALCULATOR, TOY_STATS, copy_toy
 
 COMMAND = "python -m pytest -q -p no:cacheprovider"
 
@@ -30,3 +30,11 @@ def test_toy_calculator_passes_once_fixed(tmp_path: Path):
     fs.edit_file(repo, "calculator/stats.py", "len(values) - 1", "len(values)")
     result = run_tests(repo, COMMAND)
     assert result.passed, result.render()
+
+
+def test_toy_stats_passes_and_has_no_median(tmp_path: Path):
+    repo = copy_toy(TOY_STATS, tmp_path)
+    result = run_tests(repo, COMMAND)
+    assert result.passed, result.render()
+    assert "6 passed" in result.stdout
+    assert not fs.search_code(repo, r"def median")
