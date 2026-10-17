@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -29,6 +30,10 @@ def run(
     max_steps: Annotated[int | None, typer.Option(min=1, help="Override MAX_STEPS_PER_AGENT.")] = None,
 ) -> None:
     """Run the coder agent on REPO to fix ISSUE."""
+    # Model output can contain characters the console encoding lacks; don't crash on them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     settings = Settings()
     if max_steps is not None:
         settings = settings.model_copy(update={"max_steps_per_agent": max_steps})
@@ -77,7 +82,7 @@ def _format_args(arguments: dict[str, Any], limit: int = 40) -> str:
     for key, value in arguments.items():
         text = repr(value)
         if len(text) > limit:
-            text = text[: limit - 4] + "…" + text[-3:]
+            text = text[: limit - 6] + "..." + text[-3:]
         parts.append(f"{key}={text}")
     return ", ".join(parts)
 

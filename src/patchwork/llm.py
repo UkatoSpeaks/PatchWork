@@ -91,7 +91,15 @@ class RateLimitExhausted(LLMError):
 
 
 class MalformedToolCall(LLMError):
-    """The provider rejected the model's tool call as unparseable (Groq: tool_use_failed)."""
+    """The provider rejected the model's output as a bad tool call (Groq: tool_use_failed).
+
+    ``failed_generation`` is what the model actually produced, when the provider
+    reports it; often it is a final answer written as text instead of a tool call.
+    """
+
+    def __init__(self, message: str, failed_generation: str | None = None) -> None:
+        super().__init__(message)
+        self.failed_generation = failed_generation
 
 
 class LLMClient:
@@ -158,7 +166,7 @@ class LLMClient:
                 break
             except Exception as exc:
                 if _is_tool_use_failed(exc):
-                    raise MalformedToolCall(str(exc)) from exc
+                    raise MalformedToolCall(str(exc), _failed_generation(exc)) from exc
                 if not _is_rate_limit(exc):
                     raise
                 if attempt >= self.max_retries:
@@ -213,6 +221,21 @@ def _is_rate_limit(exc: BaseException) -> bool:
 
 def _is_tool_use_failed(exc: BaseException) -> bool:
     return _status_code(exc) == 400 and "tool_use_failed" in str(exc)
+
+
+def _failed_generation(exc: BaseException) -> str | None:
+    """Pull ``error.failed_generation`` out of a 'GroqException - {json}' message."""
+    text = str(exc)
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        body, _ = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    generation = error.get("failed_generation") if isinstance(error, dict) else None
+    return generation if isinstance(generation, str) and generation.strip() else None
 
 
 def _headers_of(exc: BaseException) -> dict[str, str]:
