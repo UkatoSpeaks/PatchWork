@@ -4,6 +4,10 @@ An ``Agent`` repeatedly calls the LLM, executes the tool calls it asks for and
 feeds the results back, until it calls the built-in ``finish`` tool or runs out
 of steps or tokens. Roles (coder, tester, reviewer, lead) differ only in their
 model, system prompt and tool list.
+
+Agents that must return structured data (the lead's plan, the reviewer's
+verdict) get a ``SubmitSpec``: they end by calling a submit tool whose
+arguments are validated against a pydantic model, with a few retries.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ class Tool(BaseModel):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": _strip_titles(self.args_model.model_json_schema()),
+                "parameters": _json_schema(self.args_model),
             },
         }
 
@@ -75,6 +79,27 @@ FINISH = Tool(
 )
 
 
+class SubmitSpec(BaseModel):
+    """A structured final answer: the agent ends by calling ``name`` with
+    arguments that validate against ``schema_model``. Invalid arguments are
+    sent back with the validation error, up to ``max_retries`` times."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    name: str
+    description: str
+    schema_model: type[BaseModel]
+    max_retries: int = 2
+    # Field of the validated payload used as the AgentResult summary.
+    summary_field: str = "summary"
+
+    def schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {"name": self.name, "description": self.description, "parameters": _json_schema(self.schema_model)},
+        }
+
+
 class AgentEvent(BaseModel):
     """Emitted as the agent works, for live logging."""
 
@@ -88,7 +113,7 @@ class AgentEvent(BaseModel):
     tokens_used: int = 0
 
 
-StopReason = Literal["finished", "max_steps", "max_tokens", "error"]
+StopReason = Literal["finished", "max_steps", "max_tokens", "invalid_output", "error"]
 
 
 class AgentResult(BaseModel):
@@ -101,6 +126,8 @@ class AgentResult(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     stop_reason: StopReason
+    # The validated submit payload, for agents with a SubmitSpec.
+    output: dict[str, Any] | None = None
 
 
 class SupportsComplete(Protocol):
@@ -134,13 +161,18 @@ class Agent:
         keep_recent_tool_results: int = 3,
         max_tool_output_chars: int = 8_000,
         verify_finish: Callable[[], str | None] | None = None,
+        submit: SubmitSpec | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         """``verify_finish`` checks a claimed success independently of the model:
-        it returns None to accept, or a reason that is fed back to the model."""
+        it returns None to accept, or a reason that is fed back to the model.
+
+        With ``submit``, success is reported only through the submit tool;
+        ``finish`` remains available for giving up (success=false)."""
         names = [t.name for t in tools]
-        if FINISH_TOOL in names:
-            raise ValueError(f"'{FINISH_TOOL}' is reserved")
+        reserved = {FINISH_TOOL} | ({submit.name} if submit else set())
+        if reserved & set(names):
+            raise ValueError(f"reserved tool names: {sorted(reserved & set(names))}")
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate tool names: {names}")
         self.role = role
@@ -155,8 +187,9 @@ class Agent:
         self.keep_recent_tool_results = keep_recent_tool_results
         self.max_tool_output_chars = max_tool_output_chars
         self.verify_finish = verify_finish
+        self.submit = submit
         self.on_event = on_event
-        self._schemas = [t.schema() for t in tools] + [FINISH.schema()]
+        self._schemas = [t.schema() for t in tools] + ([submit.schema()] if submit else []) + [FINISH.schema()]
 
     async def run(self, task: str) -> AgentResult:
         messages: list[dict[str, Any]] = [
@@ -167,7 +200,7 @@ class Agent:
         files_changed: list[str] = []
         step = 0
 
-        def result(success: bool, summary: str, reason: StopReason) -> AgentResult:
+        def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
             return AgentResult(
                 role=self.role,
                 success=success,
@@ -178,8 +211,30 @@ class Agent:
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
                 stop_reason=reason,
+                output=output.model_dump() if output is not None else None,
             )
 
+        def submitted(payload: BaseModel, arguments: dict[str, Any]) -> AgentResult:
+            summary = str(getattr(payload, self.submit.summary_field, "") or f"called {self.submit.name}")
+            self._emit(step, usage, "finish", tool=self.submit.name, arguments=arguments, summary=_preview(summary))
+            return result(True, summary, "finished", payload)
+
+        def invalid_submit(error: str) -> tuple[AgentResult | None, str]:
+            """Count a failed submit. Returns the final result once retries run out,
+            otherwise the feedback for the model."""
+            nonlocal invalid_submits
+            invalid_submits += 1
+            left = self.submit.max_retries - invalid_submits + 1
+            self._emit(step, usage, "notice", summary=f"{self.submit.name} rejected: {error}", is_error=True)
+            if left <= 0:
+                summary = f"{self.submit.name} failed validation {invalid_submits} times; last error: {error}"
+                return result(False, summary, "invalid_output"), ""
+            return None, (
+                f"ERROR: {self.submit.name} arguments are invalid: {error}. "
+                f"Fix them and call {self.submit.name} again ({left} retries left)."
+            )
+
+        invalid_submits = 0
         text_only_streak = 0
         while step < self.max_steps:
             if usage.total_tokens >= self.max_tokens:
@@ -213,7 +268,20 @@ class Agent:
 
             if not response.tool_calls:
                 text_only_streak += 1
-                finish = _finish_from_text(text)
+                data = _json_from_text(text)
+                if self.submit is not None and data is not None and not _looks_like_finish(data):
+                    # The submit arguments written as plain JSON text.
+                    if data.get("name") == self.submit.name:
+                        data = data.get("arguments") or data.get("parameters") or {}
+                    payload, error = self._validate_submit(data)
+                    if payload is not None:
+                        return submitted(payload, data)
+                    final, feedback = invalid_submit(error)
+                    if final is not None:
+                        return final
+                    messages.append({"role": "user", "content": feedback})
+                    continue
+                finish = _finish_from_args(data) if data is not None else None
                 if finish is not None:
                     rejection = self._reject_finish(finish)
                     if rejection is None:
@@ -222,7 +290,7 @@ class Agent:
                     self._emit(step, usage, "notice", summary=f"finish rejected: {rejection}", is_error=True)
                     messages.append({"role": "user", "content": f"finish rejected: {rejection}"})
                     continue
-                if text and text_only_streak >= 2:
+                if text and text_only_streak >= 2 and self.submit is None:
                     # Some models (e.g. gpt-oss) end with a prose answer instead of
                     # calling finish. Accept it, but success comes from the verifier.
                     success = self.verify_finish is not None and self.verify_finish() is None
@@ -230,13 +298,26 @@ class Agent:
                     return result(success, text, "finished")
                 if text:
                     self._emit(step, usage, "thought", summary=_preview(text))
-                messages.append({"role": "user", "content": f"If the task is done, call `{FINISH_TOOL}`. Otherwise call the next tool."})
+                done_tool = self.submit.name if self.submit else FINISH_TOOL
+                messages.append({"role": "user", "content": f"If the task is done, call `{done_tool}`. Otherwise call the next tool."})
                 continue
 
             text_only_streak = 0
             if text:
                 self._emit(step, usage, "thought", summary=_preview(text))
             for call in response.tool_calls:
+                if self.submit is not None and call.name == self.submit.name:
+                    if call.parse_error:
+                        payload, error = None, f"arguments were not valid JSON: {call.parse_error}"
+                    else:
+                        payload, error = self._validate_submit(call.arguments)
+                    if payload is not None:
+                        return submitted(payload, call.arguments)
+                    final, feedback = invalid_submit(error)
+                    if final is not None:
+                        return final
+                    messages.append(_tool_message(call.id, feedback))
+                    continue
                 if call.name == FINISH_TOOL and call.parse_error is None:
                     try:
                         finish = FinishArgs.model_validate(call.arguments)
@@ -270,9 +351,17 @@ class Agent:
 
     def _reject_finish(self, finish: FinishArgs) -> str | None:
         """Why a claimed success is not accepted, or None to accept the finish."""
+        if finish.success and self.submit is not None:
+            return f"report your result by calling {self.submit.name}; use {FINISH_TOOL} only with success=false to give up"
         if finish.success and self.verify_finish is not None:
             return self.verify_finish()
         return None
+
+    def _validate_submit(self, arguments: dict[str, Any]) -> tuple[BaseModel | None, str]:
+        try:
+            return self.submit.schema_model.model_validate(arguments), ""
+        except ValidationError as exc:
+            return None, _format_validation(exc)
 
     async def _execute(self, name: str, arguments: dict[str, Any], parse_error: str | None) -> ToolOutput:
         tool = self.tools.get(name)
@@ -338,8 +427,8 @@ def _shrink_call(call: dict[str, Any], limit: int = 200) -> dict[str, Any]:
     return {**call, "function": {**call["function"], "arguments": json.dumps(shrunk)}}
 
 
-def _finish_from_text(text: str) -> FinishArgs | None:
-    """Recognise finish arguments written as plain JSON text instead of a tool call."""
+def _json_from_text(text: str) -> dict[str, Any] | None:
+    """A JSON object written as plain text (e.g. tool arguments) instead of a tool call."""
     candidate = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     if not candidate.startswith("{"):
         return None
@@ -347,7 +436,16 @@ def _finish_from_text(text: str) -> FinishArgs | None:
         data = json.loads(candidate)
     except json.JSONDecodeError:
         return None
-    if isinstance(data, dict) and data.get("name") == FINISH_TOOL:
+    return data if isinstance(data, dict) else None
+
+
+def _looks_like_finish(data: dict[str, Any]) -> bool:
+    return data.get("name") == FINISH_TOOL or (bool(data) and set(data) <= set(FinishArgs.model_fields))
+
+
+def _finish_from_args(data: dict[str, Any]) -> FinishArgs | None:
+    """Recognise finish arguments written as plain JSON text instead of a tool call."""
+    if data.get("name") == FINISH_TOOL:
         data = data.get("arguments") or data.get("parameters") or {}
     try:
         return FinishArgs.model_validate(data)
@@ -364,6 +462,25 @@ def _format_validation(exc: ValidationError) -> str:
     return "; ".join(
         f"{'.'.join(str(p) for p in err['loc']) or 'arguments'}: {err['msg']}" for err in exc.errors()
     )
+
+
+def _json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """Tool-parameter schema for ``model``: titles stripped and nested models
+    inlined, since some providers handle ``$ref`` poorly."""
+    schema = model.model_json_schema()
+    defs = schema.pop("$defs", {})
+    return _strip_titles(_inline_refs(schema, defs))
+
+
+def _inline_refs(schema: Any, defs: dict[str, Any]) -> Any:
+    if isinstance(schema, dict):
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            return _inline_refs(defs[ref.removeprefix("#/$defs/")], defs)
+        return {key: _inline_refs(value, defs) for key, value in schema.items()}
+    if isinstance(schema, list):
+        return [_inline_refs(item, defs) for item in schema]
+    return schema
 
 
 def _strip_titles(schema: Any, in_properties: bool = False) -> Any:
