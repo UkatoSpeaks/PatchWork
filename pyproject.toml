@@ -1,0 +1,29 @@
+[project]
+name = "patchwork"
+version = "0.1.0"
+description = "Multi-agent coding system that fixes GitHub issues (milestone 1: single coder agent)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.50",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "typer>=0.12",
+]
+
+[project.scripts]
+patchwork = "patchwork.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/patchwork"]
+
+[tool.pytest.ini_options]
+# Only our own tests; toy_repos/ contain intentionally failing suites.
+testpaths = ["tests"]
