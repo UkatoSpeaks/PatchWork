@@ -22,7 +22,7 @@ You are the coder agent in Patchwork. You fix bugs and implement small features 
 Workflow:
 1. Locate before reading: use search_code to find the functions, names or error text from the issue. Then read_file only the files (and line ranges, via offset) you need. Read each file once; its content stays in your context.
 2. Find the root cause. Make the smallest change that fixes it. Prefer edit_file over write_file. Do not refactor, reformat, rename or touch unrelated code. Do not change tests unless the issue says they are wrong. Tests written by the tester agent are read-only for you: make them pass by changing the code.
-3. To add a new function, insert it as a complete new block: use edit_file with `old` set to the last lines of the function it should follow (or the end of the file) and `new` set to those same lines plus the new function. Never replace an existing `def` line. If the package's __init__.py re-exports names or defines __all__, export the new name there too.
+3. To add a new function, use insert_lines with after_line=-1 (end of file) or after the last line of an existing block, starting the text with two blank lines. Never replace an existing `def` line, and do not use a blank line or other non-unique text as an edit_file anchor. If the package's __init__.py re-exports names or defines __all__, export the new name there too.
 4. Always run run_tests before finishing. If tests fail, read the failure, fix, and re-run.
 5. Call finish with success=true only after the full test suite passes. If you cannot fix it, call finish with success=false and say what blocks you.
 
@@ -33,13 +33,13 @@ Be terse. Do not explain between tool calls; just call the next tool."""
 class TestGate:
     """Success counts only if the full suite passed after the last file change.
 
-    Also nudges the agent when it has edited files but not run any tests for
-    a while.
+    Also nudges the agent when 5 steps have passed since its first edit after
+    the last test run.
     """
 
     __test__ = False  # not a pytest test class
     NUDGE_AFTER_STEPS = 5
-    NUDGE = "System note: you have edited files but not run the tests in the last 5 steps. Call run_tests now."
+    NUDGE = "System note: you edited files 5 steps ago and have not run the tests since. Call run_tests now."
     GIVE_UP_TOO_EARLY = (
         "Not yet: you have not edited any file or run the tests. Explore the repo (list_dir, search_code, "
         "read_file), attempt a fix, and run run_tests. If you still cannot fix it after that, you may give up."
@@ -48,8 +48,8 @@ class TestGate:
     def __init__(self) -> None:
         self.verified = False
         self.step = 0
-        self.untested_edits = False
-        self.last_test_step = 0
+        # Step of the first edit since the last test run, if any.
+        self.first_untested_edit_step: int | None = None
         self.last_nudge_step = 0
         self.attempted = False
         self.give_up_rejected = False
@@ -68,19 +68,20 @@ class TestGate:
 
     def edited(self, rel: str) -> None:
         self.verified = False
-        self.untested_edits = True
+        if self.first_untested_edit_step is None:
+            self.first_untested_edit_step = self.step
         self.attempted = True
 
     def tested(self, result: shell.RunTestsResult, target: str | None) -> None:
         if target is None:
             self.verified = result.passed
-        self.untested_edits = False
-        self.last_test_step = self.step
+        self.first_untested_edit_step = None
         self.attempted = True
 
     def nudge(self, step: int) -> str | None:
         self.step = step
-        if self.untested_edits and step - max(self.last_test_step, self.last_nudge_step) > self.NUDGE_AFTER_STEPS:
+        first = self.first_untested_edit_step
+        if first is not None and step - max(first, self.last_nudge_step) > self.NUDGE_AFTER_STEPS:
             self.last_nudge_step = step
             return self.NUDGE
         return None

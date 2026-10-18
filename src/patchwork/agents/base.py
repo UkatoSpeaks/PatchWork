@@ -17,8 +17,9 @@ import inspect
 import json
 import re
 from collections.abc import Callable
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
+import json_repair
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from patchwork.llm import LLMResponse, MalformedToolCall, TokenUsage, ToolCall
@@ -38,6 +39,11 @@ class ToolOutput(BaseModel):
     # key stays in full in the history, older ones are stubbed, and an identical
     # repeat is replaced by a pointer to the earlier result.
     view_key: str | None = None
+    # For views of data that can change (a file): a fingerprint of the data and
+    # the 1-based line span shown. A later view of the same key and version
+    # whose span is already covered gets the short note instead.
+    view_version: str | None = None
+    view_span: tuple[int, int] | None = None
     # Set by a tool that has itself verified the task is complete: the run ends
     # with success and this summary.
     finish_summary: str | None = None
@@ -153,6 +159,31 @@ class SupportsComplete(Protocol):
 
 
 EventCallback = Callable[[AgentEvent], None]
+
+
+class _View(NamedTuple):
+    key: str
+    step: int
+    version: str | None
+    span: tuple[int, int] | None
+
+
+def _covers(old: _View, new: _View) -> bool:
+    """Whether ``old`` already shows everything ``new`` would (versioned views only)."""
+    if old.key != new.key or new.version is None or old.version != new.version:
+        return False
+    if old.span is None or new.span is None:
+        return old.span == new.span
+    return old.span[0] <= new.span[0] and old.span[1] >= new.span[1]
+
+
+def _supersedes(new: _View, old: _View) -> bool:
+    if new.key != old.key:
+        return False
+    if new.version is None:
+        return True
+    return new.version != old.version or _covers(new, old)
+
 # Maps the arguments of a foreign tool name to (our tool name, our arguments).
 ToolAlias = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
 
@@ -231,8 +262,8 @@ class Agent:
         ]
         usage = TokenUsage()
         files_changed: list[str] = []
-        # Message index -> (view key, step) for view results still in full.
-        views: dict[int, tuple[str, int]] = {}
+        # Message index -> view, for view results still in full.
+        views: dict[int, _View] = {}
         step = 0
 
         def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
@@ -306,24 +337,46 @@ class Agent:
                 self._emit(step, usage, "notice", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
 
+            text_call_error = None
             if not response.tool_calls:
-                text_call = self._tool_call_from_text(response.content, step)
-                if text_call is not None:
+                looks_like_call = _looks_like_text_tool_call(response.content)
+                if looks_like_call and response.finish_reason == "length":
+                    # Repairing cut-off JSON would run the call with truncated arguments.
+                    text_call_error = (
+                        "ERROR: your reply was cut off at the output token limit, so the tool call you wrote as "
+                        "text was not run. Call the tool natively, and keep content short (edit_file or "
+                        "insert_lines instead of rewriting a large file)."
+                    )
+                elif (text_call := self._tool_call_from_text(response.content, step)) is not None:
                     self._emit(step, usage, "notice", summary=f"tool call written as text; running {text_call.name}")
                     response = response.model_copy(update={"content": None, "tool_calls": [text_call]})
+                elif looks_like_call:
+                    text_call_error = (
+                        "ERROR: your tool call written as text could not be parsed as JSON, so it was not run. "
+                        "Call the tool natively (as a function call), not as text."
+                    )
             if response.tool_calls:
                 response = response.model_copy(update={"tool_calls": [self._resolve_alias(c, step, usage) for c in response.tool_calls]})
 
             usage = usage + response.usage
             messages.append(response.to_message())
             text = (response.content or "").strip()
+            if text_call_error is not None:
+                self._emit(step, usage, "notice", summary=text_call_error.removeprefix("ERROR: "), is_error=True)
+                messages.append({"role": "user", "content": text_call_error})
+                continue
 
             if not response.tool_calls:
                 data = _json_from_text(text)
                 # JSON (finish or submit arguments as text) never counts as a prose answer.
                 if data is None:
                     text_only_streak += 1
-                if self.submit is not None and data is not None and not _looks_like_finish(data):
+                if (
+                    self.submit is not None
+                    and data is not None
+                    and not _looks_like_finish(data)
+                    and set(data) & set(self.submit.schema_model.model_fields)
+                ):
                     # The submit arguments written as plain JSON text.
                     payload, error = self._validate_submit(data)
                     if payload is not None:
@@ -395,15 +448,15 @@ class Agent:
                     if path not in files_changed:
                         files_changed.append(path)
                 content = output.content
+                summary = output.summary or _preview(content)
                 if output.view_key is not None:
-                    earlier = max((i for i, (key, _) in views.items() if key == output.view_key), default=None)
-                    if earlier is not None and messages[earlier]["content"] == content:
-                        content = (
-                            f"[unchanged since your identical call at step {views[earlier][1]}; "
-                            "that result is still in your context above, so it is not repeated]"
-                        )
+                    view = _View(output.view_key, step, output.view_version, output.view_span)
+                    earlier = _earlier_view(messages, views, view, content)
+                    if earlier is not None:
+                        content = _unchanged_note(earlier, view)
+                        summary += " (unchanged, short note)"
                     else:
-                        views[len(messages)] = (output.view_key, step)
+                        views[len(messages)] = view
                 messages.append(_tool_message(call.id, content))
                 self._emit(
                     step,
@@ -411,7 +464,7 @@ class Agent:
                     "tool_call",
                     tool=call.name,
                     arguments=call.arguments,
-                    summary=output.summary or _preview(content),
+                    summary=summary,
                     is_error=output.is_error,
                 )
                 if output.finish_summary is not None:
@@ -461,18 +514,16 @@ class Agent:
         """A tool call the model wrote as JSON text ({"name": ..., "arguments": ...}),
         whether or not the tool exists; unknown names get an error like any call."""
         data = _json_from_text(text or "")
-        if data is None or not isinstance(data.get("name"), str) or not (set(data) <= {"name", "arguments", "parameters"}):
+        if data is None or not set(data) <= {"name", "arguments", "parameters"}:
             return None
-        call_id = f"text_call_{step}"
+        name = data.get("name")
         arguments = data.get("arguments", data.get("parameters", {}))
         if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                return ToolCall(id=call_id, name=data["name"], parse_error=str(exc))
-        if not isinstance(arguments, dict):
-            return ToolCall(id=call_id, name=data["name"], parse_error="arguments must be a JSON object")
-        return ToolCall(id=call_id, name=data["name"], arguments=arguments)
+            arguments = _load_object(arguments) if arguments.strip() != "{}" else {}
+        # json-repair turns almost anything into an object; accept only a usable call.
+        if not isinstance(name, str) or not name.strip() or not isinstance(arguments, dict):
+            return None
+        return ToolCall(id=f"text_call_{step}", name=name, arguments=arguments)
 
     async def _execute(self, name: str, arguments: dict[str, Any], parse_error: str | None) -> ToolOutput:
         tool = self.tools.get(name)
@@ -493,7 +544,7 @@ class Agent:
             )
         return output
 
-    def _compact(self, messages: list[dict[str, Any]], views: dict[int, tuple[str, int]] | None = None) -> None:
+    def _compact(self, messages: list[dict[str, Any]], views: dict[int, _View] | None = None) -> None:
         """Shrink old tool results and old tool-call arguments in place.
 
         Every request resends the whole history, so on a tokens-per-minute
@@ -503,15 +554,12 @@ class Agent:
         the same view are replaced with a stub.
         """
         views = views if views is not None else {}
-        latest: dict[str, int] = {}
         for index in sorted(views):
-            latest[views[index][0]] = index
-        for index in sorted(views):
-            key = views[index][0]
-            if latest[key] != index:
-                messages[index] = {**messages[index], "content": f"[superseded by a later result for {key}]"}
+            old = views[index]
+            if any(later > index and _supersedes(view, old) for later, view in views.items()):
+                messages[index] = {**messages[index], "content": f"[superseded by a later result for {old.key}]"}
                 del views[index]
-        pinned = set(sorted(latest.values())[-self.keep_recent_views:]) if self.keep_recent_views > 0 else set()
+        pinned = set(sorted(views)[-self.keep_recent_views:]) if self.keep_recent_views > 0 else set()
 
         tool_indexes = [i for i, m in enumerate(messages) if m["role"] == "tool"]
         keep = self.keep_recent_tool_results
@@ -554,16 +602,64 @@ def _shrink_call(call: dict[str, Any], limit: int = 200) -> dict[str, Any]:
     return {**call, "function": {**call["function"], "arguments": json.dumps(shrunk)}}
 
 
+def _earlier_view(messages: list[dict[str, Any]], views: dict[int, _View], view: _View, content: str) -> _View | None:
+    """The latest view still in full that already shows what ``view`` would."""
+    for index in sorted(views, reverse=True):
+        earlier = views[index]
+        if earlier.key != view.key:
+            continue
+        if view.version is None and messages[index]["content"] == content:
+            return earlier
+        if _covers(earlier, view):
+            return earlier
+    return None
+
+
+def _unchanged_note(earlier: _View, view: _View) -> str:
+    if earlier.span and view.span:
+        return (
+            f"[{view.key}, lines {view.span[0]}-{view.span[1]}: unchanged since your read at step {earlier.step} "
+            f"(lines {earlier.span[0]}-{earlier.span[1]}), which is still in your context above; not repeated]"
+        )
+    return (
+        f"[unchanged since your identical call at step {earlier.step}; "
+        "that result is still in your context above, so it is not repeated]"
+    )
+
+
+_TEXT_TOOL_CALL_RE = re.compile(r'^\s*(?:```(?:json)?\s*)?\{\s*"name"\s*:')
+
+
+def _looks_like_text_tool_call(text: str | None) -> bool:
+    return bool(text and _TEXT_TOOL_CALL_RE.match(text))
+
+
 def _json_from_text(text: str) -> dict[str, Any] | None:
-    """A JSON object written as plain text (e.g. tool arguments) instead of a tool call."""
+    """A JSON object written as plain text (e.g. a tool call) instead of a tool call.
+
+    Tries strict JSON (raw newlines in strings allowed), then json-repair, then
+    the outermost {...} block of the text.
+    """
     candidate = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    if not candidate.startswith("{"):
-        return None
+    if candidate.startswith("{"):
+        data = _load_object(candidate)
+        if data is not None:
+            return data
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end and text[start:end + 1] != candidate:
+        return _load_object(text[start:end + 1])
+    return None
+
+
+def _load_object(text: str) -> dict[str, Any] | None:
     try:
-        data = json.loads(candidate)
+        data = json.loads(text, strict=False)
     except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+        try:
+            data = json_repair.loads(text)
+        except Exception:
+            return None
+    return data if isinstance(data, dict) and data else None
 
 
 def _looks_like_finish(data: dict[str, Any]) -> bool:

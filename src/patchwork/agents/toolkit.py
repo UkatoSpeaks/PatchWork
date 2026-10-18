@@ -7,7 +7,9 @@ test runner. Restrictions live here, in the tool layer, not only in prompts.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from collections.abc import Callable, Collection
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -35,6 +37,12 @@ class EditFileArgs(BaseModel):
     path: str
     old: str = Field(description="exact existing text; must occur exactly once")
     new: str = Field(description="replacement text")
+
+
+class InsertLinesArgs(BaseModel):
+    path: str
+    after_line: int = Field(ge=-1, description="insert after this 1-based line; 0 = top, -1 = end of file")
+    text: str = Field(description="lines to insert")
 
 
 class ListDirArgs(BaseModel):
@@ -150,6 +158,9 @@ def protect(paths: Collection[str], owner: str = "tester") -> WriteGuard:
     return guard
 
 
+_READ_SPAN_RE = re.compile(r": lines (\d+)-(\d+) of \d+")
+
+
 def read_only_tools(repo: Path) -> list[Tool]:
     def read_file(args: ReadFileArgs) -> ToolOutput:
         if fs.resolve_in_root(repo, args.path).is_dir():
@@ -162,8 +173,14 @@ def read_only_tools(repo: Path) -> list[Tool]:
             )
         text = fs.read_file(repo, args.path, offset=args.offset)
         rel = fs.to_relative(repo, args.path)
-        key = f"read_file {rel}" + (f" from line {args.offset}" if args.offset > 1 else "")
-        return ToolOutput(content=text, summary=text.rsplit("\n", 1)[-1].strip("[]"), view_key=key)
+        span = _READ_SPAN_RE.search(text.rsplit("\n", 1)[-1])
+        return ToolOutput(
+            content=text,
+            summary=text.rsplit("\n", 1)[-1].strip("[]"),
+            view_key=f"read_file {rel}",
+            view_version=hashlib.sha1(fs.resolve_in_root(repo, rel).read_bytes()).hexdigest(),
+            view_span=(int(span.group(1)), int(span.group(2))) if span else None,
+        )
 
     def list_dir(args: ListDirArgs) -> ToolOutput:
         text = fs.list_dir(repo, args.path)
@@ -194,8 +211,8 @@ def write_tools(
     guard: WriteGuard | None = None,
     on_change: Callable[[str], None] | None = None,
 ) -> list[Tool]:
-    """edit_file and write_file. ``guard`` sees the normalized path before any
-    write; ``on_change`` is told about each path written."""
+    """edit_file, insert_lines and write_file. ``guard`` sees the normalized
+    path before any write; ``on_change`` is told about each path written."""
 
     def checked(path: str) -> str:
         rel = fs.to_relative(repo, path)
@@ -217,8 +234,18 @@ def write_tools(
         rel = checked(args.path)
         return changed(rel, fs.edit_file(repo, rel, args.old, args.new))
 
+    def insert_lines(args: InsertLinesArgs) -> ToolOutput:
+        rel = checked(args.path)
+        return changed(rel, fs.insert_lines(repo, rel, args.after_line, args.text))
+
     return [
         Tool(name="edit_file", description="Replace one exact occurrence of old with new.", args_model=EditFileArgs, handler=edit_file),
+        Tool(
+            name="insert_lines",
+            description="Insert text after a line number (0 = top, -1 = end of file).",
+            args_model=InsertLinesArgs,
+            handler=insert_lines,
+        ),
         Tool(name="write_file", description="Create or overwrite a whole file.", args_model=WriteFileArgs, handler=write_file),
     ]
 

@@ -187,6 +187,40 @@ def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> st
     return f"edited {rel} at line {first}; it now reads:\n" + render_region(updated.splitlines(), first, last)
 
 
+def insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text: str) -> str:
+    """Insert ``text`` after 1-based line ``after_line`` (0 = top, -1 = end).
+
+    Like edit_file: keeps line endings, refuses unparseable .py results, and
+    returns the inserted region, numbered.
+    """
+    target = resolve_in_root(root, path)
+    if not target.is_file():
+        raise _not_a_file(root, path, target)
+    rel = _rel_of(root, target)
+    crlf = _is_crlf(target)
+    lines = _to_lf(_read_text(target)).splitlines(keepends=True)
+    position = len(lines) if after_line == -1 else after_line
+    if not 0 <= position <= len(lines):
+        raise ValueError(f"after_line must be between 0 and {len(lines)}, or -1 for the end; got {after_line}")
+    new = _to_lf(text)
+    if not new:
+        raise ValueError("text must not be empty")
+    if not new.endswith("\n"):
+        new += "\n"
+    head = "".join(lines[:position])
+    if head and not head.endswith("\n"):
+        head += "\n"
+    updated = head + new + "".join(lines[position:])
+    check_python(rel, updated)
+    _write_text(target, updated, crlf)
+
+    count = new.count("\n")
+    return (
+        f"inserted {count} line(s) into {rel} after line {position}; it now reads:\n"
+        + render_region(updated.splitlines(), position + 1, position + count)
+    )
+
+
 def check_python(rel: str, text: str) -> None:
     """Raise InvalidPython if ``rel`` is a .py file and ``text`` does not parse."""
     if not rel.endswith(".py"):

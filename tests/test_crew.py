@@ -212,7 +212,7 @@ def test_is_test_path(path, allowed):
 
 def test_tester_write_guard_is_enforced_in_the_tool_layer(stats_repo: Path):
     original = (stats_repo / "stats" / "core.py").read_text()
-    edit, write = write_tools(stats_repo, guard=tests_only)
+    edit, _insert, write = write_tools(stats_repo, guard=tests_only)
     for tool, args in [
         (write, {"path": "stats/core.py", "content": "pwned"}),
         (write, {"path": "tests/../stats/core.py", "content": "pwned"}),
@@ -560,17 +560,17 @@ def test_coder_is_nudged_to_run_tests(stats_repo: Path):
 
     llm = ScriptedLLM([
         reply(("edit_file", {"path": "stats/core.py", "old": "    return max(values) - min(values)", "new": MEDIAN_IMPL})),
-        *[reply(("search_code", {"pattern": f"def {name}"})) for name in ("mean", "mode", "data_range", "median")],
+        *[reply(("search_code", {"pattern": f"def {name}"})) for name in ("mean", "mode", "data_range", "median", "x")],
         reply(("run_tests", {})),
         *[reply(("search_code", {"pattern": f"import {name}"})) for name in ("a", "b", "c", "d", "e")],
         finish(),
     ])
-    coder = build_coder(repo=stats_repo, settings=settings(max_steps_per_agent=12), llm=llm)
+    coder = build_coder(repo=stats_repo, settings=settings(max_steps_per_agent=14), llm=llm)
     result = run(coder)
     assert result.success
     nudged = [i for i, request in enumerate(llm.requests) if request[-1]["content"] == TestGate.NUDGE]
-    # Edit at step 1, no tests in steps 2-5: the note goes into step 6's request only.
-    assert nudged == [5]
+    # Edit at step 1, no tests in steps 2-6: the note goes into step 7's request only.
+    assert nudged == [6]
 
 
 def test_coder_early_give_up_is_rejected_once(stats_repo: Path):
@@ -591,3 +591,24 @@ def test_coder_early_give_up_is_rejected_once(stats_repo: Path):
     llm = ScriptedLLM([reply(("run_tests", {})), finish(success=False, summary="cannot")])
     result = run(build_coder(repo=stats_repo, settings=settings(), llm=llm))
     assert (result.success, result.summary, result.steps_used) == (False, "cannot", 2)
+
+
+def test_coder_nudge_waits_5_steps_after_the_first_untested_edit(stats_repo: Path):
+    from patchwork.agents.coder import TestGate
+
+    explore = [reply(("search_code", {"pattern": f"exploring {i}"})) for i in range(6)]
+    llm = ScriptedLLM([
+        *explore,  # steps 1-6: no edits, no tests -> no nudge
+        reply(("insert_lines", {"path": "stats/core.py", "after_line": -1, "text": "\n\n" + MEDIAN_IMPL.split("\n\n\n", 1)[1]})),
+        *[reply(("search_code", {"pattern": f"after edit {i}"})) for i in range(5)],  # steps 8-12
+        reply(("write_file", {"path": "stats/__init__.py", "content": STATS_INIT})),  # step 13: the nudged turn
+        reply(("run_tests", {})),
+        finish(summary="added median"),
+    ])
+    result = run(build_coder(repo=stats_repo, settings=settings(max_steps_per_agent=20), llm=llm))
+    assert result.success
+    nudged = [i + 1 for i, request in enumerate(llm.requests) if request[-1]["content"] == TestGate.NUDGE]
+    assert nudged == [13]  # first edit at step 7; steps 8-12 without tests
+    insert_result = tool_results(llm.requests[7])[-1]
+    assert insert_result.startswith("inserted 11 line(s) into stats/core.py after line 25; it now reads:")
+    assert "def median(values):" in (stats_repo / "stats" / "core.py").read_text()

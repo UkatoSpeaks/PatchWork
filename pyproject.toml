@@ -5,6 +5,7 @@ description = "Multi-agent coding system that fixes GitHub issues (milestone 2: 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "json-repair>=0.64.0",
     "litellm>=1.50",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",

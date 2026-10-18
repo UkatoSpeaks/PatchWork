@@ -133,7 +133,10 @@ def test_repeated_read_of_unchanged_file_returns_a_short_note(repo: Path):
     ])
     asyncio.run(_agent(repo, llm).run("go"))
     results = tool_results(llm.requests[-1])
-    assert results[1].startswith("[unchanged since your identical call at step 1;")
+    assert results[1] == (
+        "[read_file m.py, lines 1-20: unchanged since your read at step 1 (lines 1-20), "
+        "which is still in your context above; not repeated]"
+    )
     # The file changed, so the next read is returned in full and the old one is stubbed.
     assert results[0] == "[superseded by a later result for read_file m.py]"
     assert results[3].startswith(" 1| x1 = 11")
@@ -233,7 +236,7 @@ def test_unknown_tool_returns_the_tool_list_and_the_run_continues(repo: Path, as
     assert result.success and result.steps_used == 3
     assert tool_results(llm.requests[1])[-1] == (
         "ERROR: unknown tool 'repo_browser.fetch'. The only tools you can call are: "
-        "search_code, read_file, list_dir, edit_file, write_file, finish. Call one of them."
+        "search_code, read_file, list_dir, edit_file, insert_lines, write_file, finish. Call one of them."
     )
 
 
@@ -252,3 +255,125 @@ def test_json_text_tool_calls_never_count_as_a_prose_answer(repo: Path):
     result = asyncio.run(_agent(repo, llm).run("go"))
     assert (result.success, result.summary, result.steps_used) == (True, "done for real", 6)
     assert tool_results(llm.requests[-1])[0].startswith("ERROR: unknown tool 'repo_browser.print_tree'")
+
+
+# --- insert_lines -------------------------------------------------------------------------
+
+def test_insert_lines_top_middle_and_end(repo: Path):
+    (repo / "m.py").write_bytes(b"a = 1\nb = 2")  # no trailing newline
+    out = fs.insert_lines(repo, "m.py", -1, "\n\ndef f():\n    return a")
+    assert out.startswith("inserted 4 line(s) into m.py after line 2; it now reads:\n")
+    assert "3| \n4| \n5| def f():\n6|     return a" in out
+    fs.insert_lines(repo, "m.py", 0, '"""Doc."""')
+    fs.insert_lines(repo, "m.py", 2, "c = 3\n")
+    assert (repo / "m.py").read_text() == '"""Doc."""\na = 1\nc = 3\nb = 2\n\n\ndef f():\n    return a\n'
+
+
+def test_insert_lines_keeps_crlf_and_shows_context(repo: Path):
+    (repo / "w.py").write_bytes(MODULE.replace("\n", "\r\n").encode())
+    out = fs.insert_lines(repo, "w.py", 10, "y = 0")
+    lines = out.splitlines()
+    assert lines[1] == " 6| x6 = 6" and "11| y = 0" in lines and lines[-1] == "16| x15 = 15"
+    data = (repo / "w.py").read_bytes()
+    assert b"x10 = 10\r\ny = 0\r\nx11 = 11\r\n" in data and b"\n" not in data.replace(b"\r\n", b"")
+
+
+def test_insert_lines_rejects_bad_line_and_invalid_python(repo: Path):
+    (repo / "m.py").write_text(MODULE)
+    with pytest.raises(ValueError, match="between 0 and 20, or -1"):
+        fs.insert_lines(repo, "m.py", 21, "x = 0")
+    with pytest.raises(InvalidPython, match="line 6"):
+        fs.insert_lines(repo, "m.py", 5, "def broken(:")
+    assert (repo / "m.py").read_text() == MODULE
+
+
+def test_insert_lines_tool_applies_write_guards(repo: Path):
+    from patchwork.agents.toolkit import WriteNotAllowed, protect
+
+    (repo / "m.py").write_text(MODULE)
+    tools = {t.name: t for t in write_tools(repo, guard=protect(["m.py"]))}
+    with pytest.raises(WriteNotAllowed, match="read-only for you"):
+        asyncio.run(tools["insert_lines"].invoke({"path": "m.py", "after_line": -1, "text": "z = 0"}))
+    assert (repo / "m.py").read_text() == MODULE
+
+
+# --- repeated reads at other offsets ----------------------------------------------------------
+
+def test_reads_of_an_unchanged_file_at_other_offsets_get_the_short_note(repo: Path):
+    (repo / "m.py").write_text(MODULE)
+    big = "".join(f"line_{i} = {i}\n" for i in range(1, 301))
+    (repo / "big.py").write_text(big)
+    llm = ScriptedLLM([
+        reply(("read_file", {"path": "m.py"})),
+        reply(("read_file", {"path": "m.py", "offset": 10})),
+        reply(("read_file", {"path": "big.py"})),
+        reply(("read_file", {"path": "big.py", "offset": 201})),  # not covered: full
+        reply(("read_file", {"path": "big.py", "offset": 250})),  # inside page 2: note
+        finish(),
+    ])
+    events = []
+    asyncio.run(_agent(repo, llm, on_event=events.append).run("go"))
+    results = tool_results(llm.requests[-1])
+    assert results[1] == (
+        "[read_file m.py, lines 10-20: unchanged since your read at step 1 (lines 1-20), "
+        "which is still in your context above; not repeated]"
+    )
+    assert results[3].startswith("201| line_201 = 201")
+    assert results[4].startswith("[read_file big.py, lines 250-300: unchanged since your read at step 4 (lines 201-300)")
+    summaries = [e.summary for e in events if e.kind == "tool_call"]
+    assert summaries[1] == "m.py: lines 10-20 of 20 (unchanged, short note)"
+    assert summaries[3] == "big.py: lines 201-300 of 300"
+    assert summaries[4].endswith("(unchanged, short note)")
+
+
+# --- tolerant text tool calls ------------------------------------------------------------------
+
+def test_text_tool_call_with_raw_newlines_in_content_is_executed(repo: Path):
+    content = 'import stats\n\n\ndef test_a():\n    assert stats.mean([1, 3]) == 2\n    assert "a\tb"\n'
+    # Long file content written with literal newlines inside the JSON string (invalid strict JSON).
+    text = '{"name": "write_file", "arguments": {"path": "tests/test_a.py", "content": "' + content.replace('"', '\\"') + '"}}'
+    llm = ScriptedLLM([reply(content=text), finish()])
+    asyncio.run(_agent(repo, llm).run("go"))
+    assert (repo / "tests" / "test_a.py").read_text() == content
+    assert tool_results(llm.requests[-1])[0].startswith("wrote ")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"name": "list_dir", "arguments": {"path": "."},}',  # needs json-repair
+        'Calling it now: {"name": "list_dir", "arguments": {}} as planned',  # outermost {...} block
+    ],
+    ids=["repaired", "extracted"],
+)
+def test_text_tool_call_is_repaired_or_extracted(repo: Path, text: str):
+    (repo / "m.py").write_text("")
+    llm = ScriptedLLM([reply(content=text), finish()])
+    asyncio.run(_agent(repo, llm).run("go"))
+    assert tool_results(llm.requests[-1]) == ["m.py"]
+
+
+def test_unparseable_text_tool_call_gets_an_error_not_silence(repo: Path):
+    llm = ScriptedLLM([
+        reply(content='{"name": "write_file", "arguments": '),
+        reply(content="Hmm."),  # would be the second prose reply if the call above counted as prose
+        finish(summary="ok"),
+    ])
+    result = asyncio.run(_agent(repo, llm).run("go"))
+    assert (result.success, result.steps_used) == (True, 3)
+    assert llm.requests[1][-1] == {
+        "role": "user",
+        "content": "ERROR: your tool call written as text could not be parsed as JSON, so it was not run. "
+        "Call the tool natively (as a function call), not as text.",
+    }
+
+
+def test_cut_off_text_tool_call_is_not_run(repo: Path):
+    from patchwork.llm import LLMResponse
+
+    cut = LLMResponse(model="m", content='{"name": "write_file", "arguments": {"path": "a.py", "content": "x = 1\ny =',
+                      finish_reason="length")
+    llm = ScriptedLLM([cut, finish()])
+    asyncio.run(_agent(repo, llm).run("go"))
+    assert not (repo / "a.py").exists()
+    assert llm.requests[1][-1]["content"].startswith("ERROR: your reply was cut off at the output token limit")
