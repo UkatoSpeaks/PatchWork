@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
-from patchwork.agents.toolkit import NO_REREAD, protect, read_only_tools, run_tests_tool, write_tools
+from patchwork.agents.toolkit import NO_REREAD, TOOL_ALIASES, protect, read_only_tools, run_tests_tool, write_tools
 from patchwork.config import Settings
 from patchwork.tools import fs, shell
 
@@ -40,6 +40,10 @@ class TestGate:
     __test__ = False  # not a pytest test class
     NUDGE_AFTER_STEPS = 5
     NUDGE = "System note: you have edited files but not run the tests in the last 5 steps. Call run_tests now."
+    GIVE_UP_TOO_EARLY = (
+        "Not yet: you have not edited any file or run the tests. Explore the repo (list_dir, search_code, "
+        "read_file), attempt a fix, and run run_tests. If you still cannot fix it after that, you may give up."
+    )
 
     def __init__(self) -> None:
         self.verified = False
@@ -47,21 +51,32 @@ class TestGate:
         self.untested_edits = False
         self.last_test_step = 0
         self.last_nudge_step = 0
+        self.attempted = False
+        self.give_up_rejected = False
 
     def check(self) -> str | None:
         if self.verified:
             return None
         return "the full test suite has not passed since your last edit; call run_tests with no path"
 
+    def give_up_check(self) -> str | None:
+        """Refuse one give-up before any edit or test run."""
+        if self.attempted or self.give_up_rejected:
+            return None
+        self.give_up_rejected = True
+        return self.GIVE_UP_TOO_EARLY
+
     def edited(self, rel: str) -> None:
         self.verified = False
         self.untested_edits = True
+        self.attempted = True
 
     def tested(self, result: shell.RunTestsResult, target: str | None) -> None:
         if target is None:
             self.verified = result.passed
         self.untested_edits = False
         self.last_test_step = self.step
+        self.attempted = True
 
     def nudge(self, step: int) -> str | None:
         self.step = step
@@ -104,7 +119,9 @@ def build_coder(
         system_prompt=SYSTEM_PROMPT,
         tools=build_tools(repo, test_command or settings.test_command, settings.test_timeout_seconds, gate, protected_files),
         verify_finish=gate.check,
+        verify_give_up=gate.give_up_check,
         nudge=gate.nudge,
+        aliases=TOOL_ALIASES,
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,

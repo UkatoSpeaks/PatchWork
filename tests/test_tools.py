@@ -190,3 +190,65 @@ def test_failed_run_leads_with_the_failure_reason(tmp_path: Path):
     assert lines[0].startswith("FAILED (exit 2)")
     assert lines[1].startswith("reason: ") and "ModuleNotFoundError: No module named 'missing_module_xyz'" in lines[1]
     assert lines[2].startswith("--- output (last ")
+
+
+# --- gpt-oss tool aliases, unknown tools, JSON text vs prose ----------------------------
+
+def _alias_agent(repo: Path, llm, **kwargs) -> Agent:
+    from patchwork.agents.toolkit import TOOL_ALIASES
+
+    return _agent(repo, llm, aliases=TOOL_ALIASES, **kwargs)
+
+
+def test_repo_browser_aliases_are_mapped_and_executed(repo: Path):
+    (repo / "m.py").write_text(MODULE)
+    llm = ScriptedLLM([
+        reply(("repo_browser.print_tree", {"path": "", "depth": 2})),
+        reply(content='{"name": "repo_browser.open_file", "arguments": {"path": "m.py", "line_start": 5, "line_end": 8}}'),
+        reply(("repo_browser.search", {"query": "x2 =", "path": ""})),
+        finish(),
+    ])
+    events = []
+    result = asyncio.run(_alias_agent(repo, llm, on_event=events.append).run("go"))
+
+    assert result.success and result.steps_used == 4
+    last = llm.requests[-1]
+    calls = [m["tool_calls"][0]["function"] for m in last if m.get("tool_calls")]
+    assert [c["name"] for c in calls] == ["list_dir", "read_file", "search_code"]
+    results = tool_results(last)
+    assert results[0] == "m.py"
+    assert results[1].startswith(" 5| x5 = 5")
+    assert results[2] == "m.py:2: x2 = 2"
+    notices = [e.summary for e in events if e.kind == "notice"]
+    for alias, target in [("print_tree", "list_dir"), ("open_file", "read_file"), ("search", "search_code")]:
+        assert f"mapped repo_browser.{alias} -> {target}" in notices
+
+
+@pytest.mark.parametrize("as_text", [False, True], ids=["native", "json-text"])
+def test_unknown_tool_returns_the_tool_list_and_the_run_continues(repo: Path, as_text: bool):
+    call = ("repo_browser.fetch", {"url": "x"})
+    first = reply(content='{"name": "repo_browser.fetch", "arguments": {"url": "x"}}') if as_text else reply(call)
+    llm = ScriptedLLM([first, reply(("list_dir", {})), finish()])
+    result = asyncio.run(_alias_agent(repo, llm).run("go"))
+    assert result.success and result.steps_used == 3
+    assert tool_results(llm.requests[1])[-1] == (
+        "ERROR: unknown tool 'repo_browser.fetch'. The only tools you can call are: "
+        "search_code, read_file, list_dir, edit_file, write_file, finish. Call one of them."
+    )
+
+
+def test_json_text_tool_calls_never_count_as_a_prose_answer(repo: Path):
+    # Prose and JSON-text calls alternate. If a JSON-text call counted as prose,
+    # the second reply would already be taken as the final answer.
+    llm = ScriptedLLM([
+        reply(content="Let me look around."),
+        reply(content='{"name": "repo_browser.print_tree", "arguments": {"path": "", "depth": 2}}'),
+        reply(content="Still thinking."),
+        reply(content='{"name": "nonexistent_tool", "arguments": {}}'),
+        reply(content="Almost there."),
+        finish(summary="done for real"),
+    ])
+    # Without aliases, repo_browser.print_tree is an unknown tool too.
+    result = asyncio.run(_agent(repo, llm).run("go"))
+    assert (result.success, result.summary, result.steps_used) == (True, "done for real", 6)
+    assert tool_results(llm.requests[-1])[0].startswith("ERROR: unknown tool 'repo_browser.print_tree'")

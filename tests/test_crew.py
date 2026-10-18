@@ -374,7 +374,7 @@ def test_orchestrator_stops_when_the_coder_fails(stats_repo: Path):
     result, llm, started, _ = orchestrate(stats_repo, {
         "lead": [submit_plan(VALID_PLAN)],
         "tester": [reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})), finish()],
-        "coder": [finish(success=False, summary="stuck")],
+        "coder": [finish(success=False, summary="stuck"), finish(success=False, summary="still stuck")],
         "reviewer": [],
     })
     assert (result.success, result.failed_agent, result.verdict) == (False, "coder", None)
@@ -571,3 +571,23 @@ def test_coder_is_nudged_to_run_tests(stats_repo: Path):
     nudged = [i for i, request in enumerate(llm.requests) if request[-1]["content"] == TestGate.NUDGE]
     # Edit at step 1, no tests in steps 2-5: the note goes into step 6's request only.
     assert nudged == [5]
+
+
+def test_coder_early_give_up_is_rejected_once(stats_repo: Path):
+    from patchwork.agents.coder import TestGate
+
+    llm = ScriptedLLM([finish(success=False, summary="no idea"), finish(success=False, summary="really stuck")])
+    result = run(build_coder(repo=stats_repo, settings=settings(), llm=llm))
+    assert (result.success, result.summary, result.steps_used) == (False, "really stuck", 2)
+    assert tool_results(llm.requests[1])[-1] == f"ERROR: finish rejected: {TestGate.GIVE_UP_TOO_EARLY}"
+
+    # Giving up in prose (two plain-text replies) is caught the same way.
+    llm = ScriptedLLM([reply(content="I can't."), reply(content="Giving up."), reply(content="Hm."), reply(content="Done.")])
+    result = run(build_coder(repo=stats_repo, settings=settings(), llm=llm))
+    assert (result.success, result.summary, result.steps_used) == (False, "Done.", 4)
+    assert llm.requests[2][-1]["content"] == TestGate.GIVE_UP_TOO_EARLY
+
+    # After an attempt (here: a test run), giving up is allowed straight away.
+    llm = ScriptedLLM([reply(("run_tests", {})), finish(success=False, summary="cannot")])
+    result = run(build_coder(repo=stats_repo, settings=settings(), llm=llm))
+    assert (result.success, result.summary, result.steps_used) == (False, "cannot", 2)

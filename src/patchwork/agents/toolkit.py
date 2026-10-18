@@ -10,10 +10,11 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Collection
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-from patchwork.agents.base import Tool, ToolOutput
+from patchwork.agents.base import Tool, ToolAlias, ToolOutput
 from patchwork.tools import fs, shell
 
 # Appended to every role's system prompt.
@@ -48,6 +49,39 @@ class SearchCodeArgs(BaseModel):
 
 class RunTestsArgs(BaseModel):
     path: str | None = Field(default=None, description="optional test file, dir or node id; default runs all")
+
+
+def _path_arg(arguments: dict[str, Any]) -> str:
+    path = arguments.get("path") or "."
+    return str(path).strip() or "."
+
+
+def _print_tree(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    # list_dir is not recursive, so "depth" has no equivalent and is dropped.
+    return "list_dir", {"path": _path_arg(arguments)}
+
+
+def _open_file(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    # read_file shows up to 200 lines from offset, so line_end is not needed.
+    args: dict[str, Any] = {"path": arguments.get("path", "")}
+    try:
+        args["offset"] = max(1, int(arguments.get("line_start") or 1))
+    except (TypeError, ValueError):
+        pass
+    return "read_file", args
+
+
+def _search(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    args: dict[str, Any] = {"pattern": arguments.get("query", arguments.get("pattern", "")), "path": _path_arg(arguments)}
+    return "search_code", args
+
+
+# Tool names gpt-oss was trained on, mapped to ours.
+TOOL_ALIASES: dict[str, ToolAlias] = {
+    "repo_browser.print_tree": _print_tree,
+    "repo_browser.open_file": _open_file,
+    "repo_browser.search": _search,
+}
 
 
 class WriteNotAllowed(PermissionError):

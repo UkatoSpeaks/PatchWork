@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
@@ -152,6 +153,8 @@ class SupportsComplete(Protocol):
 
 
 EventCallback = Callable[[AgentEvent], None]
+# Maps the arguments of a foreign tool name to (our tool name, our arguments).
+ToolAlias = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
 
 
 class Agent:
@@ -171,12 +174,20 @@ class Agent:
         keep_recent_views: int = 6,
         max_tool_output_chars: int = 8_000,
         verify_finish: Callable[[], str | None] | None = None,
+        verify_give_up: Callable[[], str | None] | None = None,
         submit: SubmitSpec | None = None,
+        aliases: dict[str, ToolAlias] | None = None,
         nudge: Callable[[int], str | None] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         """``verify_finish`` checks a claimed success independently of the model:
         it returns None to accept, or a reason that is fed back to the model.
+
+        ``verify_give_up`` does the same for a finish with success=false, e.g.
+        to refuse giving up before trying anything.
+
+        ``aliases`` map tool names some models were trained on (e.g. gpt-oss's
+        ``repo_browser.*``) to our tools.
 
         With ``submit``, success is reported only through the submit tool;
         ``finish`` remains available for giving up (success=false).
@@ -206,6 +217,8 @@ class Agent:
         self.keep_recent_views = keep_recent_views
         self.max_tool_output_chars = max_tool_output_chars
         self.verify_finish = verify_finish
+        self.verify_give_up = verify_give_up
+        self.aliases = aliases or {}
         self.submit = submit
         self.nudge = nudge
         self.on_event = on_event
@@ -280,7 +293,12 @@ class Agent:
             except MalformedToolCall as exc:
                 if exc.failed_generation is None:
                     self._emit(step, usage, "notice", summary="malformed tool call rejected by provider; retrying", is_error=True)
-                    messages.append({"role": "user", "content": "Your last tool call was malformed. Call one tool with valid JSON arguments."})
+                    unknown = re.search(r"call tool '([^']+)'", str(exc))
+                    if unknown:
+                        feedback = self._unknown_tool_message(unknown.group(1))
+                    else:
+                        feedback = "Your last tool call was malformed. Call one tool with valid JSON arguments."
+                    messages.append({"role": "user", "content": feedback})
                     continue
                 # Handle what the model actually wrote like any text-only reply.
                 response = LLMResponse(model=self.model, content=exc.failed_generation)
@@ -293,14 +311,18 @@ class Agent:
                 if text_call is not None:
                     self._emit(step, usage, "notice", summary=f"tool call written as text; running {text_call.name}")
                     response = response.model_copy(update={"content": None, "tool_calls": [text_call]})
+            if response.tool_calls:
+                response = response.model_copy(update={"tool_calls": [self._resolve_alias(c, step, usage) for c in response.tool_calls]})
 
             usage = usage + response.usage
             messages.append(response.to_message())
             text = (response.content or "").strip()
 
             if not response.tool_calls:
-                text_only_streak += 1
                 data = _json_from_text(text)
+                # JSON (finish or submit arguments as text) never counts as a prose answer.
+                if data is None:
+                    text_only_streak += 1
                 if self.submit is not None and data is not None and not _looks_like_finish(data):
                     # The submit arguments written as plain JSON text.
                     payload, error = self._validate_submit(data)
@@ -324,8 +346,14 @@ class Agent:
                     # Some models (e.g. gpt-oss) end with a prose answer instead of
                     # calling finish. Accept it, but success comes from the verifier.
                     success = self.verify_finish is not None and self.verify_finish() is None
-                    self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=_preview(text), is_error=not success)
-                    return result(success, text, "finished")
+                    rejection = None if success or self.verify_give_up is None else self.verify_give_up()
+                    if rejection is None:
+                        self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=_preview(text), is_error=not success)
+                        return result(success, text, "finished")
+                    text_only_streak = 0
+                    self._emit(step, usage, "notice", summary=f"give-up rejected: {rejection}", is_error=True)
+                    messages.append({"role": "user", "content": rejection})
+                    continue
                 if text:
                     self._emit(step, usage, "thought", summary=_preview(text))
                 done_tool = self.submit.name if self.submit else FINISH_TOOL
@@ -399,7 +427,29 @@ class Agent:
             return f"report your result by calling {self.submit.name}; use {FINISH_TOOL} only with success=false to give up"
         if finish.success and self.verify_finish is not None:
             return self.verify_finish()
+        if not finish.success and self.verify_give_up is not None:
+            return self.verify_give_up()
         return None
+
+    def _known_tools(self) -> list[str]:
+        return [*self.tools] + ([self.submit.name] if self.submit else []) + [FINISH_TOOL]
+
+    def _unknown_tool_message(self, name: str) -> str:
+        return (
+            f"ERROR: unknown tool '{name}'. The only tools you can call are: "
+            f"{', '.join(self._known_tools())}. Call one of them."
+        )
+
+    def _resolve_alias(self, call: ToolCall, step: int, usage: TokenUsage) -> ToolCall:
+        """Map a foreign tool name (e.g. repo_browser.open_file) to our tool."""
+        alias = self.aliases.get(call.name)
+        if call.name in self._known_tools() or alias is None or call.parse_error:
+            return call
+        target, arguments = alias(call.arguments)
+        if target not in self.tools:
+            return call
+        self._emit(step, usage, "notice", summary=f"mapped {call.name} -> {target}")
+        return call.model_copy(update={"name": target, "arguments": arguments})
 
     def _validate_submit(self, arguments: dict[str, Any]) -> tuple[BaseModel | None, str]:
         try:
@@ -408,29 +458,26 @@ class Agent:
             return None, _format_validation(exc)
 
     def _tool_call_from_text(self, text: str | None, step: int) -> ToolCall | None:
-        """A tool call the model wrote as JSON text ({"name": ..., "arguments": ...})."""
+        """A tool call the model wrote as JSON text ({"name": ..., "arguments": ...}),
+        whether or not the tool exists; unknown names get an error like any call."""
         data = _json_from_text(text or "")
-        if data is None:
+        if data is None or not isinstance(data.get("name"), str) or not (set(data) <= {"name", "arguments", "parameters"}):
             return None
-        name = data.get("name")
-        known = {*self.tools, FINISH_TOOL} | ({self.submit.name} if self.submit else set())
-        if name not in known:
-            return None
+        call_id = f"text_call_{step}"
         arguments = data.get("arguments", data.get("parameters", {}))
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                return None
+            except json.JSONDecodeError as exc:
+                return ToolCall(id=call_id, name=data["name"], parse_error=str(exc))
         if not isinstance(arguments, dict):
-            return None
-        return ToolCall(id=f"text_call_{step}", name=name, arguments=arguments)
+            return ToolCall(id=call_id, name=data["name"], parse_error="arguments must be a JSON object")
+        return ToolCall(id=call_id, name=data["name"], arguments=arguments)
 
     async def _execute(self, name: str, arguments: dict[str, Any], parse_error: str | None) -> ToolOutput:
         tool = self.tools.get(name)
         if tool is None:
-            available = ", ".join([*self.tools, FINISH_TOOL])
-            return ToolOutput(content=f"ERROR: unknown tool '{name}'. Available: {available}", is_error=True)
+            return ToolOutput(content=self._unknown_tool_message(name), is_error=True)
         if parse_error:
             return ToolOutput(content=f"ERROR: arguments were not valid JSON: {parse_error}", is_error=True)
         try:

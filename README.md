@@ -19,7 +19,9 @@ Tool behaviour that helps every agent recover without wasted steps:
 - Successful `edit_file` / `write_file` results show the changed region with 5 lines of context, so there is no need to re-read the file.
 - Writes to `.py` files are refused, and the file is left unchanged, if the result doesn't parse (`ast.parse`). The error gives the line number.
 - `read_file` on a directory returns its listing. A missing path suggests close matches ("did you mean tests/test_core.py?").
-- A tool call written as JSON text (`{"name": ..., "arguments": ...}`) is executed like a normal tool call.
+- A tool call written as JSON text (`{"name": ..., "arguments": ...}`) is executed like a normal tool call, and never counts as a plain-text final answer.
+- gpt-oss's built-in tool names are mapped to ours: `repo_browser.print_tree` → `list_dir`, `repo_browser.open_file` → `read_file` (`line_start` → `offset`), `repo_browser.search` → `search_code` (`query` → `pattern`). Any other unknown tool name gets an error listing the tools that exist, and the run continues.
+- The coder may not give up before it has edited a file or run the tests: the first such give-up is refused with a note to explore and attempt a fix; a second one is accepted.
 - Failed `run_tests` results start with the failure reason (the pytest `E ...` lines), then the last 30 lines of output.
 
 ## Setup

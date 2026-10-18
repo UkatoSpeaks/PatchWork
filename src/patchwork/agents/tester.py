@@ -10,6 +10,7 @@ from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
 from patchwork.agents.coder import format_subtasks
 from patchwork.agents.toolkit import (
     NO_REREAD,
+    TOOL_ALIASES,
     all_of,
     is_test_module,
     new_files_only,
@@ -136,6 +137,7 @@ def build_tester(
         system_prompt=SYSTEM_PROMPT,
         tools=tools,
         verify_finish=gate.check,
+        aliases=TOOL_ALIASES,
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,
