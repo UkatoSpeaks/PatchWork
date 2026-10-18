@@ -4,7 +4,9 @@ Adds what the agents need on top of ``litellm.acompletion``:
 - normalized tool calls and per-call token accounting,
 - retries on rate-limit (429) errors that honour the provider's retry-after
   hint, falling back to exponential backoff with jitter,
-- an ``asyncio.Semaphore`` capping concurrent in-flight requests.
+- per-model limits shared by every agent in the process: a semaphore capping
+  in-flight requests, and a cooldown so that when one agent gets a 429, the
+  others on that model wait it out too instead of hammering the provider.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ import os
 import random
 import re
 import time
+import weakref
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -25,7 +29,33 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 CompletionFn = Callable[..., Awaitable[Any]]
-RetryCallback = Callable[[int, float, BaseException], None]
+# (model, attempt, delay, exception) when this call is rate limited and retries.
+RetryCallback = Callable[[str, int, float, BaseException], None]
+# (model, delay) when a call waits out a cooldown set by another call's 429.
+CooldownCallback = Callable[[str, float], None]
+
+# Name of the agent making LLM calls in the current task, for attributing
+# rate-limit waits. Each asyncio task gets its own copy.
+llm_caller: ContextVar[str | None] = ContextVar("patchwork_llm_caller", default=None)
+
+
+class _ModelGate:
+    """Per-model limits shared by all clients in one event loop."""
+
+    def __init__(self, max_concurrency: int) -> None:
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.cooldown_until = 0.0
+
+
+# Keyed by event loop: asyncio primitives must not be shared across loops.
+_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, _ModelGate]] = weakref.WeakKeyDictionary()
+
+
+def _gate_for(model: str, max_concurrency: int) -> _ModelGate:
+    gates = _GATES.setdefault(asyncio.get_running_loop(), {})
+    if model not in gates:
+        gates[model] = _ModelGate(max_concurrency)
+    return gates[model]
 
 
 class TokenUsage(BaseModel):
@@ -113,16 +143,22 @@ class LLMClient:
         max_backoff: float = 90.0,
         completion_fn: CompletionFn | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], float] = time.monotonic,
         on_retry: RetryCallback | None = None,
+        on_cooldown: CooldownCallback | None = None,
     ) -> None:
+        """``max_concurrency`` caps in-flight requests per model; the first
+        client to use a model in an event loop sets that model's cap."""
         self._api_key = api_key
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self.max_concurrency = max_concurrency
         self._completion_fn = completion_fn or _litellm_acompletion()
         self._sleep = sleep
+        self._clock = clock
         self.max_retries = max_retries
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
         self.on_retry = on_retry
+        self.on_cooldown = on_cooldown
         self.calls: list[CallRecord] = []
 
     @property
@@ -157,11 +193,21 @@ class LLMClient:
         if self._api_key:
             kwargs["api_key"] = self._api_key
 
+        gate = _gate_for(model, self.max_concurrency)
         started = time.monotonic()
         attempt = 0
+        just_backed_off = False
         while True:
+            # Wait out a cooldown another call on this model hit (our own
+            # backoff sleep already covered the one we set).
+            remaining = gate.cooldown_until - self._clock()
+            if remaining > 0 and not just_backed_off:
+                if self.on_cooldown:
+                    self.on_cooldown(model, remaining)
+                await self._sleep(remaining)
+            just_backed_off = False
             try:
-                async with self._semaphore:
+                async with gate.semaphore:
                     raw = await self._completion_fn(**kwargs)
                 break
             except Exception as exc:
@@ -174,12 +220,14 @@ class LLMClient:
                         f"still rate limited after {attempt} retries: {exc}"
                     ) from exc
                 delay = self._retry_delay(exc, attempt)
+                gate.cooldown_until = max(gate.cooldown_until, self._clock() + delay)
                 attempt += 1
                 log.info("rate limited on %s; retry %d in %.1fs", model, attempt, delay)
                 if self.on_retry:
-                    self.on_retry(attempt, delay, exc)
+                    self.on_retry(model, attempt, delay, exc)
                 # Sleep outside the semaphore so other requests are not blocked on us.
                 await self._sleep(delay)
+                just_backed_off = True
 
         response = _parse_response(raw, model)
         self.calls.append(
