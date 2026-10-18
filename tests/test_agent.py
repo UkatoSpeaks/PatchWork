@@ -9,10 +9,10 @@ from pydantic import BaseModel
 from patchwork.agents.base import ELIDED_MARK, Agent, AgentEvent, Tool, ToolOutput
 from patchwork.agents.coder import build_coder, build_task
 from patchwork.config import Settings
-from patchwork.llm import LLMResponse, MalformedToolCall, ToolCall
+from patchwork.llm import BadRequest, DailyLimitReached, LLMResponse, ToolCall
 
 from conftest import TOY_CALCULATOR
-from scripted import ScriptedLLM, finish, reply
+from scripted import ScriptedLLM, finish, reply, tool_results
 
 
 class EchoArgs(BaseModel):
@@ -155,18 +155,135 @@ def test_verifier_does_not_block_reporting_failure():
 
 
 def test_rejected_generation_is_used_as_the_reply():
-    exc = MalformedToolCall("tool_use_failed", failed_generation='{"success": true, "summary": "done via text"}')
+    exc = BadRequest("tool_use_failed", code="tool_use_failed", failed_generation='{"success": true, "summary": "done via text"}')
     llm = ScriptedLLM([exc])
     result = run(make_agent(llm))
     assert (result.success, result.summary) == (True, "done via text")
 
 
 def test_malformed_tool_call_from_provider_is_retried():
-    llm = ScriptedLLM([MalformedToolCall("tool_use_failed"), finish()])
+    llm = ScriptedLLM([BadRequest("tool_use_failed", code="tool_use_failed"), finish()])
     result = run(make_agent(llm))
     assert result.success
     assert result.steps_used == 2
     assert "malformed" in llm.requests[1][-1]["content"]
+
+
+def events_of(sink):
+    return [e.summary for e in sink if e.kind == "note"]
+
+
+def test_parse_failure_with_prose_follows_the_plain_text_rules():
+    """Groq output_parse_failed: the failed_generation is a thought, not a crash."""
+    notes: list[AgentEvent] = []
+    exc = BadRequest("parse failed", code="output_parse_failed",
+                     failed_generation="We need to add tests for median. Let's inspect stats core.")
+    llm = ScriptedLLM([exc, reply(("echo", {"text": "hi"})), finish()])
+    result = run(make_agent(llm, on_event=notes.append))
+    assert result.success and result.steps_used == 3
+    assert "provider could not parse the reply (output_parse_failed); using its text" in events_of(notes)
+    # The text went into the history as the model's reply, followed by the usual nudge.
+    assert llm.requests[1][-2] == {"role": "assistant", "content": "We need to add tests for median. Let's inspect stats core."}
+    assert "call `finish`" in llm.requests[1][-1]["content"]
+
+
+def test_parse_failure_with_a_json_tool_call_runs_the_call():
+    exc = BadRequest("parse failed", code="output_parse_failed",
+                     failed_generation='{"name": "echo", "arguments": {"text": "from text"}}')
+    llm = ScriptedLLM([exc, finish()])
+    result = run(make_agent(llm))
+    assert result.success
+    assert "echo: from text" in tool_results(llm.requests[1])
+
+
+def test_400_without_failed_generation_is_retried_twice_then_fails():
+    notes: list[AgentEvent] = []
+    recovered = run(make_agent(ScriptedLLM([BadRequest("x", code="weird")] * 2 + [finish()])))
+    assert recovered.success
+
+    llm = ScriptedLLM([BadRequest("bad", code="weird")] * 3 + [finish()])
+    result = run(make_agent(llm, on_event=notes.append))
+    assert (result.success, result.stop_reason) == (False, "error")
+    assert "rejected the request 3 times in a row (400, weird)" in result.summary
+    assert len(llm.requests) == 3
+    assert events_of(notes)[:2] == [
+        "provider rejected the request (400, weird); retry 1/2",
+        "provider rejected the request (400, weird); retry 2/2",
+    ]
+
+
+def daily_limit(model, wait=209.0):
+    from datetime import datetime
+
+    return DailyLimitReached(model, "Rate limit reached ... on tokens per day (TPD): Limit 200000",
+                             retry_after=wait, reset_at=datetime(2026, 10, 18, 17, 35), limit_name="tokens per day (TPD)")
+
+
+def test_daily_limit_switches_to_the_fallback_with_the_conversation_intact():
+    notes: list[AgentEvent] = []
+    llm = ScriptedLLM({
+        "primary": [reply(("echo", {"text": "one"})), daily_limit("primary")],
+        "backup": [finish(summary="done on backup")],
+    })
+    agent = make_agent(llm, on_event=notes.append, fallback_models=["backup"])
+    agent.model = "primary"
+    result = run(agent)
+    assert (result.success, result.summary) == (True, "done on backup")
+    assert result.models_used == ["primary", "backup"]
+    assert "daily limit reached on primary, switching to backup" in events_of(notes)
+    # The backup got exactly the conversation the primary was about to answer.
+    assert llm.requests_for("backup")[0] == llm.requests_for("primary")[1]
+    assert "echo: one" in tool_results(llm.requests_for("backup")[0])
+    assert result.steps_used == 2  # the switch does not cost a step
+
+
+def test_all_fallbacks_exhausted_gives_a_clear_error():
+    llm = ScriptedLLM({"primary": [daily_limit("primary")], "b1": [daily_limit("b1", wait=60)]})
+    agent = make_agent(llm, fallback_models=["b1"])
+    agent.model = "primary"
+    result = run(agent)
+    assert (result.success, result.stop_reason) == (False, "daily_limit")
+    assert result.models_used == ["primary", "b1"]
+    assert result.summary == (
+        "daily limit reached on every model the test may use: "
+        "primary (tokens per day (TPD), resets in 3m29s, around 17:35); "
+        "b1 (tokens per day (TPD), resets in 1m00s, around 17:35). "
+        "Try again after the reset, or add models to TEST_FALLBACKS."
+    )
+
+
+def test_repo_browser_prefix_maps_to_any_of_our_tools(tmp_path: Path):
+    from patchwork.agents.lead import build_lead
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "mod.py").write_text("x = 1\n")
+    notes: list[AgentEvent] = []
+    llm = ScriptedLLM([
+        reply(("repo_browser.list_dir", {"path": "pkg"})),
+        reply(("repo_browser.read_file", {"path": "pkg/mod.py"})),
+        reply(("repo_browser.print_tree", {"path": ".", "depth": 2})),  # the explicit alias still applies
+        reply(("repo_browser.nope", {})),
+        finish(success=False, summary="stop"),
+    ])
+    lead = build_lead(repo=tmp_path, settings=Settings(_env_file=None), llm=llm, on_event=notes.append)
+    run(lead)
+    results = tool_results(llm.requests[-1])
+    assert "mod.py" in results[0] and "x = 1" in results[1] and "pkg/" in results[2]
+    assert results[3].startswith("ERROR: unknown tool 'repo_browser.nope'")
+    assert [n for n in events_of(notes) if n.startswith("mapped")] == [
+        "mapped repo_browser.list_dir -> list_dir", "mapped repo_browser.read_file -> read_file",
+        "mapped repo_browser.print_tree -> list_dir",
+    ]
+
+
+def test_unknown_prefixed_tool_rejected_by_provider_gets_the_mapping_hint(tmp_path: Path):
+    from patchwork.agents.lead import build_lead
+
+    exc = BadRequest("tool call validation failed: attempted to call tool 'repo_browser.list_dir' "
+                     "which was not in request.tools", code="tool_use_failed")
+    llm = ScriptedLLM([exc, finish(success=False, summary="stop")])
+    run(build_lead(repo=tmp_path, settings=Settings(_env_file=None), llm=llm))
+    assert "Call list_dir instead." in llm.requests[1][-1]["content"]
 
 
 def test_llm_failure_ends_run_with_error():

@@ -90,6 +90,8 @@ TOOL_ALIASES: dict[str, ToolAlias] = {
     "repo_browser.open_file": _open_file,
     "repo_browser.search": _search,
 }
+# Any other "repo_browser.<tool>" maps to <tool> when that is one of ours.
+ALIAS_PREFIXES = ("repo_browser.",)
 
 
 class WriteNotAllowed(PermissionError):

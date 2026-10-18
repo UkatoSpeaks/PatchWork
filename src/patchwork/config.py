@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     tester_model: str = "groq/openai/gpt-oss-120b"
     reviewer_model: str = "groq/qwen/qwen3.8-27b"
 
+    # Comma-separated models to switch to, in order, when a role's model hits a
+    # per-day limit. The agent keeps its conversation.
+    lead_fallbacks: str = "groq/qwen/qwen3.8-27b,groq/openai/gpt-oss-20b"
+    coder_fallbacks: str = "groq/qwen/qwen3.8-27b,groq/openai/gpt-oss-20b"
+    tester_fallbacks: str = "groq/qwen/qwen3.8-27b,groq/openai/gpt-oss-20b"
+    reviewer_fallbacks: str = "groq/openai/gpt-oss-120b,groq/openai/gpt-oss-20b"
+
     # Agent budgets
     max_steps_per_agent: int = Field(default=25, ge=1)
     max_tokens_per_run: int = Field(default=60_000, ge=1)
@@ -38,13 +45,24 @@ class Settings(BaseSettings):
 
     # LLM client
     max_concurrent_requests: int = Field(default=2, ge=1)
-    llm_max_retries: int = Field(default=6, ge=0)
+    # Seconds one LLM call may spend waiting on per-minute rate limits in total.
+    llm_max_wait_seconds: float = Field(default=180.0, ge=0)
 
     # Crew: coder retries (failing suite or review blockers) per run
     max_retries: int = Field(default=3, ge=0)
 
     def model_for(self, role: Role) -> str:
         return getattr(self, f"{role}_model")
+
+    def fallbacks_for(self, role: Role) -> list[str]:
+        """The role's fallback models in order, without its own model or duplicates."""
+        primary = self.model_for(role)
+        out: list[str] = []
+        for model in getattr(self, f"{role}_fallbacks").split(","):
+            model = model.strip()
+            if model and model != primary and model not in out:
+                out.append(model)
+        return out
 
     def api_key(self) -> str | None:
         return self.groq_api_key.get_secret_value() if self.groq_api_key else None

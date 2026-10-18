@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
 from patchwork.agents.coder import format_subtasks
 from patchwork.agents.toolkit import (
+    ALIAS_PREFIXES,
     NO_REREAD,
     TOOL_ALIASES,
     all_of,
@@ -138,6 +139,8 @@ def build_tester(
         tools=tools,
         verify_finish=gate.check,
         aliases=TOOL_ALIASES,
+        alias_prefixes=ALIAS_PREFIXES,
+        fallback_models=settings.fallbacks_for(ROLE),
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,

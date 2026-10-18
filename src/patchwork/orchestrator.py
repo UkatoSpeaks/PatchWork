@@ -4,27 +4,29 @@ Crew flow:
 1. plan: the lead reads the main repo (read-only) and submits a Plan.
 2. implement: the tester and the coder run concurrently (or one after the
    other with ``sequential``), each in its own git worktree, and commit to
-   their own branch.
+   their own branch. If one fails, the run stops: sequentially the coder is
+   not started; in parallel the other agent is cancelled.
 3. integrate: both branches are merged into a fresh result branch.
 4. verify / review: the full suite runs in the result worktree, then the
    reviewer reads the diff. A failing suite or a review blocker starts a
    fresh coder retry in the result worktree, up to ``max_retries`` in total.
 
 Success = the full suite passes in the result worktree and the reviewer
-approved. The diff and changed files come from git. Everything observable
-is published on the EventBus; nothing here prints.
+approved. The diff and changed files come from git. Worktrees are always
+removed; a failed run keeps the branches that have commits for inspection.
+Everything observable is published on the EventBus; nothing here prints.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from patchwork.agents.base import Agent, AgentEvent, EventCallback, SupportsComplete
+from patchwork.agents.base import Agent, AgentEvent, AgentResult, EventCallback, SupportsComplete
 from patchwork.agents.coder import build_coder, build_retry_task, build_task
 from patchwork.agents.lead import build_lead, build_lead_task
 from patchwork.agents.reviewer import build_review_task, build_reviewer
@@ -62,9 +64,12 @@ class Orchestrator:
         self.init_git = init_git
         self.sequential = sequential
         self.max_retries = settings.max_retries if max_retries is None else max_retries
+        # Agents the orchestrator is cancelling (their sibling failed).
+        self._cancelling: set[str] = set()
         if isinstance(llm, LLMClient):
             llm.on_retry = self._on_rate_limited
             llm.on_cooldown = self._on_cooldown
+            llm.on_throttle = self._on_throttle
 
     @property
     def run_id(self) -> str:
@@ -84,22 +89,34 @@ class Orchestrator:
         except WorkspaceError as exc:
             run.error = str(exc)
         finally:
+            run.success = (
+                run.error is None
+                and run.failed_agent is None
+                and run.tests_passed is True
+                and run.verdict is not None
+                and run.verdict.approved
+            )
             if workspace is not None:
-                if workspace.has_branch("result"):
-                    run.result_branch = workspace.branch("result")
-                    run.diff = workspace.diff("result")
-                    run.files_changed = workspace.changed_files("result")
-                # Worktrees always go; tester/coder branches only once merged.
-                workspace.cleanup(delete_branches=tuple(workspace.merged))
-        run.success = (
-            run.error is None
-            and run.failed_agent is None
-            and run.tests_passed is True
-            and run.verdict is not None
-            and run.verdict.approved
-        )
+                self._finish_workspace(run, workspace)
+        run.usage_today = self._usage_today()
         self._emit("orchestrator", "run_finished", result=run.model_dump(mode="json"))
         return run
+
+    def _finish_workspace(self, run: RunResult, workspace: Workspace) -> None:
+        """Remove the worktrees. Keep the branches with commits, except the
+        tester/coder branches of a successful run (merged into the result)."""
+        names = ("tester", "coder", "result")
+        keep = [n for n in names if workspace.has_commits(n) and not (run.success and n in workspace.merged)]
+        if "result" in keep:
+            run.result_branch = workspace.branch("result")
+            run.diff = workspace.diff("result")
+            run.files_changed = workspace.changed_files("result")
+        run.kept_branches = [workspace.branch(n) for n in keep]
+        workspace.cleanup(delete_branches=tuple(n for n in names if n not in keep))
+
+    def _usage_today(self) -> dict[str, dict[str, Any]]:
+        store = getattr(self.llm, "usage", None)
+        return store.day() if store is not None else {}
 
     async def _crew(self, issue: str, run: RunResult, workspace: Workspace) -> None:
         plan = await self._plan(issue, run)
@@ -107,18 +124,25 @@ class Orchestrator:
             return
 
         with self._phase(run, "implement", parallel=not self.sequential):
-            tester_dir = workspace.add_worktree("tester")
-            coder_dir = workspace.add_worktree("coder")
-            tester_job = self._implement_tester(run, issue, plan, workspace, tester_dir)
-            coder_job = self._implement_coder(run, issue, plan, workspace, coder_dir)
             if self.sequential:
-                tester_ok = await tester_job
-                coder_ok = await coder_job
+                tester_dir = workspace.add_worktree("tester")
+                if not await self._implement_tester(run, issue, plan, workspace, tester_dir):
+                    run.failed_agent = "tester"
+                    self._emit("orchestrator", "note", kind="stopped", text="the tester failed; not starting the coder")
+                    return
+                coder_dir = workspace.add_worktree("coder")
+                if not await self._implement_coder(run, issue, plan, workspace, coder_dir):
+                    run.failed_agent = "coder"
+                    return
             else:
-                tester_ok, coder_ok = await asyncio.gather(tester_job, coder_job)
-        if not tester_ok or not coder_ok:
-            run.failed_agent = "tester" if not tester_ok else "coder"
-            return
+                tester_dir = workspace.add_worktree("tester")
+                coder_dir = workspace.add_worktree("coder")
+                run.failed_agent = await self._first_failure({
+                    "tester": self._implement_tester(run, issue, plan, workspace, tester_dir),
+                    "coder": self._implement_coder(run, issue, plan, workspace, coder_dir),
+                })
+                if run.failed_agent is not None:
+                    return
 
         with self._phase(run, "integrate"):
             result_dir = workspace.add_worktree("result")
@@ -169,6 +193,29 @@ class Orchestrator:
             )
             if not await self._retry(run, issue, plan, workspace, result_dir, "review", feedback, tester_files):
                 return
+
+    async def _first_failure(self, jobs: dict[str, Coroutine[Any, Any, bool]]) -> str | None:
+        """Run the jobs concurrently. When one returns False, cancel the rest
+        (each records and commits what it did) and return its name."""
+        tasks = {asyncio.create_task(job): name for name, job in jobs.items()}
+        pending = set(tasks)
+        failed = None
+        try:
+            while pending and failed is None:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                failed = next((tasks[t] for t in done if not t.result()), None)
+            if failed is not None and pending:
+                others = ", ".join(sorted(tasks[t] for t in pending))
+                self._emit("orchestrator", "note", kind="cancelled", text=f"the {failed} failed; cancelling the {others}")
+        finally:
+            # Also on an error or our own cancellation: never leave a sibling running.
+            for task in pending:
+                self._cancelling.add(tasks[task])
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._cancelling.clear()
+        return failed
 
     async def _plan(self, issue: str, run: RunResult) -> Plan | None:
         with self._phase(run, "plan"):
@@ -251,20 +298,34 @@ class Orchestrator:
         run.success = entry.result.success
         if not run.success:
             run.failed_agent = "coder"
+        run.usage_today = self._usage_today()
         self._emit("orchestrator", "run_finished", result=run.model_dump(mode="json"))
         return run
 
     # --- agents and events ---------------------------------------------------------
 
     async def _run_agent(self, run: RunResult, name: AgentName, label: str, agent: Agent, task: str) -> AgentRun:
+        """Run ``agent``. If the orchestrator cancels it (see ``_first_failure``),
+        the run so far is returned as a failure with stop reason "cancelled"."""
         token = llm_caller.set(name)
-        self._emit(name, "agent_started", label=label, model=agent.model)
+        model = agent.model
+        self._emit(name, "agent_started", label=label, model=model)
         started = time.monotonic()
         try:
             result = await agent.run(task)
+        except asyncio.CancelledError:
+            if name not in self._cancelling:
+                raise
+            asyncio.current_task().uncancel()
+            summary = "cancelled: the other implement-phase agent failed"
+            if agent.partial_result is not None:
+                result = agent.partial_result(summary, "cancelled")
+            else:
+                result = AgentResult(role=name, success=False, summary=summary, files_changed=[], steps_used=0,
+                                     tokens_used=0, prompt_tokens=0, completion_tokens=0, stop_reason="cancelled")
         finally:
             llm_caller.reset(token)
-        entry = AgentRun(agent=name, label=label, model=agent.model, result=result,
+        entry = AgentRun(agent=name, label=label, model=model, result=result,
                          duration_s=round(time.monotonic() - started, 3))
         run.runs.append(entry)
         return entry
@@ -276,6 +337,7 @@ class Orchestrator:
             "agent_finished",
             label=entry.label,
             model=entry.model,
+            models_used=entry.models,
             success=result.success,
             summary=result.summary,
             stop_reason=result.stop_reason,
@@ -338,6 +400,10 @@ class Orchestrator:
     def _on_cooldown(self, model: str, delay: float) -> None:
         self._emit(llm_caller.get() or "orchestrator", "rate_limited", model=model, delay_s=round(delay, 2),
                    shared=True)
+
+    def _on_throttle(self, model: str, delay: float, needed: int, remaining: int) -> None:
+        self._emit(llm_caller.get() or "orchestrator", "throttled", model=model, delay_s=round(delay, 2),
+                   needed_tokens=needed, remaining_tokens=remaining)
 
     def _emit(self, agent: AgentName, type: str, **payload: Any) -> None:
         self.bus.publish(agent, type, **payload)  # type: ignore[arg-type]

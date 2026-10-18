@@ -26,6 +26,7 @@ EventType = Literal[
     "tool_called",
     "tool_result",
     "rate_limited",
+    "throttled",
     "note",
     "agent_finished",
     "tests_run",

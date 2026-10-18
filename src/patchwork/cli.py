@@ -2,9 +2,12 @@
 
 ``patchwork run --repo PATH --issue TEXT [--init-git] [--sequential] [--max-retries N] [--solo]``
 ``patchwork replay runs/<run_id>/events.jsonl``
+``patchwork usage [--days N]``
 
 All output is rendered from run events (see ``render.py``); every run is
 also logged to ``runs/<run_id>/events.jsonl`` and ``runs/<run_id>/result.json``.
+Only one run at a time is allowed (``runs/.patchwork.lock``); token usage per
+model per day accumulates in ``runs/usage.json``.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ from patchwork.events import EventBus, JsonlWriter, read_events
 from patchwork.llm import LLMClient
 from patchwork.orchestrator import CREW, Orchestrator
 from patchwork.render import CliRenderer
+from patchwork.runlock import RunLocked, run_lock
+from patchwork.usage import UsageStore, format_day
 
 app = typer.Typer(help="Patchwork: a multi-agent coding system.", add_completion=False, no_args_is_help=True)
 
@@ -65,21 +70,50 @@ def run(
         raise typer.Exit(2)
 
     bus = EventBus()
-    bus.subscribe(CliRenderer())
-    writer = JsonlWriter(RUNS_DIR / bus.run_id)
-    bus.subscribe(writer)
-    llm = LLMClient(
-        api_key=settings.api_key(),
-        max_concurrency=settings.max_concurrent_requests,
-        max_retries=settings.llm_max_retries,
-    )
-    orchestrator = Orchestrator(
-        repo=repo, settings=settings, llm=llm, bus=bus, test_command=test_cmd,
-        init_git=init_git, sequential=sequential, max_retries=max_retries,
-    )
-    result = asyncio.run(orchestrator.run_solo(issue) if solo else orchestrator.run(issue))
+    try:
+        with run_lock(RUNS_DIR, bus.run_id):
+            bus.subscribe(CliRenderer())
+            writer = JsonlWriter(RUNS_DIR / bus.run_id)
+            bus.subscribe(writer)
+            llm = LLMClient(
+                api_key=settings.api_key(),
+                max_concurrency=settings.max_concurrent_requests,
+                max_wait=settings.llm_max_wait_seconds,
+                usage=UsageStore(RUNS_DIR / "usage.json"),
+            )
+            orchestrator = Orchestrator(
+                repo=repo, settings=settings, llm=llm, bus=bus, test_command=test_cmd,
+                init_git=init_git, sequential=sequential, max_retries=max_retries,
+            )
+            result = asyncio.run(orchestrator.run_solo(issue) if solo else orchestrator.run(issue))
+    except RunLocked as exc:
+        typer.secho(str(exc), fg="red", err=True)
+        raise typer.Exit(2) from None
     typer.secho(f"\nEvent log: {writer.events_path}  (replay: patchwork replay {writer.events_path})", dim=True)
     raise typer.Exit(0 if result.success else 1)
+
+
+@app.command()
+def usage(
+    days: Annotated[int, typer.Option(min=1, help="Show the last N days that have usage (default: today only).")] = 1,
+) -> None:
+    """Tokens and requests per model per day, from runs/usage.json."""
+    store = UsageStore(RUNS_DIR / "usage.json")
+    if days == 1:
+        today = store.day()
+        if not today:
+            typer.echo(f"No usage recorded today ({store.path}).")
+            return
+        for line in format_day(today):
+            typer.echo(line)
+        return
+    recorded = store.days()[-days:]
+    if not recorded:
+        typer.echo(f"No usage recorded ({store.path}).")
+    for day in recorded:
+        typer.secho(day, bold=True)
+        for line in format_day(store.day(day), label="total"):
+            typer.echo("  " + line)
 
 
 @app.command()

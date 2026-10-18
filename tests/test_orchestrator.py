@@ -327,7 +327,7 @@ def test_suite_failure_with_no_retries_left(stats_git: Path):
 
 def test_worktrees_are_cleaned_up_after_an_agent_failure(stats_git: Path):
     before = tree_bytes(stats_git)
-    result, events, llm, _ = crew(
+    result, events, llm, lines = crew(
         stats_git,
         {"lead": lead_script(), "tester": qa_script(),
          "coder": [finish(success=False, summary="no idea"), finish(success=False, summary="stuck")], "reviewer": []},
@@ -335,11 +335,106 @@ def test_worktrees_are_cleaned_up_after_an_agent_failure(stats_git: Path):
     assert (result.success, result.failed_agent) == (False, "coder")
     assert of(events, "phase_started")[-1].payload["phase"] == "implement"  # stopped before integrate
     assert len(worktrees(stats_git)) == 1
-    # Not merged, so the tester and coder branches are kept for inspection; no result branch.
-    run_id = result.run_id
-    assert branches(stats_git) == ["main", f"patchwork/{run_id}/coder", f"patchwork/{run_id}/tester"]
+    # The tester's branch has its test file, so it is kept; the coder committed nothing,
+    # so its branch is deleted. No result branch.
+    tester_branch = f"patchwork/{result.run_id}/tester"
+    assert branches(stats_git) == ["main", tester_branch]
+    assert result.kept_branches == [tester_branch]
     assert result.result_branch is None and result.diff == ""
     assert tree_bytes(stats_git) == before
+    base = result.base_commit[:12]
+    assert f"    git log --oneline {base}..{tester_branch}" in lines
+    assert f"Delete them:   git branch -D {tester_branch}" in lines
+    assert "reason:        finished: stuck" in lines
+
+
+def test_sequential_stops_before_the_coder_when_the_tester_fails(stats_git: Path):
+    tester = [reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
+              finish(success=False, summary="cannot write failing tests")]
+    result, events, llm, _ = crew(
+        stats_git, {"lead": lead_script(), "tester": tester, "coder": coder_script(), "reviewer": []},
+        sequential=True,
+    )
+    assert (result.success, result.failed_agent) == (False, "tester")
+    assert of(events, "agent_started", "coder") == [] and llm.requests_for("coder") == []
+    assert of(events, "note", "orchestrator")[-1].payload["text"] == "the tester failed; not starting the coder"
+    # Failed run: the tester branch has a commit and is kept; no coder branch was created.
+    assert branches(stats_git) == ["main", f"patchwork/{result.run_id}/tester"]
+    assert len(worktrees(stats_git)) == 1
+
+
+def test_parallel_failure_cancels_the_sibling(stats_git: Path):
+    coder = [reply(("list_dir", {"path": "."})) for _ in range(9)] + [finish(summary="never reached")]
+    result, events, llm, _ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": [finish(success=False, summary="cannot test this")], "coder": coder,
+         "reviewer": []},
+    )
+    assert (result.success, result.failed_agent) == (False, "tester")
+    # The coder was stopped part-way, recorded as cancelled, and cleaned up after.
+    assert len(llm.requests_for("coder")) < len(coder)
+    [coder_done] = of(events, "agent_finished", "coder")
+    assert (coder_done.payload["success"], coder_done.payload["stop_reason"]) == (False, "cancelled")
+    assert [r.result.stop_reason for r in result.runs if r.agent == "coder"] == ["cancelled"]
+    assert "the tester failed; cancelling the coder" in [e.payload["text"] for e in of(events, "note", "orchestrator")]
+    assert of(events, "phase_started")[-1].payload["phase"] == "implement"
+    assert len(worktrees(stats_git)) == 1 and branches(stats_git) == ["main"]  # neither committed anything
+
+
+def test_failed_run_keeps_the_result_branch_with_inspect_commands(stats_git: Path):
+    retry = [reply(("run_tests", {})), finish(summary="tried")]
+    result, _, _, lines = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script() + retry,
+         "reviewer": [submit_review(approved=False, issues=[BLOCKER], summary="No.")] * 2},
+        max_retries=1,
+    )
+    assert not result.success
+    # A failed run keeps every branch with commits, merged or not.
+    prefix = f"patchwork/{result.run_id}"
+    assert result.kept_branches == [f"{prefix}/tester", f"{prefix}/coder", f"{prefix}/result"]
+    assert result.result_branch == f"{prefix}/result" and "+def median(values):" in result.diff
+    assert branches(stats_git) == sorted(["main", *result.kept_branches])
+    assert len(worktrees(stats_git)) == 1
+    for branch in result.kept_branches:
+        assert f"    git diff {result.base_commit[:12]} {branch}" in lines
+
+
+def test_daily_limit_fallback_is_recorded_in_the_result_and_table(stats_git: Path):
+    from datetime import datetime
+
+    from patchwork.llm import DailyLimitReached
+
+    exhausted = DailyLimitReached("lead", "on tokens per day (TPD): Limit 200000", 60.0, datetime(2026, 1, 1, 9, 0),
+                                  "tokens per day (TPD)")
+    result, events, llm, lines = crew(
+        stats_git,
+        {"lead": [exhausted], "lead-backup": lead_script(), "tester": qa_script(), "coder": coder_script(),
+         "reviewer": [submit_review()]},
+        settings={"lead_fallbacks": "lead-backup"},
+    )
+    assert result.success
+    lead_run = result.runs[0]
+    assert (lead_run.model, lead_run.result.models_used) == ("lead", ["lead", "lead-backup"])
+    assert {r.agent: r.result.models_used for r in result.runs[1:]} == {
+        "tester": ["tester"], "coder": ["coder"], "reviewer": ["reviewer"]}
+    assert any(line.startswith("lead      lead -> lead-backup") for line in lines)
+    assert "lead    | [step  1] daily limit reached on lead, switching to lead-backup" in lines
+
+
+def test_final_table_shows_todays_usage(stats_git: Path, tmp_path: Path):
+    from patchwork.usage import UsageStore
+
+    store = UsageStore(tmp_path / "usage.json")
+    store.note_reported("groq/openai/gpt-oss-120b", used_tokens=152400, tokens_per_day=200000, requests_per_day=1000)
+    llm = ScriptedLLM({"lead": [finish(success=False, summary="cannot plan")]})
+    llm.usage = store
+    sink = ListSink()
+    bus = EventBus()
+    bus.subscribe(CliRenderer(sink))
+    result = asyncio.run(Orchestrator(repo=stats_git, settings=settings(), llm=llm, bus=bus).run("x"))
+    assert result.usage_today["groq/openai/gpt-oss-120b"]["tokens"] == 152400
+    assert "  groq/openai/gpt-oss-120b today: 152,400 / 200,000 tokens, 0 / 1,000 requests" in sink.lines
 
 
 def test_merge_conflict_stops_with_the_files_and_cleans_up(stats_git: Path, monkeypatch):

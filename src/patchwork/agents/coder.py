@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
-from patchwork.agents.toolkit import NO_REREAD, TOOL_ALIASES, protect, read_only_tools, run_tests_tool, write_tools
+from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, protect, read_only_tools, run_tests_tool, write_tools
 from patchwork.config import Settings
 from patchwork.tools import fs, shell
 
@@ -123,6 +123,8 @@ def build_coder(
         verify_give_up=gate.give_up_check,
         nudge=gate.nudge,
         aliases=TOOL_ALIASES,
+        alias_prefixes=ALIAS_PREFIXES,
+        fallback_models=settings.fallbacks_for(ROLE),
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,

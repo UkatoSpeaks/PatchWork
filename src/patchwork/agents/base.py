@@ -16,15 +16,17 @@ import asyncio
 import inspect
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal, NamedTuple, Protocol
 
 import json_repair
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from patchwork.llm import LLMResponse, MalformedToolCall, TokenUsage, ToolCall
+from patchwork.llm import AllModelsExhausted, BadRequest, DailyLimitReached, LLMResponse, TokenUsage, ToolCall
 
 FINISH_TOOL = "finish"
+# Consecutive HTTP 400s without a failed_generation that are retried before the agent fails.
+MAX_BAD_REQUEST_RETRIES = 2
 ELIDE_KEEP_CHARS = 300
 ELIDED_MARK = "\n[…older output elided to save tokens; re-run the tool if you need it]"
 
@@ -138,7 +140,9 @@ class AgentEvent(BaseModel):
     completion_tokens: int = 0
 
 
-StopReason = Literal["finished", "max_steps", "max_tokens", "invalid_output", "error"]
+# "daily_limit": every model the agent may use hit its per-day limit.
+# "cancelled": stopped by the orchestrator (e.g. its parallel sibling failed).
+StopReason = Literal["finished", "max_steps", "max_tokens", "invalid_output", "error", "daily_limit", "cancelled"]
 
 
 class AgentResult(BaseModel):
@@ -153,6 +157,8 @@ class AgentResult(BaseModel):
     stop_reason: StopReason
     # The validated submit payload, for agents with a SubmitSpec.
     output: dict[str, Any] | None = None
+    # Models the agent actually called, in order (more than one after a fallback).
+    models_used: list[str] = Field(default_factory=list)
 
 
 class SupportsComplete(Protocol):
@@ -217,6 +223,8 @@ class Agent:
         verify_give_up: Callable[[], str | None] | None = None,
         submit: SubmitSpec | None = None,
         aliases: dict[str, ToolAlias] | None = None,
+        alias_prefixes: Sequence[str] = (),
+        fallback_models: Sequence[str] = (),
         nudge: Callable[[int], str | None] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
@@ -227,7 +235,12 @@ class Agent:
         to refuse giving up before trying anything.
 
         ``aliases`` map tool names some models were trained on (e.g. gpt-oss's
-        ``repo_browser.*``) to our tools.
+        ``repo_browser.*``) to our tools. A name ``<prefix><tool>`` with a
+        prefix in ``alias_prefixes`` (e.g. ``repo_browser.list_dir``) maps to
+        ``<tool>`` when that is one of ours.
+
+        ``fallback_models`` are used in order once the current model hits a
+        per-day limit; the conversation carries over.
 
         With ``submit``, success is reported only through the submit tool;
         ``finish`` remains available for giving up (success=false).
@@ -259,6 +272,12 @@ class Agent:
         self.verify_finish = verify_finish
         self.verify_give_up = verify_give_up
         self.aliases = aliases or {}
+        self.alias_prefixes = tuple(alias_prefixes)
+        self.fallback_models = [m for m in dict.fromkeys(fallback_models) if m != model]
+        # Models called during the latest run, and ``partial_result(summary, reason)``:
+        # a result for that run so far, for when it is cancelled.
+        self.models_used: list[str] = []
+        self.partial_result: Callable[[str, StopReason], AgentResult] | None = None
         self.submit = submit
         self.nudge = nudge
         self.on_event = on_event
@@ -274,6 +293,10 @@ class Agent:
         # Message index -> view, for view results still in full.
         views: dict[int, _View] = {}
         step = 0
+        self.model = self.model_chain[0]
+        self.models_used = []
+        # Models found exhausted (per-day limit) during this run.
+        exhausted: dict[str, DailyLimitReached] = {}
 
         def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
             return AgentResult(
@@ -287,7 +310,10 @@ class Agent:
                 completion_tokens=usage.completion_tokens,
                 stop_reason=reason,
                 output=output.model_dump() if output is not None else None,
+                models_used=list(self.models_used),
             )
+
+        self.partial_result = lambda summary, reason: result(False, summary, reason)
 
         def submitted(payload: BaseModel, arguments: dict[str, Any]) -> AgentResult:
             summary = str(getattr(payload, self.submit.summary_field, "") or f"called {self.submit.name}")
@@ -311,6 +337,7 @@ class Agent:
 
         invalid_submits = 0
         text_only_streak = 0
+        bad_requests = 0
         while step < self.max_steps:
             if usage.total_tokens >= self.max_tokens:
                 return result(
@@ -323,28 +350,42 @@ class Agent:
                 messages.append({"role": "user", "content": note})
             self._compact(messages, views)
             try:
-                response = await self.llm.complete(
-                    self.model,
-                    messages,
-                    self._schemas,
-                    tool_choice=self.tool_choice,
-                    max_tokens=self.max_output_tokens,
-                )
-            except MalformedToolCall as exc:
+                response = await self._complete(messages, step, usage, exhausted)
+            except BadRequest as exc:
+                code = exc.code or "no error code"
                 if exc.failed_generation is None:
-                    self._emit(step, usage, "note", summary="malformed tool call rejected by provider; retrying", is_error=True)
-                    unknown = re.search(r"call tool '([^']+)'", str(exc))
-                    if unknown:
-                        feedback = self._unknown_tool_message(unknown.group(1))
-                    else:
-                        feedback = "Your last tool call was malformed. Call one tool with valid JSON arguments."
-                    messages.append({"role": "user", "content": feedback})
+                    bad_requests += 1
+                    if bad_requests > MAX_BAD_REQUEST_RETRIES:
+                        summary = (
+                            f"LLM call failed: the provider rejected the request {bad_requests} times "
+                            f"in a row (400, {code}): {exc}"
+                        )
+                        self._emit(step, usage, "note", summary=summary, is_error=True)
+                        return result(False, summary, "error")
+                    self._emit(step, usage, "note", is_error=True, summary=(
+                        f"provider rejected the request (400, {code}); retry {bad_requests}/{MAX_BAD_REQUEST_RETRIES}"
+                    ))
+                    if exc.code == "tool_use_failed":
+                        unknown = re.search(r"call tool '([^']+)'", str(exc))
+                        if unknown:
+                            feedback = self._unknown_tool_message(unknown.group(1))
+                        else:
+                            feedback = "Your last tool call was malformed. Call one tool with valid JSON arguments."
+                        messages.append({"role": "user", "content": feedback})
                     continue
-                # Handle what the model actually wrote like any text-only reply.
+                # What the model actually wrote is handled like any reply: a tool
+                # call written as JSON text is run, prose follows the plain-text rules.
+                bad_requests = 0
+                self._emit(step, usage, "note", summary=f"provider could not parse the reply ({code}); using its text")
                 response = LLMResponse(model=self.model, content=exc.failed_generation)
+            except AllModelsExhausted as exc:
+                self._emit(step, usage, "note", summary=str(exc), is_error=True)
+                return result(False, str(exc), "daily_limit")
             except Exception as exc:
                 self._emit(step, usage, "note", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
+            else:
+                bad_requests = 0
 
             text_call_error = None
             if not response.tool_calls:
@@ -488,6 +529,38 @@ class Agent:
 
         return result(False, f"Stopped: reached the limit of {self.max_steps} steps.", "max_steps")
 
+    @property
+    def model_chain(self) -> list[str]:
+        """The models this agent may use, in order: its own, then the fallbacks."""
+        first = self.models_used[0] if self.models_used else self.model
+        return [first, *[m for m in self.fallback_models if m != first]]
+
+    async def _complete(
+        self, messages: list[dict[str, Any]], step: int, usage: TokenUsage, exhausted: dict[str, DailyLimitReached]
+    ) -> LLMResponse:
+        """One LLM call. On a per-day limit, switch to the next fallback model and
+        call again with the same conversation; ``AllModelsExhausted`` once none is left."""
+        while True:
+            if not self.models_used or self.models_used[-1] != self.model:
+                self.models_used.append(self.model)
+            try:
+                return await self.llm.complete(
+                    self.model,
+                    messages,
+                    self._schemas,
+                    tool_choice=self.tool_choice,
+                    max_tokens=self.max_output_tokens,
+                )
+            except DailyLimitReached as exc:
+                exhausted[self.model] = exc
+                chain = self.model_chain
+                following = [m for m in chain if m not in exhausted]
+                if not following:
+                    raise AllModelsExhausted(self.role, [exhausted[m] for m in chain]) from exc
+                self._emit(step, usage, "note", is_error=True,
+                           summary=f"daily limit reached on {self.model}, switching to {following[0]}")
+                self.model = following[0]
+
     def _reject_finish(self, finish: FinishArgs) -> str | None:
         """Why a claimed success is not accepted, or None to accept the finish."""
         if finish.success and self.submit is not None:
@@ -502,21 +575,35 @@ class Agent:
         return [*self.tools] + ([self.submit.name] if self.submit else []) + [FINISH_TOOL]
 
     def _unknown_tool_message(self, name: str) -> str:
+        mapped = self._alias_target(name, {})
+        hint = f" Call {mapped[0]} instead." if mapped else ""
         return (
-            f"ERROR: unknown tool '{name}'. The only tools you can call are: "
+            f"ERROR: unknown tool '{name}'.{hint} The only tools you can call are: "
             f"{', '.join(self._known_tools())}. Call one of them."
         )
 
     def _resolve_alias(self, call: ToolCall, step: int, usage: TokenUsage) -> ToolCall:
         """Map a foreign tool name (e.g. repo_browser.open_file) to our tool."""
-        alias = self.aliases.get(call.name)
-        if call.name in self._known_tools() or alias is None or call.parse_error:
+        if call.name in self._known_tools() or call.parse_error:
             return call
-        target, arguments = alias(call.arguments)
-        if target not in self.tools:
+        mapped = self._alias_target(call.name, call.arguments)
+        if mapped is None:
             return call
+        target, arguments = mapped
         self._emit(step, usage, "note", summary=f"mapped {call.name} -> {target}")
         return call.model_copy(update={"name": target, "arguments": arguments})
+
+    def _alias_target(self, name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        """(our tool, its arguments) for a foreign tool name, or None."""
+        alias = self.aliases.get(name)
+        if alias is not None:
+            target, mapped = alias(arguments)
+            return (target, mapped) if target in self.tools else None
+        for prefix in self.alias_prefixes:
+            tool = name.removeprefix(prefix)
+            if name.startswith(prefix) and tool in self._known_tools():
+                return tool, arguments
+        return None
 
     def _validate_submit(self, arguments: dict[str, Any]) -> tuple[BaseModel | None, str]:
         try:

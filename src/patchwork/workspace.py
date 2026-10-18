@@ -105,6 +105,13 @@ class Workspace:
     def has_branch(self, name: str) -> bool:
         return git(self.repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{self.branch(name)}", check=False).returncode == 0
 
+    def has_commits(self, name: str) -> bool:
+        """Whether branch ``name`` exists and has commits beyond the run's base."""
+        if not self.has_branch(name):
+            return False
+        count = git(self.repo, "rev-list", "--count", f"{self.base}..{self.branch(name)}", check=False).stdout.strip()
+        return count.isdigit() and int(count) > 0
+
     def add_worktree(self, name: str) -> Path:
         path = self.root / name
         git(self.repo, "worktree", "add", "-b", self.branch(name), str(path), self.base)

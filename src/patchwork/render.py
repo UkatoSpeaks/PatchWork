@@ -14,6 +14,7 @@ from typing import Any
 import typer
 
 from patchwork.events import Event
+from patchwork.usage import format_day
 
 Style = dict[str, Any]  # typer.secho keyword arguments: fg, bold, dim
 Sink = Callable[[str, Style], None]
@@ -124,8 +125,15 @@ class CliRenderer:
         why = "waiting out a shared cooldown" if p.get("shared") else f"rate limited (retry {p.get('attempt')})"
         self._agent(event, f"          {why} on {p['model']}: {p['delay_s']:.1f}s", fg="yellow")
 
+    def _on_throttled(self, event: Event, p: dict[str, Any]) -> None:
+        self._agent(event, f"          throttling: waiting {p['delay_s']:.1f}s for the token budget on {p['model']} "
+                           f"(need ~{p['needed_tokens']:,}, {p['remaining_tokens']:,} left)", fg="yellow")
+
     def _on_agent_finished(self, event: Event, p: dict[str, Any]) -> None:
         stats = f"({p['duration_s']:.1f}s, {p['steps']} steps, {p['tokens']:,} tokens)"
+        models = p.get("models_used") or []
+        if len(models) > 1:
+            stats += f" [models: {' -> '.join(models)}]"
         if not p["success"]:
             self._agent(event, f"{p['label']} failed ({p['stop_reason']}): {p['summary']} {stats}", fg="red", bold=True)
             return
@@ -207,7 +215,8 @@ class CliRenderer:
         for run in runs:
             r = run["result"]
             rows.append((
-                run["label"], run["model"], f"{r['steps_used']}{limit}", f"{r['prompt_tokens']:,}",
+                run["label"], " -> ".join(r.get("models_used") or [run["model"]]), f"{r['steps_used']}{limit}",
+                f"{r['prompt_tokens']:,}",
                 f"{r['completion_tokens']:,}", f"{r['tokens_used']:,}", f"{run['duration_s']:.1f}s",
             ))
         rows.append((
@@ -222,6 +231,11 @@ class CliRenderer:
             self._line("  ".join(cells), bold=index in (0, len(rows) - 1))
         if result["phases"]:
             self._line("Phases: " + " | ".join(f"{name} {secs:.1f}s" for name, secs in result["phases"].items()))
+        usage = result.get("usage_today") or {}
+        if usage:
+            self._line("Usage today (all runs, runs/usage.json):")
+            for line in format_day(usage):
+                self._line("  " + line)
 
     def _render_outcome(self, result: dict[str, Any]) -> None:
         self._section("Result")
@@ -230,6 +244,10 @@ class CliRenderer:
             self._line(f"error:         {result['error']}", fg="red")
         elif result.get("failed_agent"):
             self._line(f"stopped at:    {result['failed_agent']} (agent failed)", fg="red")
+            failed = [r for r in result["runs"] if r["agent"] == result["failed_agent"]]
+            if failed:
+                r = failed[-1]["result"]
+                self._line(f"reason:        {r['stop_reason']}: {r['summary']}", fg="red")
         elif result["mode"] == "crew" and result.get("tests_passed") is False:
             self._line("stopped:       the full suite still fails in the result (retry limit reached)", fg="red")
         elif result["mode"] == "crew" and result.get("verdict") and not result["verdict"]["approved"]:
@@ -238,10 +256,20 @@ class CliRenderer:
             self._line(f"retries:       {result['retries']}/{self.max_retries}")
         self._line(f"files changed: {', '.join(result['files_changed']) or '(none)'}")
         branch = result.get("result_branch")
-        if branch:
+        if result["success"] and branch:
             self._line(f"result branch: {branch}")
             self._line("Inspect it:    git diff HEAD " + branch)
             self._line("Apply it:      git merge " + branch)
+            return
+        kept = result.get("kept_branches") or []
+        if kept:
+            base = (result.get("base_commit") or "HEAD")[:12]
+            self._line(f"kept branches (with commits, base {base}):")
+            for name in kept:
+                self._line(f"  {name}")
+                self._line(f"    git log --oneline {base}..{name}", dim=True)
+                self._line(f"    git diff {base} {name}", dim=True)
+            self._line("Delete them:   git branch -D " + " ".join(kept))
 
 
 def format_args(arguments: dict[str, Any], limit: int = 40) -> str:

@@ -86,9 +86,14 @@ class AgentRun(BaseModel):
     agent: str
     # e.g. "coder", "coder (retry 1: tests)", "reviewer (round 2)"
     label: str
+    # The model the agent started on; ``result.models_used`` has every model it called.
     model: str
     result: AgentResult
     duration_s: float
+
+    @property
+    def models(self) -> list[str]:
+        return self.result.models_used or [self.model]
 
 
 class RunResult(BaseModel):
@@ -114,6 +119,12 @@ class RunResult(BaseModel):
     # Branch holding the result (crew), kept after the run for inspection.
     result_branch: str | None = None
     base_commit: str | None = None
+    # Branches left in the repo at the end: the result branch, plus (after a
+    # failure) the tester/coder branches that have commits.
+    kept_branches: list[str] = Field(default_factory=list)
+    # Today's usage per model from runs/usage.json at the end of the run:
+    # {model: {tokens, requests, tokens_per_day, requests_per_day}}.
+    usage_today: dict[str, dict[str, int | None]] = Field(default_factory=dict)
     # Wall-clock seconds per phase (plan, implement, integrate, verify, review, retry).
     phases: dict[str, float] = Field(default_factory=dict)
     success: bool = False
