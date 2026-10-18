@@ -163,3 +163,65 @@ def test_semaphore_caps_concurrency():
 
     asyncio.run(main())
     assert peak == 2
+
+
+def test_rate_limit_cooldown_is_shared_per_model():
+    """A 429 on one call makes concurrent calls on the same model wait too;
+    other models are unaffected."""
+    calls: list[str] = []
+    sleeps: list[tuple[str, float]] = []
+    cooldowns: list[tuple[str, float]] = []
+    first = {"m": True}
+
+    async def completion_fn(**kw):
+        tag = kw["messages"][0]["content"]
+        calls.append(tag)
+        if tag == "A" and first["m"]:
+            first["m"] = False
+            raise FakeRateLimit(headers={"retry-after": "5"})
+        return fake_response("ok")
+
+    def client(name):
+        async def sleep(seconds):
+            sleeps.append((name, seconds))
+            await asyncio.sleep(0)
+        return LLMClient(completion_fn=completion_fn, sleep=sleep, clock=lambda: 100.0,
+                         on_cooldown=lambda model, delay: cooldowns.append((model, delay)))
+
+    async def main():
+        a, b, c = client("A"), client("B"), client("C")
+        await asyncio.gather(
+            a.complete("m", [{"role": "user", "content": "A"}]),
+            b.complete("m", [{"role": "user", "content": "B"}]),
+            c.complete("other", [{"role": "user", "content": "C"}]),
+        )
+
+    asyncio.run(main())
+    # A hit the 429 and backed off; B (same model, different client) waited out the
+    # same cooldown instead of calling; C (other model) never waited.
+    assert ("A", 5.5) in sleeps and ("B", 5.5) in sleeps
+    assert not any(name == "C" for name, _ in sleeps)
+    assert cooldowns == [("m", 5.5)]
+    assert calls.index("C") < calls.index("B")
+
+
+def test_rate_limit_events_name_the_waiting_agent(tmp_path):
+    from patchwork.config import Settings
+    from patchwork.events import EventBus
+    from patchwork.llm import llm_caller
+    from patchwork.orchestrator import Orchestrator
+
+    events = []
+    bus = EventBus()
+    bus.subscribe(events.append)
+    llm, _ = make_client([])
+    Orchestrator(repo=tmp_path, settings=Settings(_env_file=None), llm=llm, bus=bus)
+    token = llm_caller.set("tester")
+    try:
+        llm.on_retry("m", 1, 2.0, FakeRateLimit())
+        llm.on_cooldown("m", 1.5)
+    finally:
+        llm_caller.reset(token)
+    assert [(e.agent, e.type, e.payload["shared"]) for e in events] == [
+        ("tester", "rate_limited", False), ("tester", "rate_limited", True),
+    ]

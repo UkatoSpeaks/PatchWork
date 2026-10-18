@@ -222,7 +222,7 @@ def test_repo_browser_aliases_are_mapped_and_executed(repo: Path):
     assert results[0] == "m.py"
     assert results[1].startswith(" 5| x5 = 5")
     assert results[2] == "m.py:2: x2 = 2"
-    notices = [e.summary for e in events if e.kind == "notice"]
+    notices = [e.summary for e in events if e.kind == "note"]
     for alias, target in [("print_tree", "list_dir"), ("open_file", "read_file"), ("search", "search_code")]:
         assert f"mapped repo_browser.{alias} -> {target}" in notices
 
@@ -320,7 +320,7 @@ def test_reads_of_an_unchanged_file_at_other_offsets_get_the_short_note(repo: Pa
     )
     assert results[3].startswith("201| line_201 = 201")
     assert results[4].startswith("[read_file big.py, lines 250-300: unchanged since your read at step 4 (lines 201-300)")
-    summaries = [e.summary for e in events if e.kind == "tool_call"]
+    summaries = [e.summary for e in events if e.kind == "tool_result"]
     assert summaries[1] == "m.py: lines 10-20 of 20 (unchanged, short note)"
     assert summaries[3] == "big.py: lines 201-300 of 300"
     assert summaries[4].endswith("(unchanged, short note)")
@@ -377,3 +377,28 @@ def test_cut_off_text_tool_call_is_not_run(repo: Path):
     asyncio.run(_agent(repo, llm).run("go"))
     assert not (repo / "a.py").exists()
     assert llm.requests[1][-1]["content"].startswith("ERROR: your reply was cut off at the output token limit")
+
+
+# --- duplicate definitions --------------------------------------------------------------------
+
+def test_duplicate_top_level_definition_is_written_with_a_warning(repo: Path):
+    from patchwork.agents.toolkit import write_tools
+
+    source = "def mean(v):\n    return 1\n\n\ndef median(v):\n    return 2\n"
+    (repo / "core.py").write_text(source)
+    tools = {t.name: t for t in write_tools(repo)}
+    out = asyncio.run(tools["insert_lines"].invoke({"path": "core.py", "after_line": -1,
+                                                    "text": "\n\ndef median(v):\n    return 3\n"}))
+    assert out.content.endswith("\nWARNING: median is now defined twice (lines 5 and 9); remove one")
+    assert out.summary.endswith("(WARNING: duplicate definition)")
+    assert (repo / "core.py").read_text().count("def median") == 2  # still written
+
+    out = fs.write_file(repo, "three.py", "class A: ...\nclass A: ...\nclass A: ...\n")
+    assert out.endswith("WARNING: A is now defined 3 times (lines 1, 2 and 3); remove one")
+    # @overload stubs, nested functions and non-Python files are not flagged.
+    clean = (
+        "from typing import overload\n\n\n@overload\ndef f(x: int) -> int: ...\n@overload\ndef f(x: str) -> str: ...\n"
+        "def f(x):\n    def g(): ...\n    def g(): ...\n    return x\n"
+    )
+    assert "WARNING" not in fs.write_file(repo, "ok.py", clean)
+    assert "WARNING" not in fs.write_file(repo, "notes.txt", "def a(): ...\ndef a(): ...\n")

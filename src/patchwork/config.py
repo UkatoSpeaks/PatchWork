@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = Field(default=2, ge=1)
     llm_max_retries: int = Field(default=6, ge=0)
 
+    # Crew: coder retries (failing suite or review blockers) per run
+    max_retries: int = Field(default=3, ge=0)
+
     def model_for(self, role: Role) -> str:
         return getattr(self, f"{role}_model")
 

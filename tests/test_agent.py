@@ -54,7 +54,7 @@ def test_executes_tools_feeds_results_back_and_finishes():
     assert second_request[-2]["role"] == "assistant"
     assert second_request[-2]["tool_calls"][0]["function"]["name"] == "echo"
     assert second_request[-1] == {"role": "tool", "tool_call_id": "call_0", "content": "echo: hi"}
-    assert [e.kind for e in events] == ["tool_call", "finish"]
+    assert [e.kind for e in events] == ["llm_call", "tool_called", "tool_result", "llm_call", "finish"]
 
 
 def test_finish_tool_is_always_offered_without_titles():
@@ -98,7 +98,7 @@ def test_tool_errors_are_fed_back_not_raised():
     assert tool_results[0] == "ERROR: RuntimeError: kaboom"
     assert tool_results[1].startswith("ERROR: unknown tool 'nope'")
     assert tool_results[2].startswith("ERROR: invalid arguments: text: Field required")
-    assert [e.is_error for e in events if e.kind == "tool_call"] == [True, True, True]
+    assert [e.is_error for e in events if e.kind == "tool_result"] == [True, True, True]
 
 
 def test_unparseable_arguments_are_reported():
@@ -115,7 +115,7 @@ def test_text_only_reply_gets_nudged():
     assert result.success
     assert llm.requests[1][-1]["role"] == "user"
     assert "finish" in llm.requests[1][-1]["content"]
-    assert events[0].kind == "thought"
+    assert [e.kind for e in events][:2] == ["llm_call", "thought"]
 
 
 def test_finish_written_as_json_text_is_accepted():

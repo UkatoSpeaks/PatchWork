@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from typing import Any
 
@@ -23,6 +24,7 @@ class ScriptedLLM:
         self.requests_by_model: dict[str, list[list[dict[str, Any]]]] = {}
 
     async def complete(self, model, messages, tools=None, *, tool_choice=None, max_tokens=None):
+        await asyncio.sleep(0)  # yield like a real network call, so concurrent agents interleave
         snapshot = copy.deepcopy(messages)
         self.requests.append(snapshot)
         self.requests_by_model.setdefault(model, []).append(snapshot)

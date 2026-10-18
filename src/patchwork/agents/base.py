@@ -117,16 +117,25 @@ class SubmitSpec(BaseModel):
 
 
 class AgentEvent(BaseModel):
-    """Emitted as the agent works, for live logging."""
+    """Emitted as the agent works. The orchestrator turns these into bus events.
+
+    Kinds: ``llm_call`` (one completion, with its token usage), ``thought``
+    (text the model wrote), ``tool_called`` (before a tool runs),
+    ``tool_result`` (after), ``note`` (nudges, alias mappings, rejections,
+    auto-finish) and ``finish`` (the agent's last step).
+    """
 
     role: str
     step: int
-    kind: Literal["thought", "tool_call", "finish", "notice"]
+    kind: Literal["llm_call", "thought", "tool_called", "tool_result", "note", "finish"]
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
     is_error: bool = False
+    # Running total for the agent; for llm_call also this call's usage.
     tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 StopReason = Literal["finished", "max_steps", "max_tokens", "invalid_output", "error"]
@@ -291,7 +300,7 @@ class Agent:
             nonlocal invalid_submits
             invalid_submits += 1
             left = self.submit.max_retries - invalid_submits + 1
-            self._emit(step, usage, "notice", summary=f"{self.submit.name} rejected: {error}", is_error=True)
+            self._emit(step, usage, "note", summary=f"{self.submit.name} rejected: {error}", is_error=True)
             if left <= 0:
                 summary = f"{self.submit.name} failed validation {invalid_submits} times; last error: {error}"
                 return result(False, summary, "invalid_output"), ""
@@ -310,7 +319,7 @@ class Agent:
             step += 1
             note = self.nudge(step) if self.nudge is not None else None
             if note:
-                self._emit(step, usage, "notice", summary=note)
+                self._emit(step, usage, "note", summary=note)
                 messages.append({"role": "user", "content": note})
             self._compact(messages, views)
             try:
@@ -323,7 +332,7 @@ class Agent:
                 )
             except MalformedToolCall as exc:
                 if exc.failed_generation is None:
-                    self._emit(step, usage, "notice", summary="malformed tool call rejected by provider; retrying", is_error=True)
+                    self._emit(step, usage, "note", summary="malformed tool call rejected by provider; retrying", is_error=True)
                     unknown = re.search(r"call tool '([^']+)'", str(exc))
                     if unknown:
                         feedback = self._unknown_tool_message(unknown.group(1))
@@ -334,7 +343,7 @@ class Agent:
                 # Handle what the model actually wrote like any text-only reply.
                 response = LLMResponse(model=self.model, content=exc.failed_generation)
             except Exception as exc:
-                self._emit(step, usage, "notice", summary=f"LLM call failed: {exc}", is_error=True)
+                self._emit(step, usage, "note", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
 
             text_call_error = None
@@ -348,7 +357,7 @@ class Agent:
                         "insert_lines instead of rewriting a large file)."
                     )
                 elif (text_call := self._tool_call_from_text(response.content, step)) is not None:
-                    self._emit(step, usage, "notice", summary=f"tool call written as text; running {text_call.name}")
+                    self._emit(step, usage, "note", summary=f"tool call written as text; running {text_call.name}")
                     response = response.model_copy(update={"content": None, "tool_calls": [text_call]})
                 elif looks_like_call:
                     text_call_error = (
@@ -359,10 +368,14 @@ class Agent:
                 response = response.model_copy(update={"tool_calls": [self._resolve_alias(c, step, usage) for c in response.tool_calls]})
 
             usage = usage + response.usage
+            self._emit(
+                step, usage, "llm_call",
+                prompt_tokens=response.usage.prompt_tokens, completion_tokens=response.usage.completion_tokens,
+            )
             messages.append(response.to_message())
             text = (response.content or "").strip()
             if text_call_error is not None:
-                self._emit(step, usage, "notice", summary=text_call_error.removeprefix("ERROR: "), is_error=True)
+                self._emit(step, usage, "note", summary=text_call_error.removeprefix("ERROR: "), is_error=True)
                 messages.append({"role": "user", "content": text_call_error})
                 continue
 
@@ -392,7 +405,7 @@ class Agent:
                     if rejection is None:
                         self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=finish.summary, is_error=not finish.success)
                         return result(finish.success, finish.summary, "finished")
-                    self._emit(step, usage, "notice", summary=f"finish rejected: {rejection}", is_error=True)
+                    self._emit(step, usage, "note", summary=f"finish rejected: {rejection}", is_error=True)
                     messages.append({"role": "user", "content": f"finish rejected: {rejection}"})
                     continue
                 if text and text_only_streak >= 2 and self.submit is None:
@@ -404,7 +417,7 @@ class Agent:
                         self._emit(step, usage, "finish", tool=FINISH_TOOL, summary=_preview(text), is_error=not success)
                         return result(success, text, "finished")
                     text_only_streak = 0
-                    self._emit(step, usage, "notice", summary=f"give-up rejected: {rejection}", is_error=True)
+                    self._emit(step, usage, "note", summary=f"give-up rejected: {rejection}", is_error=True)
                     messages.append({"role": "user", "content": rejection})
                     continue
                 if text:
@@ -437,12 +450,13 @@ class Agent:
                         continue
                     rejection = self._reject_finish(finish)
                     if rejection is not None:
-                        self._emit(step, usage, "notice", summary=f"finish rejected: {rejection}", is_error=True)
+                        self._emit(step, usage, "note", summary=f"finish rejected: {rejection}", is_error=True)
                         messages.append(_tool_message(call.id, f"ERROR: finish rejected: {rejection}"))
                         continue
                     self._emit(step, usage, "finish", tool=FINISH_TOOL, arguments=call.arguments, summary=finish.summary, is_error=not finish.success)
                     return result(finish.success, finish.summary, "finished")
 
+                self._emit(step, usage, "tool_called", tool=call.name, arguments=call.arguments)
                 output = await self._execute(call.name, call.arguments, call.parse_error)
                 for path in output.files_changed:
                     if path not in files_changed:
@@ -461,14 +475,14 @@ class Agent:
                 self._emit(
                     step,
                     usage,
-                    "tool_call",
+                    "tool_result",
                     tool=call.name,
                     arguments=call.arguments,
                     summary=summary,
                     is_error=output.is_error,
                 )
                 if output.finish_summary is not None:
-                    self._emit(step, usage, "notice", summary=output.finish_summary)
+                    self._emit(step, usage, "note", summary=output.finish_summary)
                     self._emit(step, usage, "finish", tool="auto-finish", summary=output.finish_summary)
                     return result(True, output.finish_summary, "finished")
 
@@ -501,7 +515,7 @@ class Agent:
         target, arguments = alias(call.arguments)
         if target not in self.tools:
             return call
-        self._emit(step, usage, "notice", summary=f"mapped {call.name} -> {target}")
+        self._emit(step, usage, "note", summary=f"mapped {call.name} -> {target}")
         return call.model_copy(update={"name": target, "arguments": arguments})
 
     def _validate_submit(self, arguments: dict[str, Any]) -> tuple[BaseModel | None, str]:

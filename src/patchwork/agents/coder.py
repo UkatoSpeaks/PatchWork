@@ -150,6 +150,39 @@ def build_task(
     return "\n\n".join(parts)
 
 
+MAX_RETRY_DIFF_CHARS = 8_000
+
+
+def build_retry_task(
+    repo: Path,
+    issue: str,
+    subtasks: Sequence[Subtask],
+    diff: str,
+    feedback: str,
+    test_files: Sequence[str] = (),
+) -> str:
+    """First message for a coder retry: a fresh agent that gets only the plan,
+    the work so far (as a diff) and the feedback, not earlier histories."""
+    if len(diff) > MAX_RETRY_DIFF_CHARS:
+        cut = len(diff) - MAX_RETRY_DIFF_CHARS
+        diff = diff[:MAX_RETRY_DIFF_CHARS] + f"\n[… {cut} chars truncated; read the files for the rest]\n"
+    parts = [f"Issue to fix:\n{issue.strip()}"]
+    if subtasks:
+        parts.append("Your subtasks from the lead's plan:\n" + format_subtasks(subtasks))
+    parts.append(
+        "Earlier work on this issue is already applied in this checkout. Its diff against the original code:\n"
+        + (diff or "(no changes yet)")
+    )
+    parts.append(f"It is not done yet. {feedback.strip()}\nFix this with the smallest change, then run the full test suite.")
+    if test_files:
+        parts.append(
+            "Tests written by the tester encode the expected behaviour and are read-only for you:\n"
+            + "\n".join(f"- {p}" for p in test_files)
+        )
+    parts.append(f"Repository top level:\n{fs.list_dir(repo, '.')}")
+    return "\n\n".join(parts)
+
+
 def format_subtasks(subtasks: Sequence[Subtask]) -> str:
     lines = []
     for task in subtasks:

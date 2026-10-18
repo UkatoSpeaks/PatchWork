@@ -224,6 +224,8 @@ def write_tools(
         if on_change is not None:
             on_change(rel)
         summary = message.split("\n", 1)[0].removesuffix("; it now reads:").rstrip(":")
+        if "\nWARNING: " in message:
+            summary += " (WARNING: duplicate definition)"
         return ToolOutput(content=message, summary=summary, files_changed=[rel])
 
     def write_file(args: WriteFileArgs) -> ToolOutput:

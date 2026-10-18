@@ -330,139 +330,7 @@ def test_diff_and_files_changed_come_from_the_snapshot(tmp_path: Path):
     )
 
 
-# --- orchestrator -----------------------------------------------------------------
-
-def orchestrate(repo: Path, scripts: dict, **overrides):
-    llm = ScriptedLLM(scripts)
-    started, done = [], []
-    orchestrator = Orchestrator(
-        repo=repo, settings=settings(**overrides), llm=llm,
-        on_agent_start=lambda role, model: started.append(role),
-        on_agent_done=lambda role, run_: done.append(role),
-    )
-    return asyncio.run(orchestrator.run(VALID_PLAN["issue_summary"])), llm, started, done
-
-
-def test_orchestrator_stops_when_the_lead_fails(stats_repo: Path):
-    result, llm, started, done = orchestrate(stats_repo, {
-        "lead": [finish(success=False, summary="cannot plan")], "tester": [], "coder": [], "reviewer": [],
-    })
-    assert (result.success, result.failed_agent) == (False, "lead")
-    assert list(result.agents) == ["lead"] and started == done == ["lead"]
-    assert result.plan is None and result.files_changed == [] and result.diff == ""
-    assert [llm.requests_for(m) for m in ("tester", "coder", "reviewer")] == [[], [], []]
-
-
-def test_orchestrator_stops_when_the_tester_fails(stats_repo: Path):
-    result, llm, started, _ = orchestrate(stats_repo, {
-        "lead": [submit_plan(VALID_PLAN)],
-        "tester": [
-            reply(("write_file", {"path": "tests/test_median.py", "content": PASSING_TESTS})),
-            finish(success=False, summary="could not make them fail"),
-        ],
-        "coder": [], "reviewer": [],
-    })
-    assert (result.success, result.failed_agent) == (False, "tester")
-    assert started == ["lead", "tester"]
-    assert llm.requests_for("coder") == [] and llm.requests_for("reviewer") == []
-    # The diff still reports what the failed run left behind.
-    assert result.files_changed == ["tests/test_median.py"]
-    assert "+def test_mean_again():" in result.diff
-
-
-def test_orchestrator_stops_when_the_coder_fails(stats_repo: Path):
-    result, llm, started, _ = orchestrate(stats_repo, {
-        "lead": [submit_plan(VALID_PLAN)],
-        "tester": [reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})), finish()],
-        "coder": [finish(success=False, summary="stuck"), finish(success=False, summary="still stuck")],
-        "reviewer": [],
-    })
-    assert (result.success, result.failed_agent, result.verdict) == (False, "coder", None)
-    assert started == ["lead", "tester", "coder"] and llm.requests_for("reviewer") == []
-
-
-def test_full_scripted_run_on_stats_feature(stats_repo: Path):
-    scripts = {
-        "lead": [
-            reply(("search_code", {"pattern": "def mean"}), prompt=300, completion=20),
-            submit_plan(VALID_PLAN),
-        ],
-        "tester": [
-            reply(("read_file", {"path": "tests/test_core.py"})),
-            reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
-            reply(("run_tests", {"path": "tests/test_median.py"})),
-        ],
-        "coder": [
-            # The tester's tests are off limits...
-            reply(("edit_file", {"path": "tests/test_median.py", "old": "== 2.5", "new": "== 2"})),
-            reply(("edit_file", {"path": "stats/core.py", "old": "    return max(values) - min(values)", "new": MEDIAN_IMPL})),
-            reply(("write_file", {"path": "stats/__init__.py", "content": STATS_INIT})),
-            reply(("run_tests", {})),
-            # The model's claims about what changed are ignored.
-            finish(summary="added median() and also rewrote stats/fake.py"),
-        ],
-        "reviewer": [
-            reply(("read_file", {"path": "stats/core.py"})),
-            submit_review(issues=[{"severity": "minor", "file": "stats/core.py", "description": "docstring is long"}]),
-        ],
-    }
-    result, llm, started, done = orchestrate(stats_repo, scripts)
-
-    assert result.success and result.failed_agent is None
-    assert started == done == ["lead", "tester", "coder", "reviewer"]
-    assert list(result.agents) == ["lead", "tester", "coder", "reviewer"]
-    assert result.plan == Plan.model_validate(VALID_PLAN)
-    assert result.tests_written == ["tests/test_median.py"]
-    assert result.verdict.approved and result.verdict.issues[0].severity == "minor"
-
-    # files_changed and diff are computed from the snapshot.
-    assert result.files_changed == ["stats/__init__.py", "stats/core.py", "tests/test_median.py"]
-    assert "--- /dev/null\n+++ b/tests/test_median.py" in result.diff
-    assert "+def median(values):" in result.diff
-    assert "-from stats.core import data_range, mean, mode\n+from stats.core import data_range, mean, median, mode" in result.diff
-    assert "fake.py" not in result.diff
-
-    # Each agent starts fresh with only what it needs.
-    for model in ("lead", "tester", "coder", "reviewer"):
-        assert [m["role"] for m in llm.requests_for(model)[0]] == ["system", "user"]
-    tester_task = llm.requests_for("tester")[0][1]["content"]
-    assert "[t1] Test median" in tester_task and "[c1]" not in tester_task
-    coder_task = llm.requests_for("coder")[0][1]["content"]
-    assert "[c1] Implement median()" in coder_task and "[t1]" not in coder_task
-    assert "- tests/test_median.py" in coder_task
-    assert "def mean" not in coder_task  # nothing from the lead's exploration
-    reviewer_task = llm.requests_for("reviewer")[0][1]["content"]
-    assert "+def median(values):" in reviewer_task and "- stats/core.py" in reviewer_task
-
-    coder_results = tool_results(llm.requests_for("coder")[-1])
-    assert "written by the tester agent and is read-only" in coder_results[0]
-    assert coder_results[3].startswith("PASSED: 9 passed")
-    assert "== 2.5" in (stats_repo / "tests" / "test_median.py").read_text()
-
-    # Tokens per agent and in total.
-    assert result.tokens == {"lead": 430, "tester": 330, "coder": 550, "reviewer": 220}
-    assert result.total_tokens == 1530
-    dumped = result.model_dump()
-    assert dumped["total_tokens"] == 1530 and dumped["tokens"]["coder"] == 550
-
-
-def test_reviewer_rejection_means_overall_failure(stats_repo: Path):
-    blocker = {"severity": "blocker", "file": "stats/core.py", "description": "median of strings is not handled"}
-    result, *_ = orchestrate(stats_repo, {
-        "lead": [submit_plan(VALID_PLAN)],
-        "tester": [reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})), finish()],
-        "coder": [
-            reply(("edit_file", {"path": "stats/core.py", "old": "    return max(values) - min(values)", "new": MEDIAN_IMPL})),
-            reply(("write_file", {"path": "stats/__init__.py", "content": STATS_INIT})),
-            reply(("run_tests", {})),
-            finish(),
-        ],
-        "reviewer": [submit_review(approved=False, issues=[blocker], summary="Needs work.")],
-    })
-    assert result.agents["coder"].success
-    assert result.verdict.approved is False
-    assert result.success is False and result.failed_agent is None
-
+# --- solo (crew runs are covered in test_orchestrator.py) -------------------------------
 
 def test_solo_mode_runs_only_the_coder(tmp_path: Path):
     from conftest import TOY_CALCULATOR
@@ -534,7 +402,7 @@ def test_tester_auto_finishes_on_fail_first(stats_repo: Path, content):
     result = run(build_tester(repo=stats_repo, settings=settings(), llm=llm, on_event=events.append))
     assert result.success and result.stop_reason == "finished" and result.steps_used == 2
     assert result.summary.startswith("tester: fail-first confirmed, auto-finished (FAILED")
-    assert any(e.kind == "notice" and e.summary.startswith("tester: fail-first confirmed, auto-finished") for e in events)
+    assert any(e.kind == "note" and e.summary.startswith("tester: fail-first confirmed, auto-finished") for e in events)
 
 
 def test_tester_does_not_auto_finish_on_syntax_error_or_full_suite(stats_repo: Path):

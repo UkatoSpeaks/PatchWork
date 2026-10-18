@@ -64,33 +64,80 @@ class ReviewVerdict(BaseModel):
     summary: str
 
     @model_validator(mode="after")
-    def _approved_has_no_blockers(self) -> ReviewVerdict:
-        if self.approved and any(i.severity == "blocker" for i in self.issues):
+    def _approved_means_no_blockers(self) -> ReviewVerdict:
+        blockers = self.blockers
+        if self.approved and blockers:
             raise ValueError("approved must be false when there is a blocker issue")
+        if not self.approved and not blockers:
+            raise ValueError(
+                "approved must be true when there is no blocker issue; if something must be fixed before "
+                'merging, list it with severity "blocker"'
+            )
         return self
+
+    @property
+    def blockers(self) -> list[ReviewIssue]:
+        return [i for i in self.issues if i.severity == "blocker"]
+
+
+class AgentRun(BaseModel):
+    """One agent run within a Patchwork run; retries are separate entries."""
+
+    agent: str
+    # e.g. "coder", "coder (retry 1: tests)", "reviewer (round 2)"
+    label: str
+    model: str
+    result: AgentResult
+    duration_s: float
 
 
 class RunResult(BaseModel):
-    """Outcome of one Patchwork run. ``diff`` and ``files_changed`` are computed
-    from a snapshot of the repo, never taken from what a model reports."""
+    """Outcome of one Patchwork run. ``diff`` and ``files_changed`` come from
+    git (crew: result branch vs the run's base commit) or a snapshot (solo),
+    never from what a model reports."""
 
+    run_id: str = ""
     issue: str
     mode: Literal["crew", "solo"] = "crew"
+    sequential: bool = False
     plan: Plan | None = None
-    # Per-agent results in the order the agents ran; agents that never ran are absent.
-    agents: dict[str, AgentResult] = Field(default_factory=dict)
+    # Every agent run in order, including retries.
+    runs: list[AgentRun] = Field(default_factory=list)
     tests_written: list[str] = Field(default_factory=list)
+    # The latest review verdict.
     verdict: ReviewVerdict | None = None
+    retries: int = 0
+    # Whether the full suite passed in the result worktree at the end (crew).
+    tests_passed: bool | None = None
     diff: str = ""
     files_changed: list[str] = Field(default_factory=list)
+    # Branch holding the result (crew), kept after the run for inspection.
+    result_branch: str | None = None
+    base_commit: str | None = None
+    # Wall-clock seconds per phase (plan, implement, integrate, verify, review, retry).
+    phases: dict[str, float] = Field(default_factory=dict)
     success: bool = False
     # The agent that failed and stopped the run, if any.
     failed_agent: str | None = None
+    # A run-level problem (not a git repo, merge conflict, ...).
+    error: str | None = None
+
+    @property
+    def agents(self) -> dict[str, AgentResult]:
+        """The latest result of each agent, in the order the agents first ran."""
+        latest: dict[str, AgentResult] = {}
+        for run in self.runs:
+            latest[run.agent] = run.result
+        return latest
 
     @computed_field
     @property
     def tokens(self) -> dict[str, int]:
-        return {role: result.tokens_used for role, result in self.agents.items()}
+        """Tokens per agent, summed over its runs (retries included)."""
+        totals: dict[str, int] = {}
+        for run in self.runs:
+            totals[run.agent] = totals.get(run.agent, 0) + run.result.tokens_used
+        return totals
 
     @computed_field
     @property

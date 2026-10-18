@@ -1,7 +1,7 @@
 [project]
 name = "patchwork"
 version = "0.1.0"
-description = "Multi-agent coding system that fixes GitHub issues (milestone 2: sequential lead/tester/coder/reviewer crew)"
+description = "Multi-agent coding system that fixes GitHub issues (milestone 3: parallel crew on git worktrees, retries, events)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

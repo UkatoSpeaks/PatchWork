@@ -121,6 +121,66 @@ def read_file(
 def write_file(root: str | os.PathLike[str], path: str, content: str) -> str:
     """Create or overwrite a file (parent directories are created).
 
+    The result shows the changed region, plus a warning if a .py file now
+    defines a top-level name twice.
+    """
+    return _write_file(root, path, content) + _duplicate_warning(root, path)
+
+
+def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> str:
+    """Replace the single exact occurrence of ``old`` with ``new``; see ``_edit_file``."""
+    return _edit_file(root, path, old, new) + _duplicate_warning(root, path)
+
+
+def insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text: str) -> str:
+    """Insert ``text`` after line ``after_line``; see ``_insert_lines``."""
+    return _insert_lines(root, path, after_line, text) + _duplicate_warning(root, path)
+
+
+def duplicate_definitions(text: str) -> dict[str, list[int]]:
+    """Top-level function/class names defined more than once, with their lines.
+
+    ``@overload`` stubs are legitimate repeats and are ignored.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return {}
+    seen: dict[str, list[int]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if any(_decorator_name(d) == "overload" for d in node.decorator_list):
+            continue
+        seen.setdefault(node.name, []).append(node.lineno)
+    return {name: lines for name, lines in seen.items() if len(lines) > 1}
+
+
+def _decorator_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _duplicate_warning(root: str | os.PathLike[str], path: str) -> str:
+    target = resolve_in_root(root, path)
+    if target.suffix != ".py" or not target.is_file():
+        return ""
+    notes = []
+    for name, lines in duplicate_definitions(_read_text(target)).items():
+        times = "twice" if len(lines) == 2 else f"{len(lines)} times"
+        where = ", ".join(str(n) for n in lines[:-1]) + f" and {lines[-1]}"
+        notes.append(f"WARNING: {name} is now defined {times} (lines {where}); remove one")
+    return "".join("\n" + note for note in notes)
+
+
+def _write_file(root: str | os.PathLike[str], path: str, content: str) -> str:
+    """Create or overwrite a file (parent directories are created).
+
     An overwritten file keeps its line-ending style. A .py file is only
     written if it parses. The result shows the changed region, numbered.
     """
@@ -146,7 +206,7 @@ def write_file(root: str | os.PathLike[str], path: str, content: str) -> str:
     return head + f"; changed lines {first}-{last}:\n" + render_region(lines, first, last)
 
 
-def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> str:
+def _edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> str:
     """Replace the single exact occurrence of ``old`` with ``new``.
 
     Much cheaper in tokens than rewriting a whole file. Matching ignores CRLF
@@ -187,7 +247,7 @@ def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> st
     return f"edited {rel} at line {first}; it now reads:\n" + render_region(updated.splitlines(), first, last)
 
 
-def insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text: str) -> str:
+def _insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text: str) -> str:
     """Insert ``text`` after 1-based line ``after_line`` (0 = top, -1 = end).
 
     Like edit_file: keeps line endings, refuses unparseable .py results, and

@@ -23,3 +23,15 @@ def copy_toy(source: Path, tmp_path: Path) -> Path:
     dest = tmp_path / source.name
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
     return dest
+
+
+@pytest.fixture
+def git_env(tmp_path_factory, monkeypatch) -> None:
+    """Isolate git from the machine's config: fixed identity, LF line endings."""
+    config = tmp_path_factory.mktemp("gitconfig") / "config"
+    config.write_text(
+        "[user]\n\tname = Test\n\temail = test@example.com\n"
+        "[init]\n\tdefaultBranch = main\n[core]\n\tautocrlf = false\n[commit]\n\tgpgsign = false\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")

@@ -24,7 +24,7 @@ Check:
 4. Style: consistent with the surrounding code, clear names, docstrings where neighbouring code has them.
 The full test suite already passes; do not re-check what the tests prove.
 
-Then call {SUBMIT_TOOL} once: approved (true only if there is no blocker), issues (each with severity "blocker" or "minor", file and description) and a short summary. Use "blocker" only for problems that must be fixed before merging.
+Then call {SUBMIT_TOOL} once: approved, issues (each with severity "blocker" or "minor", file and description) and a short summary. approved is true exactly when there is no blocker. Use "blocker" only for problems that must be fixed before merging; a blocker sends the change back to the coder.
 
 {NO_REREAD}
 Be terse. Do not explain between tool calls; just call the next tool."""
