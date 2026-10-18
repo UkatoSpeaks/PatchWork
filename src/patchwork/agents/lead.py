@@ -21,6 +21,7 @@ Workflow:
 2. Call {SUBMIT_TOOL} once with:
    - issue_summary: one or two sentences.
    - subtasks: one "tester" subtask (the behaviour the new tests must check) and one or more "coder" subtasks (the code changes). Each has a short id (t1, c1, ...), a description, files_hint (paths likely involved) and acceptance_criteria (checkable statements).
+     The tester subtask ALWAYS targets a NEW test file, e.g. tests/test_<feature>.py, never an existing test file: the tester may not change existing tests. Its files_hint may also name the source files under test.
    - risks: edge cases or ways the change could go wrong.
 If the plan is rejected, fix what the error says and call {SUBMIT_TOOL} again.
 
@@ -40,6 +41,7 @@ def build_lead(*, repo: Path, settings: Settings, llm: SupportsComplete, on_even
             description="Submit the plan. Ends your task.",
             schema_model=Plan,
             summary_field="issue_summary",
+            context={"repo": repo},
         ),
         llm=llm,
         max_steps=settings.max_steps_per_agent,

@@ -81,6 +81,27 @@ def tests_only(rel: str) -> None:
 tests_only.__test__ = False  # not a pytest test
 
 
+def new_files_only(repo: Path, created: Collection[str]) -> WriteGuard:
+    """Write guard that refuses files which already exist, unless the agent
+    created them itself (``created`` is the live collection of its writes)."""
+
+    def guard(rel: str) -> None:
+        if (repo / rel).exists() and rel not in created:
+            raise WriteNotAllowed(
+                f"{rel} already exists; existing tests must not be changed; put new tests in a new file"
+            )
+
+    return guard
+
+
+def all_of(*guards: WriteGuard) -> WriteGuard:
+    def guard(rel: str) -> None:
+        for check in guards:
+            check(rel)
+
+    return guard
+
+
 def protect(paths: Collection[str], owner: str = "tester") -> WriteGuard:
     """Write guard that refuses the given root-relative paths."""
     blocked = {os.path.normcase(p) for p in paths}
@@ -97,22 +118,34 @@ def protect(paths: Collection[str], owner: str = "tester") -> WriteGuard:
 
 def read_only_tools(repo: Path) -> list[Tool]:
     def read_file(args: ReadFileArgs) -> ToolOutput:
+        if fs.resolve_in_root(repo, args.path).is_dir():
+            rel = fs.to_relative(repo, args.path)
+            text = fs.list_dir(repo, args.path)
+            return ToolOutput(
+                content=f"{rel} is a directory; its entries:\n{text}",
+                summary=f"directory: {len(text.splitlines())} entries",
+                view_key=f"list_dir {rel}",
+            )
         text = fs.read_file(repo, args.path, offset=args.offset)
-        return ToolOutput(content=text, summary=text.rsplit("\n", 1)[-1].strip("[]"))
+        rel = fs.to_relative(repo, args.path)
+        key = f"read_file {rel}" + (f" from line {args.offset}" if args.offset > 1 else "")
+        return ToolOutput(content=text, summary=text.rsplit("\n", 1)[-1].strip("[]"), view_key=key)
 
     def list_dir(args: ListDirArgs) -> ToolOutput:
         text = fs.list_dir(repo, args.path)
-        return ToolOutput(content=text, summary=f"{len(text.splitlines())} entries")
+        rel = fs.to_relative(repo, args.path)
+        return ToolOutput(content=text, summary=f"{len(text.splitlines())} entries", view_key=f"list_dir {rel}")
 
     def search_code(args: SearchCodeArgs) -> ToolOutput:
         matches = fs.search_code(repo, args.pattern, path=args.path, glob=args.glob)
+        key = f"search_code {args.pattern!r} in {args.path}" + (f" ({args.glob})" if args.glob else "")
         if not matches:
-            return ToolOutput(content="no matches", summary="no matches")
+            return ToolOutput(content="no matches", summary="no matches", view_key=key)
         lines = [f"{m.path}:{m.line}: {m.text}" for m in matches]
         if len(matches) >= fs.MAX_SEARCH_RESULTS:
             lines.append(f"[capped at {fs.MAX_SEARCH_RESULTS} results; narrow the pattern or path]")
         files = len({m.path for m in matches})
-        return ToolOutput(content="\n".join(lines), summary=f"{len(matches)} match(es) in {files} file(s)")
+        return ToolOutput(content="\n".join(lines), summary=f"{len(matches)} match(es) in {files} file(s)", view_key=key)
 
     return [
         Tool(name="search_code", description="Regex search; returns path:line: text.", args_model=SearchCodeArgs, handler=search_code),
@@ -139,7 +172,8 @@ def write_tools(
     def changed(rel: str, message: str) -> ToolOutput:
         if on_change is not None:
             on_change(rel)
-        return ToolOutput(content=message, files_changed=[rel])
+        summary = message.split("\n", 1)[0].removesuffix("; it now reads:").rstrip(":")
+        return ToolOutput(content=message, summary=summary, files_changed=[rel])
 
     def write_file(args: WriteFileArgs) -> ToolOutput:
         rel = checked(args.path)
@@ -155,23 +189,26 @@ def write_tools(
     ]
 
 
-def run_tests_tool(
-    repo: Path,
-    test_command: str,
-    timeout: float,
-    on_result: Callable[[shell.RunTestsResult, bool], None] | None = None,
-) -> Tool:
-    """``on_result(result, full_suite)`` is called after every run."""
+# (result, target) -> optional finish summary. ``target`` is the normalized
+# path or node id that was run, or None for the full suite. Returning a string
+# ends the agent's run with success.
+TestResultHook = Callable[[shell.RunTestsResult, str | None], str | None]
 
+
+def run_tests_tool(repo: Path, test_command: str, timeout: float, on_result: TestResultHook | None = None) -> Tool:
     def run_tests(args: RunTestsArgs) -> ToolOutput:
-        extra = []
+        target = None
         if args.path and args.path.strip() not in ("", "."):
             # Allow pytest node ids (file.py::test_name); only the file part is a path.
             file_part, sep, node = args.path.partition("::")
-            extra = [fs.to_relative(repo, file_part) + sep + node]
-        result = shell.run_tests(repo, test_command, timeout=timeout, extra_args=extra)
-        if on_result is not None:
-            on_result(result, not extra)
-        return ToolOutput(content=result.render(), summary=result.summary_line(), is_error=not result.passed)
+            target = fs.to_relative(repo, file_part) + sep + node
+        result = shell.run_tests(repo, test_command, timeout=timeout, extra_args=[target] if target else [])
+        finish_summary = on_result(result, target) if on_result is not None else None
+        return ToolOutput(
+            content=result.render(),
+            summary=result.summary_line(),
+            is_error=not result.passed,
+            finish_summary=finish_summary,
+        )
 
     return Tool(name="run_tests", description="Run the test suite (or one path).", args_model=RunTestsArgs, handler=run_tests)

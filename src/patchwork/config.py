@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     # One model per agent role, so models can be swapped without code changes.
     lead_model: str = "groq/openai/gpt-oss-120b"
     coder_model: str = "groq/openai/gpt-oss-120b"
-    tester_model: str = "groq/openai/gpt-oss-20b"
-    reviewer_model: str = "groq/openai/gpt-oss-120b"
+    tester_model: str = "groq/openai/gpt-oss-120b"
+    reviewer_model: str = "groq/qwen/qwen3.8-27b"
 
     # Agent budgets
     max_steps_per_agent: int = Field(default=25, ge=1)

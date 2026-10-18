@@ -20,7 +20,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from patchwork.llm import LLMResponse, MalformedToolCall, TokenUsage
+from patchwork.llm import LLMResponse, MalformedToolCall, TokenUsage, ToolCall
 
 FINISH_TOOL = "finish"
 ELIDE_KEEP_CHARS = 300
@@ -33,6 +33,13 @@ class ToolOutput(BaseModel):
     summary: str | None = None
     files_changed: list[str] = Field(default_factory=list)
     is_error: bool = False
+    # Identifies a read-only view (a file page, a search). The latest result per
+    # key stays in full in the history, older ones are stubbed, and an identical
+    # repeat is replaced by a pointer to the earlier result.
+    view_key: str | None = None
+    # Set by a tool that has itself verified the task is complete: the run ends
+    # with success and this summary.
+    finish_summary: str | None = None
 
 
 class Tool(BaseModel):
@@ -92,6 +99,8 @@ class SubmitSpec(BaseModel):
     max_retries: int = 2
     # Field of the validated payload used as the AgentResult summary.
     summary_field: str = "summary"
+    # Passed to ``model_validate`` as the validation context.
+    context: dict[str, Any] | None = None
 
     def schema(self) -> dict[str, Any]:
         return {
@@ -159,16 +168,25 @@ class Agent:
         max_output_tokens: int = 1024,
         tool_choice: str | None = "auto",
         keep_recent_tool_results: int = 3,
+        keep_recent_views: int = 6,
         max_tool_output_chars: int = 8_000,
         verify_finish: Callable[[], str | None] | None = None,
         submit: SubmitSpec | None = None,
+        nudge: Callable[[int], str | None] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         """``verify_finish`` checks a claimed success independently of the model:
         it returns None to accept, or a reason that is fed back to the model.
 
         With ``submit``, success is reported only through the submit tool;
-        ``finish`` remains available for giving up (success=false)."""
+        ``finish`` remains available for giving up (success=false).
+
+        ``nudge(step)`` is called before each LLM call; a returned string is
+        added to the conversation as a note for that turn.
+
+        The latest result of up to ``keep_recent_views`` views (see
+        ``ToolOutput.view_key``) is kept in full even when older than the
+        last ``keep_recent_tool_results`` tool results."""
         names = [t.name for t in tools]
         reserved = {FINISH_TOOL} | ({submit.name} if submit else set())
         if reserved & set(names):
@@ -185,9 +203,11 @@ class Agent:
         self.max_output_tokens = max_output_tokens
         self.tool_choice = tool_choice
         self.keep_recent_tool_results = keep_recent_tool_results
+        self.keep_recent_views = keep_recent_views
         self.max_tool_output_chars = max_tool_output_chars
         self.verify_finish = verify_finish
         self.submit = submit
+        self.nudge = nudge
         self.on_event = on_event
         self._schemas = [t.schema() for t in tools] + ([submit.schema()] if submit else []) + [FINISH.schema()]
 
@@ -198,6 +218,8 @@ class Agent:
         ]
         usage = TokenUsage()
         files_changed: list[str] = []
+        # Message index -> (view key, step) for view results still in full.
+        views: dict[int, tuple[str, int]] = {}
         step = 0
 
         def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
@@ -242,7 +264,11 @@ class Agent:
                     False, f"Stopped: token budget of {self.max_tokens} exhausted.", "max_tokens"
                 )
             step += 1
-            self._compact(messages)
+            note = self.nudge(step) if self.nudge is not None else None
+            if note:
+                self._emit(step, usage, "notice", summary=note)
+                messages.append({"role": "user", "content": note})
+            self._compact(messages, views)
             try:
                 response = await self.llm.complete(
                     self.model,
@@ -262,6 +288,12 @@ class Agent:
                 self._emit(step, usage, "notice", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
 
+            if not response.tool_calls:
+                text_call = self._tool_call_from_text(response.content, step)
+                if text_call is not None:
+                    self._emit(step, usage, "notice", summary=f"tool call written as text; running {text_call.name}")
+                    response = response.model_copy(update={"content": None, "tool_calls": [text_call]})
+
             usage = usage + response.usage
             messages.append(response.to_message())
             text = (response.content or "").strip()
@@ -271,8 +303,6 @@ class Agent:
                 data = _json_from_text(text)
                 if self.submit is not None and data is not None and not _looks_like_finish(data):
                     # The submit arguments written as plain JSON text.
-                    if data.get("name") == self.submit.name:
-                        data = data.get("arguments") or data.get("parameters") or {}
                     payload, error = self._validate_submit(data)
                     if payload is not None:
                         return submitted(payload, data)
@@ -336,16 +366,30 @@ class Agent:
                 for path in output.files_changed:
                     if path not in files_changed:
                         files_changed.append(path)
-                messages.append(_tool_message(call.id, output.content))
+                content = output.content
+                if output.view_key is not None:
+                    earlier = max((i for i, (key, _) in views.items() if key == output.view_key), default=None)
+                    if earlier is not None and messages[earlier]["content"] == content:
+                        content = (
+                            f"[unchanged since your identical call at step {views[earlier][1]}; "
+                            "that result is still in your context above, so it is not repeated]"
+                        )
+                    else:
+                        views[len(messages)] = (output.view_key, step)
+                messages.append(_tool_message(call.id, content))
                 self._emit(
                     step,
                     usage,
                     "tool_call",
                     tool=call.name,
                     arguments=call.arguments,
-                    summary=output.summary or _preview(output.content),
+                    summary=output.summary or _preview(content),
                     is_error=output.is_error,
                 )
+                if output.finish_summary is not None:
+                    self._emit(step, usage, "notice", summary=output.finish_summary)
+                    self._emit(step, usage, "finish", tool="auto-finish", summary=output.finish_summary)
+                    return result(True, output.finish_summary, "finished")
 
         return result(False, f"Stopped: reached the limit of {self.max_steps} steps.", "max_steps")
 
@@ -359,9 +403,28 @@ class Agent:
 
     def _validate_submit(self, arguments: dict[str, Any]) -> tuple[BaseModel | None, str]:
         try:
-            return self.submit.schema_model.model_validate(arguments), ""
+            return self.submit.schema_model.model_validate(arguments, context=self.submit.context), ""
         except ValidationError as exc:
             return None, _format_validation(exc)
+
+    def _tool_call_from_text(self, text: str | None, step: int) -> ToolCall | None:
+        """A tool call the model wrote as JSON text ({"name": ..., "arguments": ...})."""
+        data = _json_from_text(text or "")
+        if data is None:
+            return None
+        name = data.get("name")
+        known = {*self.tools, FINISH_TOOL} | ({self.submit.name} if self.submit else set())
+        if name not in known:
+            return None
+        arguments = data.get("arguments", data.get("parameters", {}))
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(arguments, dict):
+            return None
+        return ToolCall(id=f"text_call_{step}", name=name, arguments=arguments)
 
     async def _execute(self, name: str, arguments: dict[str, Any], parse_error: str | None) -> ToolOutput:
         tool = self.tools.get(name)
@@ -383,12 +446,26 @@ class Agent:
             )
         return output
 
-    def _compact(self, messages: list[dict[str, Any]]) -> None:
+    def _compact(self, messages: list[dict[str, Any]], views: dict[int, tuple[str, int]] | None = None) -> None:
         """Shrink old tool results and old tool-call arguments in place.
 
         Every request resends the whole history, so on a tokens-per-minute
-        budget, stale file dumps and test logs are the main cost.
+        budget, stale file dumps and test logs are the main cost. The latest
+        result of each recent view (e.g. the last read of a file) is kept in
+        full so the model does not have to read it again; older results for
+        the same view are replaced with a stub.
         """
+        views = views if views is not None else {}
+        latest: dict[str, int] = {}
+        for index in sorted(views):
+            latest[views[index][0]] = index
+        for index in sorted(views):
+            key = views[index][0]
+            if latest[key] != index:
+                messages[index] = {**messages[index], "content": f"[superseded by a later result for {key}]"}
+                del views[index]
+        pinned = set(sorted(latest.values())[-self.keep_recent_views:]) if self.keep_recent_views > 0 else set()
+
         tool_indexes = [i for i, m in enumerate(messages) if m["role"] == "tool"]
         keep = self.keep_recent_tool_results
         if len(tool_indexes) <= keep:
@@ -397,9 +474,12 @@ class Agent:
         for i in range(cutoff):
             message = messages[i]
             if message["role"] == "tool":
+                if i in pinned:
+                    continue
                 content = message["content"]
                 if len(content) > ELIDE_KEEP_CHARS + len(ELIDED_MARK) and not content.endswith(ELIDED_MARK):
                     messages[i] = {**message, "content": content[:ELIDE_KEEP_CHARS] + ELIDED_MARK}
+                    views.pop(i, None)
             elif message["role"] == "assistant" and message.get("tool_calls"):
                 messages[i] = {**message, "tool_calls": [_shrink_call(c) for c in message["tool_calls"]]}
 
@@ -440,13 +520,11 @@ def _json_from_text(text: str) -> dict[str, Any] | None:
 
 
 def _looks_like_finish(data: dict[str, Any]) -> bool:
-    return data.get("name") == FINISH_TOOL or (bool(data) and set(data) <= set(FinishArgs.model_fields))
+    return bool(data) and set(data) <= set(FinishArgs.model_fields)
 
 
 def _finish_from_args(data: dict[str, Any]) -> FinishArgs | None:
     """Recognise finish arguments written as plain JSON text instead of a tool call."""
-    if data.get("name") == FINISH_TOOL:
-        data = data.get("arguments") or data.get("parameters") or {}
     try:
         return FinishArgs.model_validate(data)
     except ValidationError:

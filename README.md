@@ -4,14 +4,23 @@ A multi-agent coding system for fixing GitHub issues. A lead agent plans the fix
 
 **Status: milestone 2.** Four agents run one after another, in a fixed order:
 
-1. **lead**: explores the repo read-only and submits a `Plan` (issue summary, tester/coder subtasks with files and acceptance criteria, risks) through a `submit_plan` tool. Invalid plans are sent back with the validation error (up to 2 retries).
-2. **tester**: writes *new* tests that encode the issue's expected behaviour. It can only write test files (under a `tests/` directory or named `test_*.py`), and its success is accepted only if Patchwork re-runs those tests and they **fail**.
-3. **coder**: the milestone 1 agent, now given the plan's coder subtasks and the tester's test paths. It cannot edit any file the tester created or modified, and succeeds only if the full suite passes after its last edit.
+1. **lead**: explores the repo read-only and submits a `Plan` (issue summary, tester/coder subtasks with files and acceptance criteria, risks) through a `submit_plan` tool. Invalid plans are sent back with the validation error (up to 2 retries). A tester subtask that names an existing test file is invalid: tests go in a new file.
+2. **tester**: writes tests in a *new* file that encode the issue's expected behaviour. It can only create test files (under a `tests/` directory or named `test_*.py`); existing test files can't be changed. Its success counts only if those tests **fail** before the fix (an ImportError for the missing feature counts; a syntax error doesn't). As soon as a `run_tests` on its new files shows that, the tester is ended automatically.
+3. **coder**: the milestone 1 agent, now given the plan's coder subtasks and the tester's test paths. It cannot edit any file the tester created or modified, and succeeds only if the full suite passes after its last edit. It is nudged if it edits files and then goes 5 steps without running tests.
 4. **reviewer**: reads the run's diff (read-only tools) and submits a `ReviewVerdict` through `submit_review`. In milestone 2 the verdict is only reported; there is no retry loop yet.
 
 Each agent gets only what it needs from earlier agents, not their history. The repo is copied to a temp dir before the run, and the diff and changed files are computed from that copy with `difflib`, never taken from what a model says. A run succeeds when the coder succeeds **and** the reviewer approves. If an agent fails, the run stops and reports which one.
 
 Write restrictions are enforced in the tool layer (`agents/toolkit.py`), not just in prompts.
+
+Tool behaviour that helps every agent recover without wasted steps:
+
+- `edit_file` matches regardless of CRLF vs LF and keeps the file's line endings. It also accepts text copied with read_file's `N| ` prefixes. When the text isn't found, the error shows the closest matching lines, numbered.
+- Successful `edit_file` / `write_file` results show the changed region with 5 lines of context, so there is no need to re-read the file.
+- Writes to `.py` files are refused, and the file is left unchanged, if the result doesn't parse (`ast.parse`). The error gives the line number.
+- `read_file` on a directory returns its listing. A missing path suggests close matches ("did you mean tests/test_core.py?").
+- A tool call written as JSON text (`{"name": ..., "arguments": ...}`) is executed like a normal tool call.
+- Failed `run_tests` results start with the failure reason (the pytest `E ...` lines), then the last 30 lines of output.
 
 ## Setup
 
@@ -27,7 +36,7 @@ All settings are read from `.env` (or real environment variables). See `.env.exa
 | Variable | Default | Purpose |
 |---|---|---|
 | `GROQ_API_KEY` | none | Required for `groq/` models |
-| `LEAD_MODEL` / `CODER_MODEL` / `TESTER_MODEL` / `REVIEWER_MODEL` | `groq/openai/gpt-oss-120b` (tester: `groq/openai/gpt-oss-20b`) | Model for each role, as LiteLLM model strings. `--solo` uses only `CODER_MODEL`. |
+| `LEAD_MODEL` / `CODER_MODEL` / `TESTER_MODEL` / `REVIEWER_MODEL` | `groq/openai/gpt-oss-120b` (reviewer: `groq/qwen/qwen3.8-27b`, to spread load across Groq's per-model rate limits) | Model for each role, as LiteLLM model strings. `--solo` uses only `CODER_MODEL`. |
 | `MAX_STEPS_PER_AGENT` | 25 | LLM turns before an agent gives up (per agent) |
 | `MAX_TOKENS_PER_RUN` | 60000 | Prompt + completion token budget per agent |
 | `MAX_OUTPUT_TOKENS` | 1024 | `max_tokens` for each LLM call |
@@ -115,7 +124,8 @@ The free tier allows roughly 30 requests and 6k tokens per minute per model, and
 - caps `read_file` at 200 lines and 8k characters per call, and clips very long lines;
 - adds `edit_file` (exact find/replace), so a fix doesn't have to rewrite the whole file;
 - keeps only the last end of test output (3k chars per stream);
-- elides old tool results and old tool-call arguments, keeping the 3 most recent in full;
+- elides old tool results and old tool-call arguments, keeping the 3 most recent in full, plus the latest read of each recently read file (older reads of the same file become a one-line stub);
+- answers a repeated read or search whose result hasn't changed with a short pointer to the earlier result instead of the full content again;
 - strips `title` keys from tool JSON schemas and keeps tool descriptions short;
 - forces tool calls (`tool_choice="required"`) so turns aren't spent on prose;
 - tells every agent not to re-read a file it has just written or edited, since the tool result confirms the change;

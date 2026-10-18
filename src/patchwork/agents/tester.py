@@ -8,7 +8,16 @@ from typing import TYPE_CHECKING
 
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
 from patchwork.agents.coder import format_subtasks
-from patchwork.agents.toolkit import NO_REREAD, is_test_module, read_only_tools, run_tests_tool, tests_only, write_tools
+from patchwork.agents.toolkit import (
+    NO_REREAD,
+    all_of,
+    is_test_module,
+    new_files_only,
+    read_only_tools,
+    run_tests_tool,
+    tests_only,
+    write_tools,
+)
 from patchwork.config import Settings
 from patchwork.tools import fs, shell
 
@@ -18,17 +27,19 @@ if TYPE_CHECKING:
 ROLE = "tester"
 
 SYSTEM_PROMPT = f"""\
-You are the tester agent in Patchwork. Before any fix exists, you write NEW tests that encode the behaviour the issue asks for. A coder agent will then change the code to make them pass. All paths are relative to the repo root.
+You are the tester agent in Patchwork. The feature or fix described in the issue DOES NOT EXIST YET. You write NEW tests that encode the behaviour the issue asks for; a coder agent implements it afterwards. All paths are relative to the repo root.
+
+Your new tests are SUPPOSED to fail. Because the code is missing, an ImportError or AttributeError for the missing function or name is expected and correct; so is an assertion failure on the old behaviour. That is not your mistake: do not rewrite imports or tests to make that error go away. Your job ends the moment your new tests fail for that reason; Patchwork then finishes your task automatically.
 
 Rules:
-- You may only create or edit test files: files under a tests/ directory or named test_*.py. Other writes are refused.
+- Create a NEW test file, e.g. tests/test_<feature>.py. You may only create test files (under a tests/ directory or named test_*.py). Existing test files must not be changed; edits to them are refused.
 - Do not fix or change the code under test.
 
 Workflow:
-1. Look at the existing tests to match their style and imports. Read the code under test only as far as you need.
-2. Write focused tests in a new file such as tests/test_<topic>.py, covering the acceptance criteria and edge cases from the issue. Prefer `import pkg` and calling `pkg.func(...)` inside each test, so a missing function fails the test instead of breaking collection.
-3. run_tests on your new file. The tests must FAIL now, because the fix does not exist yet. If they pass, they do not capture the issue: rewrite them.
-4. Call finish with success=true once they fail for the right reason. Patchwork re-runs them to check. If you cannot write such tests, call finish with success=false.
+1. Read one existing test file to match its style and imports. Read the code under test only as far as you need.
+2. write_file your new test file, covering the acceptance criteria and edge cases from the issue.
+3. run_tests with path set to your new file. If it fails because the feature is missing (or the old behaviour is wrong), you are done. If your tests PASS, they do not capture the issue: rewrite them. Fix only real mistakes in your own file, such as a syntax error or a typo in an existing name.
+4. If you cannot write such tests, call finish with success=false.
 
 {NO_REREAD}
 Be terse. Do not explain between tool calls; just call the next tool."""
@@ -72,6 +83,15 @@ class FailingTestGate:
         result = shell.run_tests(self.repo, self.test_command, timeout=self.timeout, extra_args=files)
         return _must_fail_verdict(result)
 
+    def auto_finish(self, result: shell.RunTestsResult, target: str | None) -> str | None:
+        """After a tester run_tests: end the task if the run covered only the
+        tester's new files and shows them failing the right way."""
+        if target is None or target.partition("::")[0] not in self.test_files:
+            return None
+        if _must_fail_verdict(result) is not None:
+            return None
+        return f"tester: fail-first confirmed, auto-finished ({result.summary_line()})"
+
 
 def _must_fail_verdict(result: shell.RunTestsResult) -> str | None:
     """None if the run shows the new tests failing as they should; otherwise why not."""
@@ -107,8 +127,8 @@ def build_tester(
     gate = FailingTestGate(repo, command, settings.test_timeout_seconds)
     tools: list[Tool] = [
         *read_only_tools(repo),
-        *write_tools(repo, guard=tests_only, on_change=gate.record),
-        run_tests_tool(repo, command, settings.test_timeout_seconds),
+        *write_tools(repo, guard=all_of(tests_only, new_files_only(repo, gate.written)), on_change=gate.record),
+        run_tests_tool(repo, command, settings.test_timeout_seconds, gate.auto_finish),
     ]
     return Agent(
         role=ROLE,

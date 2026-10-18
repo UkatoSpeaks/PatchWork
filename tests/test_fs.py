@@ -147,7 +147,9 @@ def test_read_file_caps_total_characters(repo: Path):
 
 def test_write_and_edit_file(repo: Path):
     fs.write_file(repo, "pkg/mod.py", "def f():\n    return 1\n")
-    assert fs.edit_file(repo, "pkg/mod.py", "return 1", "return 2") == "edited pkg/mod.py at line 2"
+    assert fs.edit_file(repo, "pkg/mod.py", "return 1", "return 2") == (
+        "edited pkg/mod.py at line 2; it now reads:\n1| def f():\n2|     return 2"
+    )
     assert (repo / "pkg" / "mod.py").read_text() == "def f():\n    return 2\n"
 
 

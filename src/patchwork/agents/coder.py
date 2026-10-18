@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
 from patchwork.agents.toolkit import NO_REREAD, protect, read_only_tools, run_tests_tool, write_tools
 from patchwork.config import Settings
-from patchwork.tools import fs
+from patchwork.tools import fs, shell
 
 if TYPE_CHECKING:
     from patchwork.schemas import Subtask
@@ -20,27 +20,55 @@ SYSTEM_PROMPT = f"""\
 You are the coder agent in Patchwork. You fix bugs and implement small features in a repository. All paths are relative to the repo root.
 
 Workflow:
-1. Locate before reading: use search_code to find the functions, names or error text from the issue. Then read_file only the files (and line ranges, via offset) you need.
+1. Locate before reading: use search_code to find the functions, names or error text from the issue. Then read_file only the files (and line ranges, via offset) you need. Read each file once; its content stays in your context.
 2. Find the root cause. Make the smallest change that fixes it. Prefer edit_file over write_file. Do not refactor, reformat, rename or touch unrelated code. Do not change tests unless the issue says they are wrong. Tests written by the tester agent are read-only for you: make them pass by changing the code.
-3. Run run_tests after editing. If tests fail, read the failure, fix, and re-run.
-4. Call finish with success=true only after tests pass. If you cannot fix it, call finish with success=false and say what blocks you.
+3. To add a new function, insert it as a complete new block: use edit_file with `old` set to the last lines of the function it should follow (or the end of the file) and `new` set to those same lines plus the new function. Never replace an existing `def` line. If the package's __init__.py re-exports names or defines __all__, export the new name there too.
+4. Always run run_tests before finishing. If tests fail, read the failure, fix, and re-run.
+5. Call finish with success=true only after the full test suite passes. If you cannot fix it, call finish with success=false and say what blocks you.
 
 {NO_REREAD}
 Be terse. Do not explain between tool calls; just call the next tool."""
 
 
 class TestGate:
-    """Success counts only if the full suite passed after the last file change."""
+    """Success counts only if the full suite passed after the last file change.
+
+    Also nudges the agent when it has edited files but not run any tests for
+    a while.
+    """
 
     __test__ = False  # not a pytest test class
+    NUDGE_AFTER_STEPS = 5
+    NUDGE = "System note: you have edited files but not run the tests in the last 5 steps. Call run_tests now."
 
     def __init__(self) -> None:
         self.verified = False
+        self.step = 0
+        self.untested_edits = False
+        self.last_test_step = 0
+        self.last_nudge_step = 0
 
     def check(self) -> str | None:
         if self.verified:
             return None
         return "the full test suite has not passed since your last edit; call run_tests with no path"
+
+    def edited(self, rel: str) -> None:
+        self.verified = False
+        self.untested_edits = True
+
+    def tested(self, result: shell.RunTestsResult, target: str | None) -> None:
+        if target is None:
+            self.verified = result.passed
+        self.untested_edits = False
+        self.last_test_step = self.step
+
+    def nudge(self, step: int) -> str | None:
+        self.step = step
+        if self.untested_edits and step - max(self.last_test_step, self.last_nudge_step) > self.NUDGE_AFTER_STEPS:
+            self.last_nudge_step = step
+            return self.NUDGE
+        return None
 
 
 def build_tools(
@@ -52,18 +80,10 @@ def build_tools(
 ) -> list[Tool]:
     """``protected`` paths (root-relative) are refused by edit_file and write_file."""
     gate = gate or TestGate()
-
-    def on_change(rel: str) -> None:
-        gate.verified = False
-
-    def on_result(result, full_suite: bool) -> None:
-        if full_suite:
-            gate.verified = result.passed
-
     return [
         *read_only_tools(repo),
-        *write_tools(repo, guard=protect(protected) if protected else None, on_change=on_change),
-        run_tests_tool(repo, test_command, test_timeout, on_result),
+        *write_tools(repo, guard=protect(protected) if protected else None, on_change=gate.edited),
+        run_tests_tool(repo, test_command, test_timeout, gate.tested),
     ]
 
 
@@ -84,6 +104,7 @@ def build_coder(
         system_prompt=SYSTEM_PROMPT,
         tools=build_tools(repo, test_command or settings.test_command, settings.test_timeout_seconds, gate, protected_files),
         verify_finish=gate.check,
+        nudge=gate.nudge,
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,

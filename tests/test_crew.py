@@ -39,7 +39,7 @@ VALID_PLAN = {
     "issue_summary": "Add median() to the stats package.",
     "subtasks": [
         {"id": "t1", "role": "tester", "description": "Test median for odd, even and empty lists.",
-         "files_hint": ["tests/test_core.py"], "acceptance_criteria": ["median([]) raises ValueError"]},
+         "files_hint": ["tests/test_median.py", "stats/core.py"], "acceptance_criteria": ["median([]) raises ValueError"]},
         {"id": "c1", "role": "coder", "description": "Implement median() in stats/core.py and export it.",
          "files_hint": ["stats/core.py", "stats/__init__.py"], "acceptance_criteria": ["median([1, 2]) == 1.5"]},
     ],
@@ -242,7 +242,7 @@ def test_tester_must_rewrite_tests_that_already_pass(stats_repo: Path):
         finish(summary="tests written"),
         reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
         reply(("run_tests", {"path": "tests/test_median.py"})),
-        finish(summary="median tests fail as expected"),
+        # The run above shows fail-first, so the tester is ended without calling finish.
     ])
     result = run(build_tester(repo=stats_repo, settings=settings(), llm=llm))
 
@@ -251,7 +251,8 @@ def test_tester_must_rewrite_tests_that_already_pass(stats_repo: Path):
     results = tool_results(llm.requests[-1])
     assert results[0] == "ERROR: finish rejected: you have not written any test file (test_*.py) yet"
     assert results[2].startswith("ERROR: finish rejected: your new tests PASS without any fix")
-    assert results[4].startswith("FAILED (exit 1): 3 failed")
+    assert result.summary.startswith("tester: fail-first confirmed, auto-finished (FAILED (exit 1): 3 failed")
+    assert result.steps_used == 5
 
 
 @pytest.mark.parametrize(
@@ -290,7 +291,7 @@ def test_coder_cannot_edit_tester_files(stats_repo: Path):
     results = tool_results(llm.requests[-1])
     for blocked in results[:2]:
         assert blocked.startswith("ERROR: WriteNotAllowed: tests/test_median.py was written by the tester agent")
-    assert results[2] == "edited tests/test_core.py at line 6"  # other files are still editable
+    assert results[2] .startswith("edited tests/test_core.py at line 6;")  # other files are still editable
     assert (stats_repo / "tests" / "test_median.py").read_text() == MEDIAN_TESTS
     assert result.files_changed == ["tests/test_core.py"]
 
@@ -390,7 +391,6 @@ def test_full_scripted_run_on_stats_feature(stats_repo: Path):
             reply(("read_file", {"path": "tests/test_core.py"})),
             reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
             reply(("run_tests", {"path": "tests/test_median.py"})),
-            finish(summary="median tests written; they fail"),
         ],
         "coder": [
             # The tester's tests are off limits...
@@ -440,10 +440,10 @@ def test_full_scripted_run_on_stats_feature(stats_repo: Path):
     assert "== 2.5" in (stats_repo / "tests" / "test_median.py").read_text()
 
     # Tokens per agent and in total.
-    assert result.tokens == {"lead": 430, "tester": 440, "coder": 550, "reviewer": 220}
-    assert result.total_tokens == 1640
+    assert result.tokens == {"lead": 430, "tester": 330, "coder": 550, "reviewer": 220}
+    assert result.total_tokens == 1530
     dumped = result.model_dump()
-    assert dumped["total_tokens"] == 1640 and dumped["tokens"]["coder"] == 550
+    assert dumped["total_tokens"] == 1530 and dumped["tokens"]["coder"] == 550
 
 
 def test_reviewer_rejection_means_overall_failure(stats_repo: Path):
@@ -483,3 +483,91 @@ def test_solo_mode_runs_only_the_coder(tmp_path: Path):
     assert list(result.agents) == ["coder"]
     assert result.files_changed == ["calculator/ops.py", "calculator/stats.py"]
     assert "+    return a - b" in result.diff
+
+
+# --- milestone 2 fixes: tester creates only, lead targets new files, auto-finish, nudge -----
+
+def test_tester_cannot_change_existing_test_files(stats_repo: Path):
+    original = (stats_repo / "tests" / "test_core.py").read_text()
+    llm = ScriptedLLM([
+        reply(("edit_file", {"path": "tests/test_core.py", "old": "from stats import", "new": "from stats import median,"})),
+        reply(("write_file", {"path": "tests/test_core.py", "content": MEDIAN_TESTS})),
+        reply(("write_file", {"path": "tests/test_median.py", "content": PASSING_TESTS})),
+        # Its own new file may be rewritten.
+        reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
+        finish(success=False, summary="stop"),
+    ])
+    run(build_tester(repo=stats_repo, settings=settings(), llm=llm))
+    results = tool_results(llm.requests[-1])
+    for refused in results[:2]:
+        assert refused == (
+            "ERROR: WriteNotAllowed: tests/test_core.py already exists; existing tests must not be changed; "
+            "put new tests in a new file"
+        )
+    assert results[2].startswith("wrote") and results[3].startswith("wrote")
+    assert (stats_repo / "tests" / "test_core.py").read_text() == original
+
+
+def test_lead_plan_targeting_an_existing_test_file_is_rejected(stats_repo: Path):
+    bad = {**VALID_PLAN, "subtasks": [{**VALID_PLAN["subtasks"][0], "files_hint": ["./tests/test_core.py"]}, VALID_PLAN["subtasks"][1]]}
+    llm = ScriptedLLM([submit_plan(bad), submit_plan(VALID_PLAN)])
+    result = run(build_lead(repo=stats_repo, settings=settings(), llm=llm))
+    assert result.success
+    feedback = tool_results(llm.requests[1])[-1]
+    assert "tester subtask t1 targets the existing test file tests/test_core.py" in feedback
+    assert "NEW test file" in feedback
+    # Without a repo in the validation context the check is skipped.
+    assert Plan.model_validate(bad).subtasks[0].files_hint == ["./tests/test_core.py"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [MEDIAN_TESTS, "from stats import median\n\n\ndef test_median():\n    assert median([1]) == 1\n"],
+    ids=["assertion-failure", "import-error"],
+)
+def test_tester_auto_finishes_on_fail_first(stats_repo: Path, content):
+    llm = ScriptedLLM([
+        reply(("write_file", {"path": "tests/test_median.py", "content": content})),
+        reply(("run_tests", {"path": "tests/test_median.py"})),
+    ])
+    events = []
+    result = run(build_tester(repo=stats_repo, settings=settings(), llm=llm, on_event=events.append))
+    assert result.success and result.stop_reason == "finished" and result.steps_used == 2
+    assert result.summary.startswith("tester: fail-first confirmed, auto-finished (FAILED")
+    assert any(e.kind == "notice" and e.summary.startswith("tester: fail-first confirmed, auto-finished") for e in events)
+
+
+def test_tester_does_not_auto_finish_on_syntax_error_or_full_suite(stats_repo: Path):
+    # Parses (so the write guard accepts it) but fails to compile: a SyntaxError at collection.
+    broken = "import stats\n\n\ndef test_median():\n    break\n"
+    llm = ScriptedLLM([
+        reply(("write_file", {"path": "tests/test_median.py", "content": broken})),
+        reply(("run_tests", {"path": "tests/test_median.py"})),
+        reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
+        reply(("run_tests", {})),  # the full suite is not "only the new files"
+        reply(("run_tests", {"path": "tests/test_median.py::test_median_odd"})),
+    ])
+    result = run(build_tester(repo=stats_repo, settings=settings(), llm=llm))
+    results = tool_results(llm.requests[-1])
+    assert results[1].startswith("FAILED (exit 2)") and "SyntaxError" in results[1]
+    assert results[3].startswith("FAILED (exit 1): 3 failed, 6 passed")
+    assert result.success and result.steps_used == 5
+    assert "FAILED (exit 1): 1 failed" in result.summary
+
+
+def test_coder_is_nudged_to_run_tests(stats_repo: Path):
+    from patchwork.agents.coder import TestGate
+
+    llm = ScriptedLLM([
+        reply(("edit_file", {"path": "stats/core.py", "old": "    return max(values) - min(values)", "new": MEDIAN_IMPL})),
+        *[reply(("search_code", {"pattern": f"def {name}"})) for name in ("mean", "mode", "data_range", "median")],
+        reply(("run_tests", {})),
+        *[reply(("search_code", {"pattern": f"import {name}"})) for name in ("a", "b", "c", "d", "e")],
+        finish(),
+    ])
+    coder = build_coder(repo=stats_repo, settings=settings(max_steps_per_agent=12), llm=llm)
+    result = run(coder)
+    assert result.success
+    nudged = [i for i, request in enumerate(llm.requests) if request[-1]["content"] == TestGate.NUDGE]
+    # Edit at step 1, no tests in steps 2-5: the note goes into step 6's request only.
+    assert nudged == [5]

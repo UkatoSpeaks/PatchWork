@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -13,6 +14,8 @@ from pathlib import Path
 from pydantic import BaseModel
 
 MAX_OUTPUT_CHARS = 3_000
+TAIL_LINES = 30
+_REASON_RE = re.compile(r"^E\s+(\S.*)$")
 
 
 class RunTestsResult(BaseModel):
@@ -34,13 +37,32 @@ class RunTestsResult(BaseModel):
         last = next((ln.strip() for ln in reversed(self.stdout.splitlines()) if ln.strip()), "")
         return f"{status}: {last}" if last else status
 
-    def render(self) -> str:
-        """Compact text for the LLM."""
+    def failure_reasons(self, limit: int = 3) -> list[str]:
+        """The first distinct pytest "E   ..." lines, e.g. the ImportError."""
+        reasons: list[str] = []
+        for line in (self.stdout + "\n" + self.stderr).splitlines():
+            match = _REASON_RE.match(line)
+            if match and match.group(1) not in reasons:
+                reasons.append(match.group(1)[:200])
+                if len(reasons) >= limit:
+                    break
+        return reasons
+
+    def render(self, tail_lines: int = TAIL_LINES) -> str:
+        """Compact text for the LLM. The failure reason comes first, so it
+        survives when old tool results are trimmed to their start."""
         parts = [self.summary_line()]
-        if self.stdout.strip():
-            parts.append("--- stdout (tail) ---\n" + self.stdout.rstrip())
+        if self.passed:
+            return parts[0]
+        reasons = self.failure_reasons()
+        if reasons:
+            parts.append("reason: " + " | ".join(reasons))
+        lines = self.stdout.rstrip().splitlines()
+        if lines:
+            shown = lines[-tail_lines:]
+            parts.append(f"--- output (last {len(shown)} lines) ---\n" + "\n".join(shown))
         if self.stderr.strip():
-            parts.append("--- stderr (tail) ---\n" + self.stderr.rstrip())
+            parts.append("--- stderr (last lines) ---\n" + "\n".join(self.stderr.rstrip().splitlines()[-10:]))
         return "\n".join(parts)
 
 

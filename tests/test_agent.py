@@ -227,8 +227,9 @@ def test_coder_agent_fixes_toy_repo_with_scripted_llm(tmp_path: Path):
     tool_results = [m["content"] for m in llm.requests[-1] if m["role"] == "tool"]
     assert tool_results[0] == "calculator/ops.py:9: def subtract(a, b):"
     assert "return b - a" in tool_results[1]
-    assert tool_results[2] == "edited calculator/ops.py at line 11"
-    assert tool_results[3] == "edited calculator/ops.py at line 23"
+    assert tool_results[2].startswith("edited calculator/ops.py at line 11; it now reads:\n")
+    assert "\n11|     return a - b\n" in tool_results[2]
+    assert tool_results[3].startswith("edited calculator/ops.py at line 23;")
     assert tool_results[4].startswith("PASSED: 1 passed")
     assert tool_results[5].startswith("PASSED: 5 passed")
     assert tool_results[6].startswith("ERROR: finish rejected: the full test suite has not passed")

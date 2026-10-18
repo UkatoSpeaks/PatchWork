@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, model_validator
 
 from patchwork.agents.base import AgentResult
+from patchwork.agents.toolkit import is_test_path
 
 
 class Subtask(BaseModel):
@@ -26,13 +28,24 @@ class Plan(BaseModel):
     risks: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _check_subtasks(self) -> Plan:
+    def _check_subtasks(self, info: ValidationInfo) -> Plan:
         ids = [s.id for s in self.subtasks]
         duplicates = sorted({i for i in ids if ids.count(i) > 1})
         if duplicates:
             raise ValueError(f"subtask ids must be unique; duplicated: {', '.join(duplicates)}")
         if not self.for_role("coder"):
             raise ValueError('the plan needs at least one subtask with role "coder"')
+        # With context={"repo": path}, tester subtasks must not target existing test files.
+        repo = (info.context or {}).get("repo")
+        if repo is not None:
+            for task in self.for_role("tester"):
+                for hint in task.files_hint:
+                    rel = hint.replace("\\", "/").strip().removeprefix("./")
+                    if is_test_path(rel) and (Path(repo) / rel).is_file():
+                        raise ValueError(
+                            f"tester subtask {task.id} targets the existing test file {rel}; tester subtasks "
+                            "must name a NEW test file such as tests/test_<feature>.py"
+                        )
         return self
 
     def for_role(self, role: str) -> list[Subtask]:
