@@ -1,20 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { API_URL, fetchEvents, streamEvents } from "@/lib/api";
-import { CREW, initialScene, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
-import type { CrewAgent, RunEvent } from "@/lib/types";
+import { API_URL, fetchEvents, fetchRun, streamEvents } from "@/lib/api";
+import { fileRoles } from "@/lib/diff";
+import { logEntries, type LogFilter } from "@/lib/log";
+import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
+import { agentStats, phaseDurations, phaseSegments } from "@/lib/stats";
+import type { CrewAgent, Plan, RunDetail, RunEvent } from "@/lib/types";
 
+import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
+import InfoPanels, { type InfoTab } from "./InfoPanels";
 import OfficeCanvas from "./OfficeCanvas";
-import ReplayControls from "./ReplayControls";
+import ReplayControls, { SPEEDS } from "./ReplayControls";
 import TopBar from "./TopBar";
 
 function describe(event: RunEvent | undefined): string {
   if (!event) return "start";
   return `#${event.seq} ${event.agent} · ${event.type}`;
 }
+
+/** The plan from the run detail, else from the lead's finished run in the log. */
+function planFrom(detail: RunDetail | null, events: RunEvent[] | null): Plan | null {
+  if (detail?.plan) return detail.plan;
+  const finished = events?.findLast((e) => e.agent === "lead" && e.type === "agent_finished" && e.payload?.output?.subtasks);
+  return (finished?.payload.output as Plan | undefined) ?? null;
+}
+
+/** Keys typed into these don't drive the replay. */
+const typing = (target: EventTarget | null) =>
+  target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
 
 /**
  * Replays a run. Normal playback streams events over SSE (/stream) and feeds
@@ -23,6 +39,7 @@ function describe(event: RunEvent | undefined): string {
  */
 export default function RunView({ id }: { id: string }) {
   const [events, setEvents] = useState<RunEvent[] | null>(null);
+  const [detail, setDetail] = useState<RunDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scene, setScene] = useState<SceneState>(initialScene);
   const [index, setIndex] = useState(0);
@@ -30,8 +47,13 @@ export default function RunView({ id }: { id: string }) {
   const [speed, setSpeed] = useState(4);
   const [snapKey, setSnapKey] = useState(0);
   const [walking, setWalking] = useState<CrewAgent[]>([]);
+  const [saying, setSaying] = useState<Partial<Record<CrewAgent, string>>>({});
+  const [selected, setSelected] = useState<CrewAgent | null>(null);
+  const [logFilter, setLogFilter] = useState<LogFilter>("all");
+  const [tab, setTab] = useState<InfoTab>("plan");
   const indexRef = useRef(0);
   const closeRef = useRef<(() => void) | null>(null);
+  const panelsRef = useRef<HTMLElement>(null);
 
   const stop = useCallback(() => {
     closeRef.current?.();
@@ -70,6 +92,9 @@ export default function RunView({ id }: { id: string }) {
       (loaded) => {
         if (cancelled) return;
         setEvents(loaded);
+        // ?tab=plan|diff|stats opens that panel.
+        const tabParam = new URLSearchParams(window.location.search).get("tab");
+        if (tabParam === "plan" || tabParam === "diff" || tabParam === "stats") setTab(tabParam);
         // ?at=N opens the run paused after N events.
         const at = Number(new URLSearchParams(window.location.search).get("at"));
         if (Number.isInteger(at) && at > 0) {
@@ -84,6 +109,8 @@ export default function RunView({ id }: { id: string }) {
       },
       (e: Error) => !cancelled && setError(e.message),
     );
+    // The detail (plan, result with the diff) is optional: the scene works without it.
+    fetchRun(id).then((d) => !cancelled && setDetail(d), () => undefined);
     return () => {
       cancelled = true;
       stop();
@@ -122,6 +149,49 @@ export default function RunView({ id }: { id: string }) {
     if (playing) start(indexRef.current, s);
   };
 
+  const select = (agent: CrewAgent | null) => {
+    setSelected(agent);
+    setLogFilter(agent ?? "all");
+  };
+
+  const filterLog = (filter: LogFilter) => {
+    setLogFilter(filter);
+    setSelected(isCrew(filter) ? filter : null);
+  };
+
+  const openPlan = () => {
+    setTab("plan");
+    panelsRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
+
+  // Keyboard: space plays / pauses, left / right step one event, 1-4 pick the speed.
+  const keys = useRef({ playPause, seek, changeSpeed, index });
+  keys.current = { playPause, seek, changeSpeed, index };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || typing(event.target)) return;
+      const k = keys.current;
+      if (event.key === " " && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        k.playPause();
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        k.seek(k.index + (event.key === "ArrowLeft" ? -1 : 1), false);
+      } else if (/^[1-4]$/.test(event.key)) {
+        k.changeSpeed(SPEEDS[Number(event.key) - 1]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const entries = useMemo(() => logEntries(events ?? []), [events]);
+  const phases = useMemo(() => phaseSegments(events ?? []), [events]);
+  const stats = useMemo(() => agentStats(events ?? []), [events]);
+  const durations = useMemo(() => phaseDurations(events ?? [], detail?.result ?? null), [events, detail]);
+  const roleOf = useMemo(() => fileRoles(events ?? [], detail?.result ?? null), [events, detail]);
+  const plan = planFrom(detail, events);
+
   if (error && !events) {
     return (
       <div className="pixel-box mt-6 bg-paper p-5 text-sm">
@@ -135,14 +205,25 @@ export default function RunView({ id }: { id: string }) {
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-8 [&>*]:min-w-0">
-      <TopBar runId={id} scene={scene} />
-      <OfficeCanvas scene={scene} snapKey={snapKey} speed={speed} onWalkingChange={setWalking} />
+      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} />
+      <OfficeCanvas
+        scene={scene}
+        snapKey={snapKey}
+        speed={speed}
+        playing={playing}
+        selected={selected}
+        onSelect={select}
+        onWhiteboard={openPlan}
+        onWalkingChange={setWalking}
+        onBubblesChange={setSaying}
+      />
       <ReplayControls
         playing={playing}
         speed={speed}
         index={index}
         total={events?.length ?? 0}
         current={events ? describe(events[index - 1]) : "loading events…"}
+        phases={phases}
         onPlayPause={playPause}
         onRestart={() => seek(0, true)}
         onSpeed={changeSpeed}
@@ -157,9 +238,25 @@ export default function RunView({ id }: { id: string }) {
             walking={walking.includes(name)}
             maxSteps={scene.maxSteps}
             maxTokens={scene.maxTokens}
+            now={saying[name] ?? null}
+            selected={selected === name}
+            onSelect={() => select(selected === name ? null : name)}
           />
         ))}
       </section>
+      <div className="grid min-w-0 grid-cols-1 gap-8 lg:grid-cols-2 [&>*]:min-w-0">
+        <ActivityLog entries={entries} index={index} filter={logFilter} onFilter={filterLog} onSeek={(n) => seek(n, false)} />
+        <InfoPanels
+          ref={panelsRef}
+          tab={tab}
+          onTab={setTab}
+          plan={plan}
+          diff={String(detail?.result?.diff ?? "")}
+          roleOf={roleOf}
+          agents={stats}
+          phases={durations}
+        />
+      </div>
     </div>
   );
 }

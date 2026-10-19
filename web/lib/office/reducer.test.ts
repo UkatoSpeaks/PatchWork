@@ -3,9 +3,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import type { RunEvent } from "../types";
-import { toolLabel } from "./labels";
-import { findPath, spotFor, walkable } from "./layout";
-import { CREW, elapsedSeconds, initialScene, officeReducer, parseTestCounts, reduceEvents, type Place } from "./reducer";
+import { allSpots, findPath, walkable } from "./layout";
+import { CREW, elapsedSeconds, initialScene, officeReducer, parseTestCounts, reduceEvents } from "./reducer";
 
 // The same fixture run the Python server tests use.
 const FIXTURE = new URL("../../../tests/fixtures/runs/20261019-120000-f1x7/events.jsonl", import.meta.url);
@@ -50,24 +49,36 @@ describe("officeReducer", () => {
     expect(planned.whiteboardLines).toBe(2);
   });
 
-  it("types with a labelled bubble on tool calls", () => {
+  it("types with a speech bubble in plain language on tool calls", () => {
     const state = after((e) => e.type === "tool_called" && e.agent === "coder" && e.payload.tool === "edit_file");
     expect(state.agents.coder.activity).toBe("typing");
-    expect(state.agents.coder.bubble).toEqual({ text: "editing core.py" });
+    expect(state.agents.coder.bubble).toMatchObject({ style: "speech", seq: 23 });
+    expect(state.agents.coder.bubble?.text).toMatch(/core\.py|One-line fix|editing the code/i);
     expect(state.agents.coder.steps).toBe(2);
     const testing = after((e) => e.type === "tool_called" && e.payload.tool === "run_tests");
     expect(testing.agents.tester.activity).toBe("testing");
-    expect(testing.agents.tester.bubble?.text).toBe("running tests");
+    expect(testing.agents.tester.bubble?.text).toMatch(/test|crossed/i);
+  });
+
+  it("reports test results in words, and waits for the model in a thought cloud", () => {
+    const result = after((e) => e.type === "tool_result" && e.payload.tool === "run_tests");
+    expect(result.agents.tester.bubble?.text).toMatch(/fail|red/i); // the tester's tests fail first, as planned
+    const read = after((e) => e.type === "tool_result" && e.agent === "coder");
+    expect(read.agents.coder.activity).toBe("thinking");
+    expect(read.agents.coder.bubble).toBeNull();
+    // ...but the line it just said is kept for the overlay
+    expect(read.agents.coder.said?.text).toMatch(/core\.py/);
   });
 
   it("sends rate-limited agents for coffee and back", () => {
     const throttled = after((e) => e.type === "throttled");
     expect(throttled.agents.lead.place).toBe("coffee");
     expect(throttled.agents.lead.activity).toBe("waiting");
-    expect(throttled.agents.lead.bubble).toEqual({ text: "waiting 12s", icon: "coffee" });
+    expect(throttled.agents.lead.bubble).toMatchObject({ style: "speech", wait: 12 });
+    expect(throttled.agents.lead.bubble?.text).toMatch(/coffee|break/i);
     const limited = after((e) => e.type === "rate_limited");
     expect(limited.agents.coder.place).toBe("coffee");
-    expect(limited.agents.coder.bubble?.text).toBe("waiting 8.5s");
+    expect(limited.agents.coder.bubble?.wait).toBe(8.5);
     // The next LLM call ends the wait.
     const index = events.findIndex((e) => e.type === "rate_limited");
     const resumed = reduceEvents(events, index + 2);
@@ -115,7 +126,8 @@ describe("officeReducer", () => {
     expect(rejected.reviewRound).toBe(1);
     const retry = after((e) => e.type === "retry_started");
     expect(retry.retries).toBe(1);
-    expect(retry.agents.reviewer.trip).toEqual({ to: "coderDesk", key: 1 });
+    expect(retry.agents.reviewer.trip).toMatchObject({ to: "coderDesk", key: 1 });
+    expect(retry.agents.reviewer.trip?.say).toBeTruthy();
     expect(retry.agents.reviewer.place).toBe("desk");
     const coding = after((e) => e.type === "agent_started" && e.payload.label?.startsWith("coder (retry"));
     expect(coding.agents.coder.activity).toBe("thinking");
@@ -129,6 +141,8 @@ describe("officeReducer", () => {
     expect(final.phaseLabel).toBe("done");
     expect(final.agents.reviewer.verdict).toBe("approved");
     expect(CREW.map((name) => final.agents[name].activity)).toEqual(["done", "done", "done", "done"]);
+    // everyone gathers at the merge table to celebrate
+    expect(CREW.map((name) => final.agents[name].place)).toEqual(["celebrate", "celebrate", "celebrate", "celebrate"]);
     expect(elapsedSeconds(final)).toBeCloseTo(32.2, 1);
     expect(final.events).toBe(events.length);
   });
@@ -155,30 +169,13 @@ describe("officeReducer", () => {
   });
 });
 
-describe("toolLabel", () => {
-  it.each([
-    ["read_file", { path: "calc/ops.py" }, "reading ops.py"],
-    ["edit_file", { path: "stats\\stats.py" }, "editing stats.py"],
-    ["run_tests", { path: "" }, "running tests"],
-    ["search_code", { path: "", pattern: "median" }, "searching 'median'"],
-    ["list_dir", { path: "" }, "looking in repo"],
-    ["repo_browser.list_dir", { path: "tests" }, "looking in tests/"],
-    ["write_file", "{'path': 'tests/test_mean.py', 'content': 'x'}", "writing test_mean.py"],
-    ["read_file", { path: "tests/test_median_values.py" }, "reading test_media.."],
-    ["submit_plan", null, "posting the plan"],
-  ])("%s %j -> %s", (tool, args, label) => {
-    expect(toolLabel(tool, args)).toBe(label);
-  });
-});
-
 describe("layout", () => {
-  const places: Place[] = ["lounge", "desk", "coffee", "merge"];
   it("can reach every spot from every other", () => {
     for (const agent of CREW) {
-      const spots = [...places.map((p) => spotFor(agent, p)), spotFor(agent, "whiteboard"), spotFor(agent, "coderDesk")];
-      for (const spot of spots) expect(walkable(spot.x, spot.y), `${agent} ${JSON.stringify(spot)}`).toBe(true);
+      const spots = allSpots(agent);
+      for (const spot of spots) expect(walkable(spot.x, spot.y) || spot.seat === "sofa", `${agent} ${JSON.stringify(spot)}`).toBe(true);
       for (const a of spots) for (const b of spots) {
-        if (a !== b && (a.x !== b.x || a.y !== b.y)) expect(findPath(a, b).length, `${agent} ${a.x},${a.y} -> ${b.x},${b.y}`).toBeGreaterThan(0);
+        if (a.x !== b.x || a.y !== b.y) expect(findPath(a, b).length, `${agent} ${a.x},${a.y} -> ${b.x},${b.y}`).toBeGreaterThan(0);
       }
     }
   });

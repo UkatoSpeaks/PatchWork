@@ -149,3 +149,129 @@ body {
     transition: none;
   }
 }
+
+/* --- speech bubbles over the office canvas ------------------------------------ */
+.office-bubble {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: max-content;
+  max-width: 23ch;
+  font-family: var(--font-pixel);
+  font-size: clamp(10px, calc(var(--office-scale, 1.8) * 6.6px), 14px);
+  line-height: 1.15;
+  color: var(--color-ink);
+  will-change: transform;
+}
+
+.office-bubble[hidden] {
+  display: none;
+}
+
+.office-bubble-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  padding: 3px 7px 4px;
+  background: #fffaf0;
+  /* a stepped pixel border, like the panels */
+  box-shadow:
+    -2px 0 0 0 var(--ink),
+    2px 0 0 0 var(--ink),
+    0 -2px 0 0 var(--ink),
+    0 2px 0 0 var(--ink),
+    3px 4px 0 0 rgba(43, 37, 35, 0.25);
+  transform-origin: var(--tail, 50%) 100%;
+}
+
+/* The tail: a stepped triangle pointing down at the character. */
+.office-bubble::before,
+.office-bubble::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--tail, 50%) - 4px);
+  top: 100%;
+  width: 8px;
+  height: 4px;
+  margin-top: 2px;
+  background: var(--ink);
+  clip-path: polygon(0 0, 100% 0, 75% 50%, 62% 100%, 38% 100%, 25% 50%);
+}
+
+.office-bubble::after {
+  left: calc(var(--tail, 50%) - 2px);
+  width: 4px;
+  height: 2px;
+  margin-top: 0;
+  background: #fffaf0;
+  clip-path: none;
+}
+
+/* Thought cloud: a puffier, cooler bubble with trailing dots instead of a tail. */
+.office-bubble[data-style="thought"] .office-bubble-body {
+  background: #eef3f6;
+  padding: 4px 9px 5px;
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  min-height: 1.15em;
+  box-sizing: content-box;
+}
+
+.office-bubble[data-style="thought"]::before {
+  width: 5px;
+  height: 5px;
+  margin-top: 4px;
+  left: calc(var(--tail, 50%) - 1px);
+  background: #eef3f6;
+  clip-path: none;
+  box-shadow: 0 0 0 2px var(--ink);
+}
+
+.office-bubble[data-style="thought"]::after {
+  width: 3px;
+  height: 3px;
+  margin-top: 12px;
+  left: calc(var(--tail, 50%) + 1px);
+  background: #eef3f6;
+  box-shadow: 0 0 0 2px var(--ink);
+}
+
+.office-bubble-body i {
+  width: 4px;
+  height: 4px;
+  background: var(--color-ink-soft);
+  animation: think 1.05s steps(1) infinite;
+}
+
+.office-bubble-body i:nth-child(2) {
+  animation-delay: 0.35s;
+}
+
+.office-bubble-body i:nth-child(3) {
+  animation-delay: 0.7s;
+}
+
+@keyframes think {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  33% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .office-bubble-body i {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+/* Scrollable panels keep their own scrollbar thin and on-palette. */
+.pixel-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-soft) var(--color-cream-dark);
+}

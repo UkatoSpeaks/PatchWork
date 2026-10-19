@@ -116,7 +116,7 @@ Every run writes `runs/<run_id>/events.jsonl` (one event per line, as it happens
 
 ### Web dashboard
 
-`web/` is a Next.js app that replays a run as a pixel-art office: the lead plans at the whiteboard, the tester and coder type at their desks, rate-limited agents queue at the coffee machine, the wall monitor shows test results, and the reviewer holds up a verdict. It reads the run logs through a small read-only API (`server.py`).
+`web/` is a Next.js app that replays a run as a pixel-art office: the lead plans at the whiteboard, the tester and coder type at their desks, rate-limited agents take a coffee break (with a countdown), the wall TV shows test results, the reviewer walks over to the coder with feedback, and on success everyone gathers at the merge table. Agents talk in plain-language speech bubbles (chosen per run id + event seq, so replays and deep links read the same) and, when they have nothing to do, live office life: water cooler, sofa, window, chats. All art is drawn in code. Below the scene: an activity log (click a line to seek, click a character to filter), the lead's plan (also via the whiteboard), the final diff and per-agent stats. Keys: space play/pause, ←/→ step one event, 1-4 speed. It reads the run logs through a small read-only API (`server.py`).
 
 ```bash
 # terminal 1, repo root: the API on http://localhost:8000
@@ -133,7 +133,7 @@ The API base URL comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:800
 - `GET /api/runs/{run_id}/events`: every event.
 - `GET /api/runs/{run_id}/stream?speed=4&start=0`: server-sent events replaying the log at its original pace divided by `speed` (0 = no delays), each gap capped at 2s, then an `end` event.
 
-The replay uses `/stream` for playback and `/events` for seeking: the scene is a pure reducer over events (`web/lib/office/reducer.ts`), so jumping to event N means reducing `events[0..N]`. `/runs/<run_id>?at=N` opens a run paused at event N. Frontend tests: `cd web && npm test`.
+The replay uses `/stream` for playback and `/events` for seeking: the scene is a pure reducer over events (`web/lib/office/reducer.ts`), so jumping to event N means reducing `events[0..N]`. `/runs/<run_id>?at=N` opens a run paused at event N. The office code lives in `web/lib/office/`: `reducer` (scene state and what agents say), `phrases`, `animator` + `idle` (movement and office life), `bubbles` (how long bubbles stay up, where they go), and the art in `characters`, `furniture`, `scenery`, `renderer`. Frontend tests: `cd web && npm test`.
 
 ### Try it on the toy repos
 
@@ -207,7 +207,7 @@ toy_repos/calculator/     Bug-planted package
 toy_repos/stats_feature/  Working package + a feature request (median)
 tests/
 tests/fixtures/runs/      A small recorded run shared by the server and reducer tests
-web/                      Next.js dashboard: app/ pages, components/, lib/office/ (reducer, layout, sprites, animator, renderer)
+web/                      Next.js dashboard: app/ pages, components/ (scene, replay controls, log, plan/diff/stats panels), lib/office/ (reducer, phrases, layout, animator, idle, bubbles, art)
 runs/                     Event logs and results (git-ignored)
 ```
 

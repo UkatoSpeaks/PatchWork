@@ -12,16 +12,19 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-export default function TopBar({ runId, scene }: { runId: string; scene: SceneState }) {
+export default function TopBar({ runId, scene, issue }: { runId: string; scene: SceneState; issue: string }) {
   const phaseColor =
     scene.outcome === "success" ? "bg-moss text-paper" : scene.outcome === "failure" ? "bg-terracotta text-paper" : "bg-mustard text-ink";
+  const text = (issue || scene.issue).trim();
+  const oneLine = text.replace(/\s+/g, " ");
   return (
     <div className="pixel-box flex flex-col gap-3 bg-paper p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <Link href="/" className="pixel-link font-pixel text-sm text-ink-soft hover:text-terracotta">← all runs</Link>
-        {scene.issue && (
-          <p className="min-w-0 flex-1 truncate text-right text-xs text-ink-soft sm:text-sm" title={scene.issue}>
-            {scene.issue.split("\n")[0]}
+      <div className="flex min-w-0 items-center gap-4">
+        <Link href="/" className="pixel-link shrink-0 font-pixel text-sm text-ink-soft hover:text-terracotta">← all runs</Link>
+        {oneLine && (
+          <p className="min-w-0 flex-1 truncate text-sm" title={text}>
+            <span className="font-pixel text-ink-soft">issue: </span>
+            {oneLine}
           </p>
         )}
       </div>

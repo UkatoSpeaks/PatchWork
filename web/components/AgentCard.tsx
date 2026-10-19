@@ -3,8 +3,8 @@
 import { useEffect, useRef } from "react";
 
 import { formatTokens, shortModel } from "@/lib/api";
+import { drawPortrait } from "@/lib/office/characters";
 import type { AgentState } from "@/lib/office/reducer";
-import { drawPortrait } from "@/lib/office/sprites";
 
 export type Status = "idle" | "walking" | "thinking" | "typing" | "testing" | "waiting" | "done" | "failed" | "cancelled";
 
@@ -20,7 +20,7 @@ const STATUS_STYLE: Record<Status, string> = {
   cancelled: "bg-[#9a948c] text-paper",
 };
 
-const ROLE: Record<string, string> = { lead: "Lead", tester: "Tester", coder: "Coder", reviewer: "Reviewer" };
+export const ROLE: Record<string, string> = { lead: "Lead", tester: "Tester", coder: "Coder", reviewer: "Reviewer", orchestrator: "System" };
 
 export function agentStatus(agent: AgentState, walking: boolean): Status {
   return walking && agent.activity !== "cancelled" ? "walking" : agent.activity;
@@ -30,20 +30,24 @@ function Portrait({ agent, animate, grey }: { agent: AgentState["name"]; animate
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const ctx = ref.current!.getContext("2d")!;
-    let frame = 0;
     drawPortrait(ctx, agent, 0, grey);
     if (!animate) return;
-    const timer = setInterval(() => drawPortrait(ctx, agent, ++frame % 2, grey), 600);
+    const started = performance.now();
+    const timer = setInterval(() => drawPortrait(ctx, agent, performance.now() - started, grey), 150);
     return () => clearInterval(timer);
   }, [agent, animate, grey]);
-  return <canvas ref={ref} width={16} height={16} className="pixelated h-14 w-14 shrink-0 bg-cream-dark" aria-hidden />;
+  return <canvas ref={ref} width={20} height={20} className="pixelated h-14 w-14 shrink-0 bg-cream-dark" aria-hidden />;
 }
 
-export default function AgentCard({ agent, walking, maxSteps, maxTokens }: {
+export default function AgentCard({ agent, walking, maxSteps, maxTokens, now, selected, onSelect }: {
   agent: AgentState;
   walking: boolean;
   maxSteps: number;
   maxTokens: number;
+  // what the agent is saying right now
+  now: string | null;
+  selected: boolean;
+  onSelect: () => void;
 }) {
   const status = agentStatus(agent, walking);
   const share = Math.min(1, agent.tokens / Math.max(1, maxTokens));
@@ -51,9 +55,15 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens }: {
   const segments = 12;
   const filled = Math.round(share * segments);
   return (
-    <article className={`pixel-box flex min-w-0 flex-1 basis-[15rem] flex-col gap-2 bg-paper p-3 ${grey ? "opacity-70" : ""}`}>
-      <div className="flex items-center gap-3">
-        <Portrait agent={agent.name} animate={status === "typing" || status === "thinking" || status === "testing"} grey={grey} />
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-pressed={selected}
+      title={selected ? "Show every agent in the log" : `Follow the ${ROLE[agent.name]} in the log`}
+      className={`pixel-box flex min-w-0 flex-1 basis-[15rem] cursor-pointer flex-col gap-2 p-3 text-left transition-transform hover:-translate-y-0.5 ${selected ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"} ${grey ? "opacity-70" : ""}`}
+    >
+      <div className="flex w-full items-center gap-3">
+        <Portrait agent={agent.name} animate={status !== "done" && status !== "cancelled"} grey={grey} />
         <div className="min-w-0 flex-1">
           <h3 className="font-pixel text-base font-bold leading-tight">{ROLE[agent.name]}</h3>
           <p className="truncate font-mono text-[11px] text-ink-soft" title={agent.model ?? undefined}>{shortModel(agent.model)}</p>
@@ -62,7 +72,11 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens }: {
           </span>
         </div>
       </div>
-      <dl className="grid grid-cols-2 gap-x-2 font-pixel text-xs">
+      <p className="w-full truncate font-pixel text-xs" title={now ?? undefined}>
+        <span className="text-ink-soft">now: </span>
+        {now ?? <span className="text-ink-soft">…</span>}
+      </p>
+      <dl className="grid w-full grid-cols-2 gap-x-2 font-pixel text-xs">
         <dt className="text-ink-soft">steps</dt>
         <dd className="text-right tabular-nums">{agent.steps} / {maxSteps}</dd>
         <dt className="text-ink-soft">tokens</dt>
@@ -71,7 +85,7 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens }: {
         </dd>
       </dl>
       <div
-        className="flex h-3 gap-[2px] bg-ink p-[2px]"
+        className="flex h-3 w-full gap-[2px] bg-ink p-[2px]"
         role="meter"
         aria-label={`${ROLE[agent.name]} tokens this run`}
         aria-valuemin={0}
@@ -87,6 +101,6 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens }: {
           {agent.runs} runs · {formatTokens(agent.totalTokens)} total
         </p>
       )}
-    </article>
+    </button>
   );
 }
