@@ -70,6 +70,7 @@ class Orchestrator:
             llm.on_retry = self._on_rate_limited
             llm.on_cooldown = self._on_cooldown
             llm.on_throttle = self._on_throttle
+            llm.on_throttle_fallback = self._on_throttle_fallback
 
     @property
     def run_id(self) -> str:
@@ -401,9 +402,12 @@ class Orchestrator:
         self._emit(llm_caller.get() or "orchestrator", "rate_limited", model=model, delay_s=round(delay, 2),
                    shared=True)
 
-    def _on_throttle(self, model: str, delay: float, needed: int, remaining: int) -> None:
+    def _on_throttle(self, model: str, delay: float, needed: int, remaining: int, limit: int, mode: str) -> None:
         self._emit(llm_caller.get() or "orchestrator", "throttled", model=model, delay_s=round(delay, 2),
-                   needed_tokens=needed, remaining_tokens=remaining)
+                   needed_tokens=needed, remaining_tokens=remaining, limit_tokens=limit, mode=mode)
+
+    def _on_throttle_fallback(self, model: str) -> None:
+        self._emit("orchestrator", "note", text=f"proportional throttling not accepted on {model}; using full reset waits")
 
     def _emit(self, agent: AgentName, type: str, **payload: Any) -> None:
         self.bus.publish(agent, type, **payload)  # type: ignore[arg-type]

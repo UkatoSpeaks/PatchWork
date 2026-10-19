@@ -127,7 +127,7 @@ class CliRenderer:
 
     def _on_throttled(self, event: Event, p: dict[str, Any]) -> None:
         self._agent(event, f"          throttling: waiting {p['delay_s']:.1f}s for the token budget on {p['model']} "
-                           f"(need ~{p['needed_tokens']:,}, {p['remaining_tokens']:,} left)", fg="yellow")
+                           f"(need ~{p['needed_tokens']:,}, {p['remaining_tokens']:,} left{_throttle_inputs(p)})", fg="yellow")
 
     def _on_agent_finished(self, event: Event, p: dict[str, Any]) -> None:
         stats = f"({p['duration_s']:.1f}s, {p['steps']} steps, {p['tokens']:,} tokens)"
@@ -270,6 +270,16 @@ class CliRenderer:
                 self._line(f"    git log --oneline {base}..{name}", dim=True)
                 self._line(f"    git diff {base} {name}", dim=True)
             self._line("Delete them:   git branch -D " + " ".join(kept))
+
+
+def _throttle_inputs(p: dict[str, Any]) -> str:
+    """", limit 8,000/min, proportional" (older events have neither)."""
+    parts = []
+    if p.get("limit_tokens"):
+        parts.append(f"limit {p['limit_tokens']:,}/min")
+    if p.get("mode"):
+        parts.append(p["mode"])
+    return "".join(f", {part}" for part in parts)
 
 
 def format_args(arguments: dict[str, Any], limit: int = 40) -> str:

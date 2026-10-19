@@ -574,6 +574,10 @@ class Agent:
     def _known_tools(self) -> list[str]:
         return [*self.tools] + ([self.submit.name] if self.submit else []) + [FINISH_TOOL]
 
+    def _is_tool_name(self, name: str) -> bool:
+        """One of our tools, or a foreign name that maps to one."""
+        return name in self._known_tools() or self._alias_target(name, {}) is not None
+
     def _unknown_tool_message(self, name: str) -> str:
         mapped = self._alias_target(name, {})
         hint = f" Call {mapped[0]} instead." if mapped else ""
@@ -613,11 +617,19 @@ class Agent:
 
     def _tool_call_from_text(self, text: str | None, step: int) -> ToolCall | None:
         """A tool call the model wrote as JSON text ({"name": ..., "arguments": ...}),
-        whether or not the tool exists; unknown names get an error like any call."""
+        whether or not the tool exists; unknown names get an error like any call.
+
+        "type", "tool" and "function" are accepted in place of "name", but only
+        when the value is a known tool name or alias (other JSON has such keys too)."""
         data = _json_from_text(text or "")
-        if data is None or not set(data) <= {"name", "arguments", "parameters"}:
+        if data is None:
             return None
-        name = data.get("name")
+        name_keys = [key for key in _TOOL_NAME_KEYS if key in data]
+        if len(name_keys) != 1 or not set(data) - {name_keys[0]} <= {"arguments", "parameters"}:
+            return None
+        name = data[name_keys[0]]
+        if name_keys[0] != "name" and not (isinstance(name, str) and self._is_tool_name(name)):
+            return None
         arguments = data.get("arguments", data.get("parameters", {}))
         if isinstance(arguments, str):
             arguments = _load_object(arguments) if arguments.strip() != "{}" else {}
@@ -728,6 +740,8 @@ def _unchanged_note(earlier: _View, view: _View) -> str:
     )
 
 
+# Keys a tool call written as JSON text may use for the tool name.
+_TOOL_NAME_KEYS = ("name", "type", "tool", "function")
 _TEXT_TOOL_CALL_RE = re.compile(r'^\s*(?:```(?:json)?\s*)?\{\s*"name"\s*:')
 
 

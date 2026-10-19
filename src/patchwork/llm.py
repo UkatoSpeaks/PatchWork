@@ -14,7 +14,10 @@ Adds what the agents need on top of ``litellm.acompletion``:
   in-flight requests, a cooldown so that when one agent gets a 429 the others
   on that model wait it out too, the exhausted flag, and the token budget
   from the ``x-ratelimit-*`` response headers, used to wait for the
-  per-minute budget instead of sending a call that would get a 429,
+  per-minute budget instead of sending a call that would get a 429. By
+  default ("proportional") the budget is assumed to refill gradually, so a
+  call waits only for the tokens it lacks; after a per-minute 429 that this
+  assumption let through, the model falls back to waiting for the full reset,
 - optional daily usage accounting (``usage.UsageStore``).
 """
 
@@ -46,11 +49,17 @@ CompletionFn = Callable[..., Awaitable[Any]]
 RetryCallback = Callable[[str, int, float, BaseException], None]
 # (model, delay) when a call waits out a cooldown set by another call's 429.
 CooldownCallback = Callable[[str, float], None]
-# (model, delay, estimated tokens, remaining tokens) when a call waits for the per-minute token budget.
-ThrottleCallback = Callable[[str, float, int, int], None]
+# (model, delay, estimated tokens, remaining tokens, limit, mode) when a call waits for the per-minute token budget.
+ThrottleCallback = Callable[[str, float, int, int, int, str], None]
+# (model) when proportional throttling is abandoned for a model after a 429.
+ThrottleFallbackCallback = Callable[[str], None]
+
+ThrottleMode = Literal["proportional", "full"]
 
 # Length of a per-minute token window, used once we assume a window has reset.
 TOKEN_WINDOW_SECONDS = 60.0
+# Added to a proportional wait so the refill has surely covered the call.
+PROPORTIONAL_MARGIN_SECONDS = 1.0
 
 # Name of the agent making LLM calls in the current task, for attributing
 # rate-limit waits. Each asyncio task gets its own copy.
@@ -71,6 +80,10 @@ class TokenBudget:
     limit_requests: int | None = None
     remaining_requests: int | None = None
     requests_reset_at: float | None = None
+    # When ``remaining_tokens`` was last brought up to date (headers or refill).
+    tokens_as_of: float | None = None
+    # Whether ``remaining_tokens`` includes assumed refill since the headers.
+    refill_credited: bool = False
 
     def update(self, headers: Mapping[str, str], now: float) -> None:
         def number(key: str) -> int | None:
@@ -87,23 +100,44 @@ class TokenBudget:
             self.remaining_tokens = remaining
             self.limit_tokens = number("x-ratelimit-limit-tokens") or self.limit_tokens
             self.tokens_reset_at = reset("x-ratelimit-reset-tokens")
+            self.tokens_as_of = now
+            self.refill_credited = False
         if (remaining := number("x-ratelimit-remaining-requests")) is not None:
             self.remaining_requests = remaining
             self.limit_requests = number("x-ratelimit-limit-requests") or self.limit_requests
             self.requests_reset_at = reset("x-ratelimit-reset-requests")
 
-    def wait_for(self, tokens: int, now: float) -> float:
-        """Seconds to wait before a call costing ``tokens`` fits the budget (0 = send now)."""
+    def wait_for(self, tokens: int, now: float, mode: ThrottleMode = "full") -> float:
+        """Seconds to wait before a call costing ``tokens`` fits the budget (0 = send now).
+
+        "full": wait until the reset time from the headers. "proportional": the
+        budget refills at ``limit / 60s`` (token bucket), so wait
+        ``(tokens - remaining) / rate`` plus a margin, capped at the reset time.
+        """
         if self.remaining_tokens is None or self.limit_tokens is None:
             return 0.0
         if self.tokens_reset_at is not None and now >= self.tokens_reset_at:
             # The window has reset since the headers were read.
             self.remaining_tokens = self.limit_tokens
             self.tokens_reset_at = now + TOKEN_WINDOW_SECONDS
-        if self.remaining_tokens >= tokens or tokens > self.limit_tokens or self.tokens_reset_at is None:
-            # Fits, can never fit (let the provider answer), or no reset time to wait for.
+            self.tokens_as_of = now
+            self.refill_credited = False
+        rate = self.limit_tokens / TOKEN_WINDOW_SECONDS
+        if mode == "proportional" and self.tokens_as_of is not None and now > self.tokens_as_of:
+            # Credit what has refilled since the budget was last brought up to date.
+            refilled = min(self.limit_tokens - self.remaining_tokens, int((now - self.tokens_as_of) * rate))
+            if refilled > 0:
+                self.remaining_tokens += refilled
+                self.refill_credited = True
+            self.tokens_as_of = now
+        if self.remaining_tokens >= tokens or tokens > self.limit_tokens:
+            # Fits, or can never fit (let the provider answer).
             return 0.0
-        return self.tokens_reset_at - now
+        until_reset = self.tokens_reset_at - now if self.tokens_reset_at is not None else None
+        if mode == "full":
+            return until_reset or 0.0  # no reset time to wait for: send now
+        wait = (tokens - self.remaining_tokens) / rate + PROPORTIONAL_MARGIN_SECONDS
+        return min(wait, until_reset) if until_reset is not None else wait
 
     def reserve(self, tokens: int) -> None:
         """Count a call being sent, so concurrent calls see the budget it uses."""
@@ -118,6 +152,8 @@ class _ModelGate:
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.cooldown_until = 0.0
         self.budget = TokenBudget()
+        # Set once a per-minute 429 shows proportional throttling sends too early.
+        self.full_throttle_only = False
         # Set once the model hits a per-day limit; it stays exhausted from then on.
         self.exhausted: DailyLimitReached | None = None
 
@@ -265,6 +301,8 @@ class LLMClient:
         on_retry: RetryCallback | None = None,
         on_cooldown: CooldownCallback | None = None,
         on_throttle: ThrottleCallback | None = None,
+        on_throttle_fallback: ThrottleFallbackCallback | None = None,
+        throttle_mode: ThrottleMode = "proportional",
     ) -> None:
         """``max_concurrency`` caps in-flight requests per model; the first
         client to use a model in an event loop sets that model's cap.
@@ -273,7 +311,12 @@ class LLMClient:
         limits in total (retries, shared cooldowns, throttling): a 429 that
         would take it past that gives up with ``RateLimitExhausted``.
         ``base_backoff`` / ``max_backoff`` apply only when the provider gives
-        no retry-after hint."""
+        no retry-after hint.
+
+        ``throttle_mode`` is how long a call waits when the per-minute token
+        budget from the headers can't cover it (see ``TokenBudget.wait_for``).
+        In "proportional" mode, a per-minute 429 on a call sent on assumed
+        refill switches that model to "full" for the rest of the process."""
         self._api_key = api_key
         self.max_concurrency = max_concurrency
         self._completion_fn = completion_fn or _litellm_acompletion()
@@ -286,6 +329,8 @@ class LLMClient:
         self.on_retry = on_retry
         self.on_cooldown = on_cooldown
         self.on_throttle = on_throttle
+        self.on_throttle_fallback = on_throttle_fallback
+        self.throttle_mode = throttle_mode
         self.calls: list[CallRecord] = []
 
     @property
@@ -339,14 +384,20 @@ class LLMClient:
                 waited += remaining
             just_backed_off = False
             # Don't send a call the per-minute token budget can't cover.
-            throttle = gate.budget.wait_for(estimate, self._clock())
+            mode: ThrottleMode = "full" if gate.full_throttle_only else self.throttle_mode
+            throttle = gate.budget.wait_for(estimate, self._clock(), mode)
             if throttle > 0:
+                remaining_tokens = gate.budget.remaining_tokens or 0
+                limit_tokens = gate.budget.limit_tokens or 0
                 if self.on_throttle:
-                    self.on_throttle(model, throttle, estimate, gate.budget.remaining_tokens or 0)
-                log.info("throttling: waiting %.1fs for the token budget on %s", throttle, model)
+                    self.on_throttle(model, throttle, estimate, remaining_tokens, limit_tokens, mode)
+                log.info("throttling (%s): waiting %.1fs for the token budget on %s (need ~%d, %d left, limit %d/min)",
+                         mode, throttle, model, estimate, remaining_tokens, limit_tokens)
                 await self._sleep(throttle)
                 waited += throttle
                 continue
+            # Sent on tokens assumed to have refilled since the last headers.
+            on_assumed_refill = mode == "proportional" and gate.budget.refill_credited
             gate.budget.reserve(estimate)
             try:
                 async with gate.semaphore:
@@ -361,6 +412,11 @@ class LLMClient:
                 if limit_period(exc) == "day":
                     gate.exhausted = self._daily_limit(model, exc)
                     raise gate.exhausted from exc
+                if on_assumed_refill and not gate.full_throttle_only:
+                    gate.full_throttle_only = True
+                    log.warning("proportional throttling not accepted on %s; using full reset waits", model)
+                    if self.on_throttle_fallback:
+                        self.on_throttle_fallback(model)
                 delay = self._retry_delay(exc, attempt)
                 if waited + delay > self.max_wait:
                     raise RateLimitExhausted(

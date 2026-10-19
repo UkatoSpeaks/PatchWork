@@ -228,7 +228,7 @@ def test_throttles_when_headers_show_too_little_token_budget():
                          x_ratelimit_remaining_tokens="300", x_ratelimit_reset_tokens="7.5s",
                          x_ratelimit_limit_requests="1000", x_ratelimit_remaining_requests="990",
                          x_ratelimit_reset_requests="2m59.56s")
-    client, sleeps = make_client([first, fake_response("two")],
+    client, sleeps = make_client([first, fake_response("two")], throttle_mode="full",
                                  on_throttle=lambda *args: throttled.append(args))
     messages = [{"role": "user", "content": "x" * 2000}]  # ~500 tokens + max_tokens
 
@@ -238,8 +238,9 @@ def test_throttles_when_headers_show_too_little_token_budget():
 
     asyncio.run(main())
     assert sleeps == [pytest.approx(7.5)]
-    [(model, delay, needed, remaining)] = throttled
+    [(model, delay, needed, remaining, limit, mode)] = throttled
     assert model == "m" and delay == pytest.approx(7.5) and remaining == 300 and needed > 300
+    assert (limit, mode) == (8000, "full")
 
 
 def test_no_throttle_when_the_budget_suffices_or_headers_are_missing():
@@ -253,6 +254,131 @@ def test_no_throttle_when_the_budget_suffices_or_headers_are_missing():
 
     asyncio.run(main())
     assert sleeps == []
+
+
+def test_proportional_wait_is_computed_from_header_values():
+    from patchwork.llm import TokenBudget
+
+    headers = {"x-ratelimit-limit-tokens": "8000", "x-ratelimit-remaining-tokens": "2583",
+               "x-ratelimit-reset-tokens": "58s"}
+    budget = TokenBudget()
+    budget.update(headers, now=0.0)
+    # 402 tokens short at 8000/60s = 133.3 tokens/s: ~3.0s, plus the 1s margin.
+    assert budget.wait_for(2985, now=0.0, mode="proportional") == pytest.approx(402 / (8000 / 60) + 1.0)
+    # The full mode waits for the reset from the headers.
+    assert budget.wait_for(2985, now=0.0, mode="full") == pytest.approx(58.0)
+    # Fits: no wait.
+    assert budget.wait_for(2000, now=0.0, mode="proportional") == 0.0
+
+
+def test_proportional_wait_is_capped_at_the_reset_time():
+    from patchwork.llm import TokenBudget
+
+    budget = TokenBudget()
+    budget.update({"x-ratelimit-limit-tokens": "8000", "x-ratelimit-remaining-tokens": "100",
+                   "x-ratelimit-reset-tokens": "10s"}, now=0.0)
+    # 7,800 short would be ~59.5s, but the window resets in 10s.
+    assert budget.wait_for(7900, now=0.0, mode="proportional") == pytest.approx(10.0)
+
+
+def test_proportional_mode_credits_refill_since_the_headers():
+    from patchwork.llm import TokenBudget
+
+    budget = TokenBudget()
+    budget.update({"x-ratelimit-limit-tokens": "6000", "x-ratelimit-remaining-tokens": "1000",
+                   "x-ratelimit-reset-tokens": "50s"}, now=0.0)
+    # 5s at 100 tokens/s refilled 500: 1,500 now covers a 1,400-token call.
+    assert budget.wait_for(1400, now=5.0, mode="proportional") == 0.0
+    assert budget.remaining_tokens == 1500 and budget.refill_credited
+    # Refill never goes past the limit (45s more would add 4,500).
+    budget.remaining_tokens = 3000
+    assert budget.wait_for(1400, now=50.0 - 0.001, mode="proportional") == 0.0
+    assert budget.remaining_tokens == 6000
+
+
+def budget_headers(remaining="2583", reset="58s"):
+    return {"x_ratelimit_limit_tokens": "8000", "x_ratelimit_remaining_tokens": remaining,
+            "x_ratelimit_reset_tokens": reset}
+
+
+def test_proportional_throttle_waits_only_for_the_missing_tokens():
+    throttled = []
+    client, sleeps = make_client([with_headers(fake_response("one"), **budget_headers()), fake_response("two")],
+                                 on_throttle=lambda *args: throttled.append(args))
+
+    async def main():
+        await client.complete("m", [], max_tokens=100)
+        await client.complete("m", [], max_tokens=2985)  # estimate: 0 prompt + 2,985
+
+    asyncio.run(main())
+    expected = 402 / (8000 / 60) + 1.0
+    assert sleeps == [pytest.approx(expected)]
+    [(model, delay, needed, remaining, limit, mode)] = throttled
+    assert (model, needed, remaining, limit, mode) == ("m", 2985, 2583, 8000, "proportional")
+    assert delay == pytest.approx(expected)
+
+
+def test_throttle_mode_full_waits_for_the_reset():
+    client, sleeps = make_client([with_headers(fake_response("one"), **budget_headers()), fake_response("two")],
+                                 throttle_mode="full")
+
+    async def main():
+        await client.complete("m", [], max_tokens=100)
+        await client.complete("m", [], max_tokens=2985)
+
+    asyncio.run(main())
+    assert sleeps == [pytest.approx(58.0)]
+
+
+def test_429_after_a_proportional_wait_falls_back_to_full_waits(caplog):
+    fallbacks, modes = [], []
+    client, sleeps = make_client(
+        [
+            with_headers(fake_response("one"), **budget_headers()),
+            groq_429("TPM", wait="2s"),  # the proportional wait was not enough
+            with_headers(fake_response("two"), **budget_headers()),
+            fake_response("three"),
+        ],
+        on_throttle=lambda *args: modes.append(args[-1]),
+        on_throttle_fallback=fallbacks.append,
+    )
+
+    async def main():
+        await client.complete("m", [], max_tokens=100)
+        await client.complete("m", [], max_tokens=2985)
+        await client.complete("m", [], max_tokens=2985)
+
+    with caplog.at_level("WARNING", logger="patchwork.llm"):
+        asyncio.run(main())
+    proportional = 402 / (8000 / 60) + 1.0
+    # Proportional wait, then the 429's retry-after; from then on this model waits
+    # for the full reset (what is left of the first window, then a whole new one).
+    assert sleeps == [pytest.approx(proportional), pytest.approx(2.5),
+                      pytest.approx(58.0 - proportional - 2.5), pytest.approx(58.0)]
+    assert modes == ["proportional", "full", "full"]
+    assert fallbacks == ["m"]
+    assert "proportional throttling not accepted on m; using full reset waits" in caplog.text
+
+
+def test_429_without_proportional_credit_keeps_proportional_mode():
+    fallbacks = []
+    client, _ = make_client([groq_429("TPM", wait="1s"), fake_response("ok")],
+                            on_throttle_fallback=fallbacks.append)
+    asyncio.run(client.complete("m", []))
+    assert fallbacks == []
+
+
+def test_throttle_mode_setting(monkeypatch):
+    from pydantic import ValidationError
+
+    from patchwork.config import Settings
+
+    assert Settings(_env_file=None).throttle_mode == "proportional"
+    monkeypatch.setenv("THROTTLE_MODE", "full")
+    assert Settings(_env_file=None).throttle_mode == "full"
+    monkeypatch.setenv("THROTTLE_MODE", "sometimes")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 def test_llm_provider_prefixed_headers_are_read():
@@ -380,3 +506,31 @@ def test_rate_limit_events_name_the_waiting_agent(tmp_path):
     assert [(e.agent, e.type, e.payload["shared"]) for e in events] == [
         ("tester", "rate_limited", False), ("tester", "rate_limited", True),
     ]
+
+
+def test_throttle_events_carry_their_inputs_and_the_fallback_is_announced(tmp_path):
+    from patchwork.config import Settings
+    from patchwork.events import EventBus
+    from patchwork.llm import llm_caller
+    from patchwork.orchestrator import Orchestrator
+    from patchwork.render import CliRenderer
+
+    events, lines = [], []
+    bus = EventBus()
+    bus.subscribe(events.append)
+    bus.subscribe(CliRenderer(sink=lambda text, style: lines.append(text)))
+    llm, _ = make_client([])
+    Orchestrator(repo=tmp_path, settings=Settings(_env_file=None), llm=llm, bus=bus)
+    token = llm_caller.set("coder")
+    try:
+        llm.on_throttle("m", 4.02, 2985, 2583, 8000, "proportional")
+        llm.on_throttle_fallback("m")
+    finally:
+        llm_caller.reset(token)
+    throttled, note = events
+    assert (throttled.agent, throttled.type) == ("coder", "throttled")
+    assert throttled.payload == {"model": "m", "delay_s": 4.02, "needed_tokens": 2985, "remaining_tokens": 2583,
+                                 "limit_tokens": 8000, "mode": "proportional"}
+    assert (note.agent, note.type) == ("orchestrator", "note")
+    assert note.payload["text"] == "proportional throttling not accepted on m; using full reset waits"
+    assert any("(need ~2,985, 2,583 left, limit 8,000/min, proportional)" in line for line in lines)

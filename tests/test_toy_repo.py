@@ -6,7 +6,7 @@ from pathlib import Path
 from patchwork.tools import fs
 from patchwork.tools.shell import run_tests
 
-from conftest import TOY_CALCULATOR, TOY_STATS, copy_toy
+from conftest import TOY_CALCULATOR, TOY_STATS, TOY_TEXT_UTILS, copy_toy
 
 COMMAND = "python -m pytest -q -p no:cacheprovider"
 
@@ -38,3 +38,14 @@ def test_toy_stats_passes_and_has_no_median(tmp_path: Path):
     assert result.passed, result.render()
     assert "6 passed" in result.stdout
     assert not fs.search_code(repo, r"def median")
+
+
+def test_toy_text_utils_passes_and_has_no_slugify(tmp_path: Path):
+    repo = copy_toy(TOY_TEXT_UTILS, tmp_path)
+    result = run_tests(repo, COMMAND)
+    assert result.passed, result.render()
+    assert "6 passed" in result.stdout
+    # Neither the package nor its suite knows slugify; only the issue asks for it.
+    assert not fs.search_code(repo, r"slugify", path="text_utils")
+    assert not fs.search_code(repo, r"slugify", path="tests")
+    assert "slugify(text)" in (repo / "ISSUE.md").read_text(encoding="utf-8")

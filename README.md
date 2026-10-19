@@ -71,6 +71,7 @@ All settings are read from `.env` (or real environment variables). See `.env.exa
 | `REVIEWER_FALLBACKS` | `groq/openai/gpt-oss-120b,groq/openai/gpt-oss-20b` | Same, for the reviewer |
 | `MAX_CONCURRENT_REQUESTS` | 2 | In-flight LLM requests per model, shared by all agents |
 | `LLM_MAX_WAIT_SECONDS` | 180 | Total seconds one LLM call may wait on per-minute rate limits before failing |
+| `THROTTLE_MODE` | `proportional` | How long a call waits when the per-minute token budget is short: `proportional` (only for the missing tokens to refill) or `full` (until the window resets) |
 
 `LLM_MAX_RETRIES` is gone; per-minute retries are bounded by total wait time instead (an old value in `.env` is ignored).
 
@@ -82,7 +83,9 @@ Groq's free-tier limits are per account and model (gpt-oss-120b: 8,000 tokens pe
 - **Per-minute vs per-day.** A 429 is classified from Groq's message: TPM/RPM are per-minute, TPD/RPD per-day.
   - Per-minute: retried, always waiting at least Groq's retry-after, until the call has waited `LLM_MAX_WAIT_SECONDS` (180s) in total. There is no fixed retry count.
   - Per-day: never retried. The model is marked exhausted for the rest of the process, and the agent switches to the next model in its role's `*_FALLBACKS` list. It keeps the same conversation and logs "daily limit reached on X, switching to Y". If every model is exhausted, the agent fails with a message naming each model and its reset time from Groq's error. The models each agent actually used are in `RunResult` (`runs[].result.models_used`) and the final table.
-- **Throttling.** After every call, Groq's `x-ratelimit-*` headers (remaining tokens/requests and reset times) are stored per model. Before a call, its cost is estimated (prompt characters / 4 + `max_tokens`). If the per-minute token budget left is too small, the call waits for the reset instead of being sent and getting a 429: "throttling: waiting Xs for the token budget on <model>".
+- **Throttling.** After every call, Groq's `x-ratelimit-*` headers (remaining tokens/requests and reset times) are stored per model. Before a call, its cost is estimated (prompt characters / 4 + `max_tokens`). If the per-minute token budget left is too small, the call waits instead of being sent and getting a 429: "throttling: waiting Xs for the token budget on <model> (need ~N, M left, limit L/min, mode)".
+  - `THROTTLE_MODE=proportional` (default) assumes the budget refills gradually at limit/60s, so it waits `(needed - remaining) / (limit / 60s) + 1s`, capped at the reset time from the headers. If a call sent on assumed refill still gets a per-minute 429, that model switches to full waits for the rest of the run: "proportional throttling not accepted on <model>; using full reset waits".
+  - `THROTTLE_MODE=full` waits for the reset time from the headers.
 - **Daily usage.** Tokens and requests per model per day (local date) are added to `runs/usage.json` after every call. The final table shows today's totals, with the per-day limit when known. Groq sends the requests-per-day limit in its headers; the tokens-per-day limit only appears in a TPD 429 message, so it is remembered from there. A TPD message's "Used N" also raises today's total to Groq's count, which includes usage outside Patchwork. `patchwork usage` prints today's totals, and `patchwork usage --days 7` shows the last 7 days with usage.
 
 ## Usage
@@ -112,6 +115,7 @@ Every run writes `runs/<run_id>/events.jsonl` (one event per line, as it happens
 
 - `toy_repos/calculator`: 3 planted bugs; 3 of its 8 tests fail.
 - `toy_repos/stats_feature`: a working stats package (6 passing tests) and a feature request in `ISSUE.md`: add `median()`. This exercises the tester writing tests first.
+- `toy_repos/text_utils`: a working text-helpers package (6 passing tests, none for `slugify`) and an `ISSUE.md` asking for `slugify()` with several precise rules (accents, separator runs, edge hyphens, empty result, `TypeError`). A coder working without the tester's tests is likely to miss one, which exercises the verify/review retry loop.
 
 Always run on a copy; Patchwork's own tests check the originals are untouched. The copies aren't git repos, so pass `--init-git`:
 

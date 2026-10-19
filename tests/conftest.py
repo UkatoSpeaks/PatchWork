@@ -17,6 +17,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 TOY_STATS = Path(__file__).resolve().parents[1] / "toy_repos" / "stats_feature"
+TOY_TEXT_UTILS = Path(__file__).resolve().parents[1] / "toy_repos" / "text_utils"
 
 
 def copy_toy(source: Path, tmp_path: Path) -> Path:

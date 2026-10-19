@@ -1,0 +1,1 @@
+Add slugify(text) to text_utils: lowercase the text; strip accents (e.g. 'é' -> 'e', using unicodedata normalisation); replace every run of characters that are not a-z or 0-9 with a single hyphen; remove leading and trailing hyphens; return an empty string for input that has no letters or digits; and raise TypeError if text is not a str.

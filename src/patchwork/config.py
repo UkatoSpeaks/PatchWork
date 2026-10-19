@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = Field(default=2, ge=1)
     # Seconds one LLM call may spend waiting on per-minute rate limits in total.
     llm_max_wait_seconds: float = Field(default=180.0, ge=0)
+    # How long to wait when the per-minute token budget is short: "proportional"
+    # waits for just the missing tokens to refill, "full" for the window reset.
+    throttle_mode: Literal["proportional", "full"] = "proportional"
 
     # Crew: coder retries (failing suite or review blockers) per run
     max_retries: int = Field(default=3, ge=0)

@@ -79,6 +79,7 @@ def run(
                 api_key=settings.api_key(),
                 max_concurrency=settings.max_concurrent_requests,
                 max_wait=settings.llm_max_wait_seconds,
+                throttle_mode=settings.throttle_mode,
                 usage=UsageStore(RUNS_DIR / "usage.json"),
             )
             orchestrator = Orchestrator(

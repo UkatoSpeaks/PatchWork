@@ -1,0 +1,9 @@
+[project]
+name = "text_utils"
+version = "0.1.0"
+description = "Toy package with a passing suite and a feature request, used to exercise the Patchwork retry loop."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

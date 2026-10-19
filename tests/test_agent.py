@@ -124,6 +124,43 @@ def test_finish_written_as_json_text_is_accepted():
     assert (result.success, result.summary, result.stop_reason) == (True, "fixed it", "finished")
 
 
+def test_finish_with_type_key_keeps_the_summary():
+    """Seen from gpt-oss: {"type": "finish", "arguments": {...}} instead of "name"."""
+    text = '{"type": "finish", "arguments": {"success": true, "summary": "Added slugify with tests."}}'
+    result = run(make_agent(ScriptedLLM([reply(content=text)])))
+    assert (result.success, result.summary, result.stop_reason) == (True, "Added slugify with tests.", "finished")
+
+
+def test_tool_and_function_keys_name_a_known_tool():
+    for key in ("type", "tool", "function"):
+        llm = ScriptedLLM([reply(content=f'{{"{key}": "echo", "arguments": {{"text": "via {key}"}}}}'), finish()])
+        result = run(make_agent(llm))
+        assert result.success
+        assert f"echo: via {key}" in tool_results(llm.requests[1])
+
+
+def test_name_key_aliases_accept_tool_aliases():
+    llm = ScriptedLLM([reply(content='{"tool": "repo_browser.echo", "arguments": {"text": "aliased"}}'), finish()])
+    result = run(make_agent(llm, alias_prefixes=("repo_browser.",)))
+    assert result.success
+    assert "echo: aliased" in tool_results(llm.requests[1])
+
+
+def test_name_key_aliases_ignore_unknown_tools():
+    """{"type": "bogus"} is just JSON, not a call; {"name": "bogus"} is an unknown-tool call."""
+    for text in ('{"type": "bogus", "arguments": {"text": "x"}}', '{"tool": "echo2", "parameters": {}}',
+                 '{"function": {"name": "echo"}, "arguments": {"text": "x"}}'):
+        llm = ScriptedLLM([reply(content=text), finish()])
+        result = run(make_agent(llm))
+        assert result.success
+        follow_up = llm.requests[1][-1]
+        assert follow_up["role"] == "user" and "unknown tool" not in follow_up["content"]
+        assert tool_results(llm.requests[1]) == []
+    llm = ScriptedLLM([reply(content='{"name": "bogus", "arguments": {}}'), finish()])
+    run(make_agent(llm))
+    assert "unknown tool 'bogus'" in tool_results(llm.requests[1])[0]
+
+
 def test_repeated_prose_is_taken_as_final_answer_and_verified():
     for verified, expected in [(True, True), (False, False)]:
         llm = ScriptedLLM([reply(content="All tests pass now."), reply(content="Done: fixed subtract.")])
