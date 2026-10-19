@@ -1,0 +1,65 @@
+{
+  "run_id": "20261019-120000-f1x7",
+  "issue": "Add a median() function.\nIt must handle empty lists.",
+  "mode": "crew",
+  "sequential": false,
+  "plan": {
+    "issue_summary": "Add median() to stats",
+    "subtasks": [
+      {
+        "id": "t1",
+        "role": "tester",
+        "description": "Write tests/test_median.py",
+        "files_hint": [
+          "tests/test_median.py"
+        ],
+        "acceptance_criteria": [
+          "fails first"
+        ]
+      },
+      {
+        "id": "c1",
+        "role": "coder",
+        "description": "Implement median() in stats/core.py",
+        "files_hint": [
+          "stats/core.py"
+        ],
+        "acceptance_criteria": [
+          "tests pass"
+        ]
+      }
+    ],
+    "risks": []
+  },
+  "runs": [],
+  "tests_written": [
+    "tests/test_median.py"
+  ],
+  "verdict": {
+    "approved": true,
+    "issues": [],
+    "summary": "Looks good"
+  },
+  "retries": 1,
+  "tests_passed": true,
+  "diff": "",
+  "files_changed": [
+    "stats/core.py",
+    "tests/test_median.py"
+  ],
+  "result_branch": "patchwork/20261019-120000-f1x7/result",
+  "base_commit": "abc123",
+  "kept_branches": [],
+  "usage_today": {},
+  "phases": {},
+  "success": true,
+  "failed_agent": null,
+  "error": null,
+  "tokens": {
+    "lead": 2540,
+    "tester": 1100,
+    "coder": 5000,
+    "reviewer": 4350
+  },
+  "total_tokens": 12990
+}

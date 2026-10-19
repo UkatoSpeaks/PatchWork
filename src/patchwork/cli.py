@@ -1,8 +1,9 @@
 """Command-line interface.
 
-``patchwork run --repo PATH --issue TEXT [--init-git] [--sequential] [--max-retries N] [--solo]``
+``patchwork run --repo PATH (--issue TEXT | --issue-file PATH) [--init-git] [--sequential] [--max-retries N] [--solo]``
 ``patchwork replay runs/<run_id>/events.jsonl``
 ``patchwork usage [--days N]``
+``patchwork serve [--port 8000] [--runs-dir runs]``
 
 All output is rendered from run events (see ``render.py``); every run is
 also logged to ``runs/<run_id>/events.jsonl`` and ``runs/<run_id>/result.json``.
@@ -44,10 +45,32 @@ def _tolerant_streams() -> None:
             stream.reconfigure(errors="replace")
 
 
+def _issue_text(issue: str | None, issue_file: Path | None) -> str:
+    """The issue from --issue or --issue-file (exactly one).
+
+    The file is read as UTF-8 (a BOM is fine): passing a file's content through
+    the shell, e.g. ``--issue (Get-Content -Raw ISSUE.md)`` in Windows
+    PowerShell 5, can decode it with the wrong encoding.
+    """
+    if (issue is None) == (issue_file is None):
+        raise typer.BadParameter("pass exactly one of --issue and --issue-file", param_hint="'--issue' / '--issue-file'")
+    if issue_file is None:
+        return issue
+    try:
+        text = issue_file.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise typer.BadParameter(f"could not read {issue_file} as UTF-8: {exc}", param_hint="'--issue-file'") from exc
+    if not text:
+        raise typer.BadParameter(f"{issue_file} is empty", param_hint="'--issue-file'")
+    return text
+
+
 @app.command()
 def run(
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False, resolve_path=True, help="Path to the local repository.")],
-    issue: Annotated[str, typer.Option(help="Description of the bug or feature.")],
+    issue: Annotated[str | None, typer.Option(help="Description of the bug or feature.")] = None,
+    issue_file: Annotated[Path | None, typer.Option(exists=True, dir_okay=False, resolve_path=True,
+                                                    help="Read the issue from this UTF-8 file instead of --issue.")] = None,
     init_git: Annotated[bool, typer.Option("--init-git", help="If REPO is not a git repo, run git init and commit everything.")] = False,
     sequential: Annotated[bool, typer.Option("--sequential", help="Run the tester and coder one after the other instead of concurrently.")] = False,
     max_retries: Annotated[int | None, typer.Option(min=0, help="Max coder retries per run (default: MAX_RETRIES, 3).")] = None,
@@ -61,6 +84,7 @@ def run(
     your working tree is not modified.
     """
     _tolerant_streams()
+    issue = _issue_text(issue, issue_file)
     settings = Settings()
     if max_steps is not None:
         settings = settings.model_copy(update={"max_steps_per_agent": max_steps})
@@ -126,6 +150,21 @@ def replay(
     renderer = CliRenderer()
     for event in read_events(events):
         renderer(event)
+
+
+@app.command()
+def serve(
+    port: Annotated[int, typer.Option(min=1, max=65535, help="Port for the API.")] = 8000,
+    host: Annotated[str, typer.Option(help="Interface to bind.")] = "127.0.0.1",
+    runs_dir: Annotated[Path, typer.Option(file_okay=False, help="Directory holding runs/<run_id>/events.jsonl.")] = RUNS_DIR,
+) -> None:
+    """Serve the run logs to the web dashboard (see web/)."""
+    import uvicorn
+
+    from patchwork.server import create_app
+
+    typer.echo(f"Patchwork API on http://{host}:{port}/api/runs (runs from {runs_dir.resolve()})")
+    uvicorn.run(create_app(runs_dir), host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
