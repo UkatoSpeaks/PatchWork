@@ -84,7 +84,7 @@ Groq's free-tier limits are per account and model (gpt-oss-120b: 8,000 tokens pe
   - Per-minute: retried, always waiting at least Groq's retry-after, until the call has waited `LLM_MAX_WAIT_SECONDS` (180s) in total. There is no fixed retry count.
   - Per-day: never retried. The model is marked exhausted for the rest of the process, and the agent switches to the next model in its role's `*_FALLBACKS` list. It keeps the same conversation and logs "daily limit reached on X, switching to Y". If every model is exhausted, the agent fails with a message naming each model and its reset time from Groq's error. The models each agent actually used are in `RunResult` (`runs[].result.models_used`) and the final table.
 - **Throttling.** After every call, Groq's `x-ratelimit-*` headers (remaining tokens/requests and reset times) are stored per model. Before a call, its cost is estimated (prompt characters / 4 + `max_tokens`). If the per-minute token budget left is too small, the call waits instead of being sent and getting a 429: "throttling: waiting Xs for the token budget on <model> (need ~N, M left, limit L/min, mode)".
-  - `THROTTLE_MODE=proportional` (default) assumes the budget refills gradually at limit/60s, so it waits `(needed - remaining) / (limit / 60s) + 1s`, capped at the reset time from the headers. If a call sent on assumed refill still gets a per-minute 429, that model switches to full waits for the rest of the run: "proportional throttling not accepted on <model>; using full reset waits".
+  - `THROTTLE_MODE=proportional` (default) assumes the budget refills gradually at limit/60s, so it waits `(needed - remaining) / (limit / 60s) + 1s`, capped at the reset time from the headers. Each per-minute 429 on a call sent on assumed refill adds 2s to that model's margin; after the third, the model switches to full waits for the rest of the run, and the run says so once: "proportional throttling not accepted on <model>; using full reset waits".
   - `THROTTLE_MODE=full` waits for the reset time from the headers.
 - **Daily usage.** Tokens and requests per model per day (local date) are added to `runs/usage.json` after every call. The final table shows today's totals, with the per-day limit when known. Groq sends the requests-per-day limit in its headers; the tokens-per-day limit only appears in a TPD 429 message, so it is remembered from there. A TPD message's "Used N" also raises today's total to Groq's count, which includes usage outside Patchwork. `patchwork usage` prints today's totals, and `patchwork usage --days 7` shows the last 7 days with usage.
 
@@ -92,11 +92,14 @@ Groq's free-tier limits are per account and model (gpt-oss-120b: 8,000 tokens pe
 
 ```bash
 uv run patchwork run --repo PATH --issue "TEXT" [--init-git] [--sequential] [--max-retries N] [--test-cmd "..."] [--max-steps N]
+uv run patchwork run --repo PATH --issue-file ISSUE.md [...]
 uv run patchwork run --repo PATH --issue "TEXT" --solo
 uv run patchwork replay runs/<run_id>/events.jsonl
 uv run patchwork usage [--days N]
+uv run patchwork serve [--port 8000] [--runs-dir runs]
 ```
 
+- `--issue-file` reads the issue from a UTF-8 file (a BOM is fine) instead of `--issue`; pass exactly one of them. Prefer it for issue text with non-ASCII characters: in Windows PowerShell 5, `--issue (Get-Content -Raw ISSUE.md)` decodes UTF-8 with the wrong encoding ('é' arrives as 'Ã©').
 - `PATH` must be the root of a git repo with a commit and no uncommitted changes (commit or stash first). `--init-git` turns a plain directory into one: `git init` plus an initial commit of everything in it.
 - `--sequential` runs the tester and coder one after the other instead of concurrently. The final table shows wall-clock time per agent and per phase, so the two modes can be compared.
 - `--solo` runs only the coder, editing `PATH` **in place** as in milestone 1 (no git needed; the diff comes from a temp-dir snapshot). It's kept for single-vs-crew evals.
@@ -111,6 +114,27 @@ Everything the CLI prints is rendered from structured events (`events.py`). Agen
 
 Every run writes `runs/<run_id>/events.jsonl` (one event per line, as it happens) and `runs/<run_id>/result.json` (the final `RunResult`). `patchwork replay` re-renders a past run from its log; the output is identical. A frontend can subscribe with `EventBus.subscribe`, or consume `async for event in bus.stream()`.
 
+### Web dashboard
+
+`web/` is a Next.js app that replays a run as a pixel-art office: the lead plans at the whiteboard, the tester and coder type at their desks, rate-limited agents queue at the coffee machine, the wall monitor shows test results, and the reviewer holds up a verdict. It reads the run logs through a small read-only API (`server.py`).
+
+```bash
+# terminal 1, repo root: the API on http://localhost:8000
+uv run patchwork serve [--port 8000] [--runs-dir runs]
+
+# terminal 2: the dashboard on http://localhost:3000
+cd web && npm install && npm run dev
+```
+
+The API base URL comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`; see `web/.env.example`). Endpoints:
+
+- `GET /api/runs`: run summaries (issue, mode, success, tokens, duration), newest first.
+- `GET /api/runs/{run_id}`: the summary, `result.json` (null while unfinished) and the plan.
+- `GET /api/runs/{run_id}/events`: every event.
+- `GET /api/runs/{run_id}/stream?speed=4&start=0`: server-sent events replaying the log at its original pace divided by `speed` (0 = no delays), each gap capped at 2s, then an `end` event.
+
+The replay uses `/stream` for playback and `/events` for seeking: the scene is a pure reducer over events (`web/lib/office/reducer.ts`), so jumping to event N means reducing `events[0..N]`. `/runs/<run_id>?at=N` opens a run paused at event N. Frontend tests: `cd web && npm test`.
+
 ### Try it on the toy repos
 
 - `toy_repos/calculator`: 3 planted bugs; 3 of its 8 tests fail.
@@ -123,7 +147,11 @@ Always run on a copy; Patchwork's own tests check the originals are untouched. T
 # PowerShell
 Remove-Item -Recurse -Force $env:TEMP\stats -ErrorAction SilentlyContinue
 Copy-Item -Recurse toy_repos\stats_feature $env:TEMP\stats
-uv run patchwork run --repo $env:TEMP\stats --init-git --issue "Add a median() function that handles even and odd length lists and raises ValueError on an empty list."
+uv run patchwork run --repo $env:TEMP\stats --init-git --issue-file toy_repos\stats_feature\ISSUE.md
+
+Remove-Item -Recurse -Force $env:TEMP\text_utils -ErrorAction SilentlyContinue
+Copy-Item -Recurse toy_repos\text_utils $env:TEMP\text_utils
+uv run patchwork run --repo $env:TEMP\text_utils --init-git --issue-file toy_repos\text_utils\ISSUE.md
 ```
 
 ```bash
@@ -147,6 +175,7 @@ The LLM is mocked (scripted), so no API key or network is needed. Crew tests use
 - **Crew flow:** worktrees and cleanup, concurrency, merges, retries on test failure and review blockers, the retry cap, the user's tree staying untouched, sequential stopping after a tester failure, parallel cancelling the sibling, branches kept after a failed run, models used and today's usage in the final table.
 - **One run at a time and usage:** the lock refusing a second run and clearing a stale one, `runs/usage.json`, `patchwork usage`.
 - **Events:** the full event sequence, replay output and `--sequential` producing the same result.
+- **Dashboard API:** run list (skipping empty runs, newest first), detail and plan, events, SSE replay order and `end`, gap scaling and capping, CORS.
 
 Symlink tests are skipped on Windows unless Developer Mode is enabled.
 
@@ -172,10 +201,13 @@ src/patchwork/
   agents/tester.py   Tester role: new test files only + fail-first gate + auto-finish
   agents/coder.py    Coder role: prompt, tools, test gate and nudge; initial and retry tasks
   agents/reviewer.py Reviewer role: read-only tools + diff + submit_review
-  cli.py             Typer CLI: run, replay, usage
+  server.py          Read-only FastAPI over runs/ for the web dashboard (list, detail, events, SSE replay)
+  cli.py             Typer CLI: run, replay, usage, serve
 toy_repos/calculator/     Bug-planted package
 toy_repos/stats_feature/  Working package + a feature request (median)
 tests/
+tests/fixtures/runs/      A small recorded run shared by the server and reducer tests
+web/                      Next.js dashboard: app/ pages, components/, lib/office/ (reducer, layout, sprites, animator, renderer)
 runs/                     Event logs and results (git-ignored)
 ```
 

@@ -66,6 +66,8 @@ class Orchestrator:
         self.max_retries = settings.max_retries if max_retries is None else max_retries
         # Agents the orchestrator is cancelling (their sibling failed).
         self._cancelling: set[str] = set()
+        # Models whose proportional-throttling fallback has been announced.
+        self._throttle_fallbacks: set[str] = set()
         if isinstance(llm, LLMClient):
             llm.on_retry = self._on_rate_limited
             llm.on_cooldown = self._on_cooldown
@@ -407,6 +409,9 @@ class Orchestrator:
                    needed_tokens=needed, remaining_tokens=remaining, limit_tokens=limit, mode=mode)
 
     def _on_throttle_fallback(self, model: str) -> None:
+        if model in self._throttle_fallbacks:
+            return
+        self._throttle_fallbacks.add(model)
         self._emit("orchestrator", "note", text=f"proportional throttling not accepted on {model}; using full reset waits")
 
     def _emit(self, agent: AgentName, type: str, **payload: Any) -> None:

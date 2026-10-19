@@ -330,17 +330,26 @@ def test_throttle_mode_full_waits_for_the_reset():
     assert sleeps == [pytest.approx(58.0)]
 
 
-def test_429_after_a_proportional_wait_falls_back_to_full_waits(caplog):
-    fallbacks, modes = [], []
+def tpm_429_with_budget(**headers):
+    """A per-minute 429 that also carries x-ratelimit headers (as Groq's do)."""
+    exc = groq_429("TPM", wait="2s")
+    exc.response.headers = {k.replace("_", "-"): v for k, v in budget_headers(**headers).items()}
+    return exc
+
+
+def test_fallback_to_full_waits_only_after_the_third_429_with_a_growing_margin(caplog):
+    timeline = []
     client, sleeps = make_client(
         [
             with_headers(fake_response("one"), **budget_headers()),
-            groq_429("TPM", wait="2s"),  # the proportional wait was not enough
+            tpm_429_with_budget(),  # each proportional wait falls short
+            tpm_429_with_budget(),
+            tpm_429_with_budget(),
             with_headers(fake_response("two"), **budget_headers()),
             fake_response("three"),
         ],
-        on_throttle=lambda *args: modes.append(args[-1]),
-        on_throttle_fallback=fallbacks.append,
+        on_throttle=lambda *args: timeline.append(("throttle", *args)),
+        on_throttle_fallback=lambda model: timeline.append(("fallback", model)),
     )
 
     async def main():
@@ -348,16 +357,51 @@ def test_429_after_a_proportional_wait_falls_back_to_full_waits(caplog):
         await client.complete("m", [], max_tokens=2985)
         await client.complete("m", [], max_tokens=2985)
 
-    with caplog.at_level("WARNING", logger="patchwork.llm"):
+    with caplog.at_level("INFO", logger="patchwork.llm"):
         asyncio.run(main())
-    proportional = 402 / (8000 / 60) + 1.0
-    # Proportional wait, then the 429's retry-after; from then on this model waits
-    # for the full reset (what is left of the first window, then a whole new one).
-    assert sleeps == [pytest.approx(proportional), pytest.approx(2.5),
-                      pytest.approx(58.0 - proportional - 2.5), pytest.approx(58.0)]
-    assert modes == ["proportional", "full", "full"]
-    assert fallbacks == ["m"]
-    assert "proportional throttling not accepted on m; using full reset waits" in caplog.text
+
+    # Three proportional waits, the 1s margin growing by 2s after each 429; the
+    # fallback comes only after the third 429, then every wait is a full reset.
+    assert [entry[0] if entry[0] == "fallback" else entry[-1] for entry in timeline] == [
+        "proportional", "proportional", "proportional", "fallback", "full", "full",
+    ]
+    rate = 8000 / 60
+    for (_, model, delay, needed, remaining, limit, mode), margin in zip(timeline[:3], (1.0, 3.0, 5.0)):
+        assert delay == pytest.approx((needed - remaining) / rate + margin)
+    assert timeline[3] == ("fallback", "m")
+    # Full waits: what is left of the window the last 429 reported, then a whole window.
+    assert timeline[4][2] == pytest.approx(58.0 - 2.5)
+    assert timeline[5][2] == pytest.approx(58.0)
+    assert sleeps.count(pytest.approx(2.5)) == 3  # each 429's retry-after
+    messages = [r.getMessage() for r in caplog.records]
+    assert "per-minute 429 after proportional throttling on m (1 of 3); margin now 3s" in messages
+    assert "per-minute 429 after proportional throttling on m (2 of 3); margin now 5s" in messages
+    assert messages.count("proportional throttling not accepted on m; using full reset waits") == 1
+    # Logged at info: the run event is what users see (a warning also hit stderr).
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_429s_are_counted_per_model():
+    fallbacks = []
+    client, _ = make_client(
+        [with_headers(fake_response("a"), **budget_headers()), with_headers(fake_response("b"), **budget_headers()),
+         tpm_429_with_budget(), tpm_429_with_budget(), fake_response("a2"),
+         tpm_429_with_budget(), fake_response("b2")],
+        on_throttle_fallback=fallbacks.append,
+    )
+
+    async def main():
+        await client.complete("a", [], max_tokens=100)
+        await client.complete("b", [], max_tokens=100)
+        await client.complete("a", [], max_tokens=2985)  # two 429s on a
+        await client.complete("b", [], max_tokens=2985)  # one on b: three in total, but not on one model
+        from patchwork.llm import _gate_for
+        return _gate_for("a", 2), _gate_for("b", 2)
+
+    gate_a, gate_b = asyncio.run(main())
+    assert fallbacks == []
+    assert (gate_a.proportional_429s, gate_a.proportional_margin, gate_a.full_throttle_only) == (2, 5.0, False)
+    assert (gate_b.proportional_429s, gate_b.proportional_margin, gate_b.full_throttle_only) == (1, 3.0, False)
 
 
 def test_429_without_proportional_credit_keeps_proportional_mode():
@@ -525,12 +569,15 @@ def test_throttle_events_carry_their_inputs_and_the_fallback_is_announced(tmp_pa
     try:
         llm.on_throttle("m", 4.02, 2985, 2583, 8000, "proportional")
         llm.on_throttle_fallback("m")
+        llm.on_throttle_fallback("m")  # announced once per model per run
+        llm.on_throttle_fallback("other")
     finally:
         llm_caller.reset(token)
-    throttled, note = events
+    throttled, note, other = events
     assert (throttled.agent, throttled.type) == ("coder", "throttled")
     assert throttled.payload == {"model": "m", "delay_s": 4.02, "needed_tokens": 2985, "remaining_tokens": 2583,
                                  "limit_tokens": 8000, "mode": "proportional"}
     assert (note.agent, note.type) == ("orchestrator", "note")
     assert note.payload["text"] == "proportional throttling not accepted on m; using full reset waits"
+    assert other.payload["text"] == "proportional throttling not accepted on other; using full reset waits"
     assert any("(need ~2,985, 2,583 left, limit 8,000/min, proportional)" in line for line in lines)

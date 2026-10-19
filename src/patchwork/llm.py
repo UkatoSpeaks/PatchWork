@@ -16,8 +16,9 @@ Adds what the agents need on top of ``litellm.acompletion``:
   from the ``x-ratelimit-*`` response headers, used to wait for the
   per-minute budget instead of sending a call that would get a 429. By
   default ("proportional") the budget is assumed to refill gradually, so a
-  call waits only for the tokens it lacks; after a per-minute 429 that this
-  assumption let through, the model falls back to waiting for the full reset,
+  call waits only for the tokens it lacks; each per-minute 429 that this
+  assumption let through adds to that model's safety margin, and after
+  three the model falls back to waiting for the full reset,
 - optional daily usage accounting (``usage.UsageStore``).
 """
 
@@ -60,6 +61,10 @@ ThrottleMode = Literal["proportional", "full"]
 TOKEN_WINDOW_SECONDS = 60.0
 # Added to a proportional wait so the refill has surely covered the call.
 PROPORTIONAL_MARGIN_SECONDS = 1.0
+# Added to a model's margin after each per-minute 429 on a call sent on assumed refill.
+PROPORTIONAL_MARGIN_STEP_SECONDS = 2.0
+# That many such 429s on one model switch it to full reset waits.
+PROPORTIONAL_MAX_429S = 3
 
 # Name of the agent making LLM calls in the current task, for attributing
 # rate-limit waits. Each asyncio task gets its own copy.
@@ -107,12 +112,13 @@ class TokenBudget:
             self.limit_requests = number("x-ratelimit-limit-requests") or self.limit_requests
             self.requests_reset_at = reset("x-ratelimit-reset-requests")
 
-    def wait_for(self, tokens: int, now: float, mode: ThrottleMode = "full") -> float:
+    def wait_for(self, tokens: int, now: float, mode: ThrottleMode = "full",
+                 margin: float = PROPORTIONAL_MARGIN_SECONDS) -> float:
         """Seconds to wait before a call costing ``tokens`` fits the budget (0 = send now).
 
         "full": wait until the reset time from the headers. "proportional": the
         budget refills at ``limit / 60s`` (token bucket), so wait
-        ``(tokens - remaining) / rate`` plus a margin, capped at the reset time.
+        ``(tokens - remaining) / rate`` plus ``margin``, capped at the reset time.
         """
         if self.remaining_tokens is None or self.limit_tokens is None:
             return 0.0
@@ -136,7 +142,7 @@ class TokenBudget:
         until_reset = self.tokens_reset_at - now if self.tokens_reset_at is not None else None
         if mode == "full":
             return until_reset or 0.0  # no reset time to wait for: send now
-        wait = (tokens - self.remaining_tokens) / rate + PROPORTIONAL_MARGIN_SECONDS
+        wait = (tokens - self.remaining_tokens) / rate + margin
         return min(wait, until_reset) if until_reset is not None else wait
 
     def reserve(self, tokens: int) -> None:
@@ -152,7 +158,10 @@ class _ModelGate:
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.cooldown_until = 0.0
         self.budget = TokenBudget()
-        # Set once a per-minute 429 shows proportional throttling sends too early.
+        # Per-minute 429s on calls sent on assumed refill, and the margin they grew to.
+        self.proportional_429s = 0
+        self.proportional_margin = PROPORTIONAL_MARGIN_SECONDS
+        # Set once proportional throttling has sent too early PROPORTIONAL_MAX_429S times.
         self.full_throttle_only = False
         # Set once the model hits a per-day limit; it stays exhausted from then on.
         self.exhausted: DailyLimitReached | None = None
@@ -315,8 +324,9 @@ class LLMClient:
 
         ``throttle_mode`` is how long a call waits when the per-minute token
         budget from the headers can't cover it (see ``TokenBudget.wait_for``).
-        In "proportional" mode, a per-minute 429 on a call sent on assumed
-        refill switches that model to "full" for the rest of the process."""
+        In "proportional" mode, each per-minute 429 on a call sent on assumed
+        refill adds 2s to that model's margin; the third switches the model to
+        "full" for the rest of the process."""
         self._api_key = api_key
         self.max_concurrency = max_concurrency
         self._completion_fn = completion_fn or _litellm_acompletion()
@@ -385,7 +395,7 @@ class LLMClient:
             just_backed_off = False
             # Don't send a call the per-minute token budget can't cover.
             mode: ThrottleMode = "full" if gate.full_throttle_only else self.throttle_mode
-            throttle = gate.budget.wait_for(estimate, self._clock(), mode)
+            throttle = gate.budget.wait_for(estimate, self._clock(), mode, gate.proportional_margin)
             if throttle > 0:
                 remaining_tokens = gate.budget.remaining_tokens or 0
                 limit_tokens = gate.budget.limit_tokens or 0
@@ -413,10 +423,7 @@ class LLMClient:
                     gate.exhausted = self._daily_limit(model, exc)
                     raise gate.exhausted from exc
                 if on_assumed_refill and not gate.full_throttle_only:
-                    gate.full_throttle_only = True
-                    log.warning("proportional throttling not accepted on %s; using full reset waits", model)
-                    if self.on_throttle_fallback:
-                        self.on_throttle_fallback(model)
+                    self._proportional_rejected(model, gate)
                 delay = self._retry_delay(exc, attempt)
                 if waited + delay > self.max_wait:
                     raise RateLimitExhausted(
@@ -448,6 +455,20 @@ class LLMClient:
             if gate.budget.limit_requests is not None:
                 self.usage.note_reported(model, requests_per_day=gate.budget.limit_requests)
         return response
+
+    def _proportional_rejected(self, model: str, gate: _ModelGate) -> None:
+        """A per-minute 429 on a call sent on assumed refill: widen the margin, or give up on proportional waits."""
+        gate.proportional_429s += 1
+        if gate.proportional_429s < PROPORTIONAL_MAX_429S:
+            gate.proportional_margin += PROPORTIONAL_MARGIN_STEP_SECONDS
+            log.info("per-minute 429 after proportional throttling on %s (%d of %d); margin now %.0fs",
+                     model, gate.proportional_429s, PROPORTIONAL_MAX_429S, gate.proportional_margin)
+            return
+        gate.full_throttle_only = True
+        # Info, not warning: the event (on_throttle_fallback) is what the user sees.
+        log.info("proportional throttling not accepted on %s; using full reset waits", model)
+        if self.on_throttle_fallback:
+            self.on_throttle_fallback(model)
 
     def _daily_limit(self, model: str, exc: BaseException) -> DailyLimitReached:
         message = _error_message(exc)
