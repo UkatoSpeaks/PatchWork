@@ -1,6 +1,6 @@
 // Numbers for the stats tab and the phase timeline, computed from the events.
 
-import { isCrew } from "./office/reducer";
+import { type Attempt, finishAttempt, isCrew, startAttempt, switchAttempt } from "./office/reducer";
 import type { CrewAgent, RunEvent } from "./types";
 
 export interface AgentStats {
@@ -13,6 +13,8 @@ export interface AgentStats {
   seconds: number;
   waiting: number;
   working: number;
+  // each run of the agent with the models it used
+  attempts: Attempt[];
 }
 
 const num = (value: unknown) => {
@@ -26,7 +28,7 @@ export function agentStats(events: RunEvent[]): AgentStats[] {
   const get = (agent: CrewAgent) => {
     let s = stats.get(agent);
     if (!s) {
-      s = { agent, runs: 0, steps: 0, tokens: 0, seconds: 0, waiting: 0, working: 0, open: null, liveTokens: 0, liveSteps: 0 };
+      s = { agent, runs: 0, steps: 0, tokens: 0, seconds: 0, waiting: 0, working: 0, attempts: [], open: null, liveTokens: 0, liveSteps: 0 };
       stats.set(agent, s);
     }
     return s;
@@ -41,6 +43,10 @@ export function agentStats(events: RunEvent[]): AgentStats[] {
         s.open = ts(event);
         s.liveTokens = 0;
         s.liveSteps = 0;
+        s.attempts = startAttempt(s.attempts, event.agent, p);
+        break;
+      case "note":
+        if (p.kind === "model_switch") s.attempts = switchAttempt(s.attempts, p.to_model);
         break;
       case "llm_call":
         s.liveTokens = Math.max(s.liveTokens, num(p.tokens_used));
@@ -55,6 +61,7 @@ export function agentStats(events: RunEvent[]): AgentStats[] {
         s.tokens += num(p.tokens);
         s.seconds += p.duration_s != null ? num(p.duration_s) : s.open != null ? ts(event) - s.open : 0;
         s.open = null;
+        s.attempts = finishAttempt(s.attempts, p);
         break;
     }
   }
@@ -69,7 +76,7 @@ export function agentStats(events: RunEvent[]): AgentStats[] {
       const tokens = s.tokens + (s.open != null ? s.liveTokens : 0);
       const steps = s.steps + (s.open != null ? s.liveSteps : 0);
       const waiting = Math.min(s.waiting, seconds);
-      return { agent, runs: s.runs, steps, tokens, seconds, waiting, working: Math.max(0, seconds - waiting) };
+      return { agent, runs: s.runs, steps, tokens, seconds, waiting, working: Math.max(0, seconds - waiting), attempts: s.attempts };
     });
 }
 

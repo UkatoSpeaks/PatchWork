@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     tester_fallbacks: str = "groq/qwen/qwen3.8-27b,groq/openai/gpt-oss-20b"
     reviewer_fallbacks: str = "groq/openai/gpt-oss-120b,groq/openai/gpt-oss-20b"
 
+    # Model for crew coder retries (escalation, e.g. a bigger model); empty means
+    # CODER_MODEL. Its fallbacks; empty means CODER_FALLBACKS.
+    coder_retry_model: str = ""
+    coder_retry_fallbacks: str = ""
+
     # Agent budgets
     max_steps_per_agent: int = Field(default=25, ge=1)
     max_tokens_per_run: int = Field(default=60_000, ge=1)
@@ -59,13 +64,28 @@ class Settings(BaseSettings):
 
     def fallbacks_for(self, role: Role) -> list[str]:
         """The role's fallback models in order, without its own model or duplicates."""
-        primary = self.model_for(role)
-        out: list[str] = []
-        for model in getattr(self, f"{role}_fallbacks").split(","):
-            model = model.strip()
-            if model and model != primary and model not in out:
-                out.append(model)
-        return out
+        return _model_list(getattr(self, f"{role}_fallbacks"), self.model_for(role))
+
+    def coder_retry_model_or_default(self) -> str:
+        """The model coder retries start on: CODER_RETRY_MODEL, else CODER_MODEL."""
+        return self.coder_retry_model.strip() or self.coder_model
+
+    def coder_retry_fallbacks_or_default(self) -> list[str]:
+        """Fallbacks for coder retries: CODER_RETRY_FALLBACKS, else CODER_FALLBACKS."""
+        if not self.coder_retry_model.strip():
+            return self.fallbacks_for("coder")
+        raw = self.coder_retry_fallbacks if self.coder_retry_fallbacks.strip() else self.coder_fallbacks
+        return _model_list(raw, self.coder_retry_model_or_default())
 
     def api_key(self) -> str | None:
         return self.groq_api_key.get_secret_value() if self.groq_api_key else None
+
+
+def _model_list(raw: str, primary: str) -> list[str]:
+    """Comma-separated models in order, without ``primary`` or duplicates."""
+    out: list[str] = []
+    for model in raw.split(","):
+        model = model.strip()
+        if model and model != primary and model not in out:
+            out.append(model)
+    return out

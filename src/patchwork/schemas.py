@@ -96,6 +96,20 @@ class AgentRun(BaseModel):
         return self.result.models_used or [self.model]
 
 
+class CoderAttempt(BaseModel):
+    """One coder attempt in a crew run: the implement-phase coder (attempt 1)
+    or a retry (attempt 1 + retry)."""
+
+    attempt: int
+    # 0 for the implement-phase coder.
+    retry: int = 0
+    reason: str | None = None
+    # Every model the attempt called, in order (more than one after a switch).
+    models: list[str]
+    outcome: Literal["passed", "failed", "cancelled"]
+    stop_reason: str
+
+
 class RunResult(BaseModel):
     """Outcome of one Patchwork run. ``diff`` and ``files_changed`` come from
     git (crew: result branch vs the run's base commit) or a snapshot (solo),
@@ -112,6 +126,9 @@ class RunResult(BaseModel):
     # The latest review verdict.
     verdict: ReviewVerdict | None = None
     retries: int = 0
+    # Crew coder attempts in order, with their models. A failed implement-phase
+    # attempt counts toward the retry cap.
+    attempts: list[CoderAttempt] = Field(default_factory=list)
     # Whether the full suite passed in the result worktree at the end (crew).
     tests_passed: bool | None = None
     diff: str = ""

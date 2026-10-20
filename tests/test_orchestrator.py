@@ -327,12 +327,13 @@ def test_suite_failure_with_no_retries_left(stats_git: Path):
 
 def test_worktrees_are_cleaned_up_after_an_agent_failure(stats_git: Path):
     before = tree_bytes(stats_git)
+    tester = [reply(("write_file", {"path": "tests/test_median.py", "content": MEDIAN_TESTS})),
+              finish(success=False, summary="stuck")]
     result, events, llm, lines = crew(
         stats_git,
-        {"lead": lead_script(), "tester": qa_script(),
-         "coder": [finish(success=False, summary="no idea"), finish(success=False, summary="stuck")], "reviewer": []},
+        {"lead": lead_script(), "tester": tester, "coder": [reply(("list_dir", {"path": "."}))] * 9, "reviewer": []},
     )
-    assert (result.success, result.failed_agent) == (False, "coder")
+    assert (result.success, result.failed_agent) == (False, "tester")
     assert of(events, "phase_started")[-1].payload["phase"] == "implement"  # stopped before integrate
     assert len(worktrees(stats_git)) == 1
     # The tester's branch has its test file, so it is kept; the coder committed nothing,
@@ -494,3 +495,112 @@ def test_cli_run_and_replay(stats_git: Path, tmp_path: Path, monkeypatch):
     assert replay.exit_code == 0
     assert replay.output in live.output  # live output adds only the trailing event-log hint
     assert "Patchwork crew (parallel)" in replay.output and "success:       True" in replay.output
+
+
+# --- coder failure in the implement phase, retry model ------------------------------------
+
+def gives_up():
+    """A coder that gives up (the first give-up before any attempt is refused)."""
+    return [finish(success=False, summary="no idea"), finish(success=False, summary="stuck")]
+
+
+def test_coder_failure_in_implement_integrates_and_retries_on_the_retry_model(stats_git: Path):
+    result, events, llm, lines = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": gives_up(), "coder-big": coder_script(),
+         "reviewer": [submit_review()]},
+        settings={"coder_retry_model": "coder-big"},
+    )
+    assert result.success, result.error or result.failed_agent
+    assert result.failed_agent is None and result.retries == 1
+    # The first attempt ran on CODER_MODEL, the retry on CODER_RETRY_MODEL.
+    assert len(llm.requests_for("coder")) == 2 and len(llm.requests_for("coder-big")) == 4
+    assert [(a.attempt, a.retry, a.models, a.outcome) for a in result.attempts] == [
+        (1, 0, ["coder"], "failed"), (2, 1, ["coder-big"], "passed")]
+    notes = [e.payload["text"] for e in of(events, "note", "orchestrator")]
+    assert "coder failed (finished: stuck); continuing with a retry" in notes
+    assert "the coder committed nothing; merging only the tester's branch" in notes
+    # The tester was not cancelled, and only its branch was merged.
+    assert of(events, "agent_finished", "tester")[0].payload["success"] is True
+    assert [e.payload["branch"] for e in of(events, "merge")] == [f"patchwork/{result.run_id}/tester"]
+    # The suite failed on the tester's tests, which started the retry.
+    assert [e.payload["passed"] for e in of(events, "tests_run")] == [False, True]
+    assert of(events, "retry_started")[0].payload["reason"] == "tests"
+    started = [e.payload for e in of(events, "agent_started", "coder")]
+    assert [(p["model"], p.get("escalated")) for p in started] == [("coder", None), ("coder-big", True)]
+    assert "coder: coder (attempt 1, failed) -> retry 1: coder-big (passed)" in lines
+    assert any(line.startswith("Models: ") and line.endswith(", coder retries=coder-big") for line in lines)
+    assert of(events, "run_finished")[0].payload["result"]["attempts"][1]["models"] == ["coder-big"]
+
+
+def test_coder_failure_in_parallel_lets_the_tester_finish(stats_git: Path):
+    # The coder fails at its 2nd call, well before the tester's last one.
+    tester = [reply(("list_dir", {"path": "."}))] * 3 + qa_script()
+    result, events, *_ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": tester, "coder": gives_up(), "reviewer": []},
+        max_retries=0,
+    )
+    order = [(e.type, e.agent) for e in events if e.type == "agent_finished"]
+    assert order.index(("agent_finished", "coder")) < order.index(("agent_finished", "tester"))
+    assert of(events, "agent_finished", "tester")[0].payload["success"] is True
+    assert "cancelling" not in " ".join(e.payload["text"] for e in of(events, "note", "orchestrator"))
+    # It counts toward the cap: with no retries allowed, the merged result is checked and the run stops.
+    assert "coder failed (finished: stuck); no retries left, checking the merged result anyway" in [
+        e.payload["text"] for e in of(events, "note", "orchestrator")]
+    assert not result.success and result.failed_agent is None and result.tests_passed is False
+    assert of(events, "retry_started") == []
+
+
+def test_a_failed_implement_attempt_counts_toward_the_retry_cap(stats_git: Path):
+    retry = [reply(("run_tests", {})), finish(success=False, summary="still failing")]
+    result, events, *_ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": gives_up() + retry, "reviewer": []},
+        max_retries=2,
+    )
+    # Attempt 1 failed and retry 1 ran; a retry 2 would be over the cap.
+    assert not result.success and result.retries == 1
+    assert [(a.retry, a.outcome) for a in result.attempts] == [(0, "failed"), (1, "failed")]
+    assert of(events, "note", "orchestrator")[-1].payload["kind"] == "retry_limit"
+
+
+def test_tester_failure_after_a_coder_failure_still_stops_the_run(stats_git: Path):
+    tester = [reply(("list_dir", {"path": "."}))] * 3 + [finish(success=False, summary="cannot test this")]
+    result, events, llm, _ = crew(
+        stats_git, {"lead": lead_script(), "tester": tester, "coder": gives_up(), "reviewer": []},
+    )
+    assert (result.success, result.failed_agent) == (False, "tester")
+    assert of(events, "phase_started")[-1].payload["phase"] == "implement"
+    assert "coder_failed" not in [e.payload.get("kind") for e in of(events, "note", "orchestrator")]
+
+
+def test_retries_use_coder_model_when_no_retry_model_is_set(stats_git: Path):
+    retry = [reply(("write_file", {"path": "stats/__init__.py", "content": STATS_INIT})),
+             reply(("run_tests", {})), finish(summary="exported median")]
+    result, events, *_ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script(export=False) + retry,
+         "reviewer": [submit_review()]},
+    )
+    assert result.success
+    assert [(a.models, a.outcome) for a in result.attempts] == [(["coder"], "passed"), (["coder"], "passed")]
+    assert [e.payload.get("escalated") for e in of(events, "agent_started", "coder")] == [None, False]
+
+
+def test_coder_task_says_the_testers_tests_are_elsewhere(stats_git: Path):
+    result, _, llm, _ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script(), "reviewer": [submit_review()]},
+    )
+    task = llm.requests_for("coder")[0][1]["content"]
+    assert "The tester agent is writing tests for this issue at the same time, in a separate workspace." in task
+    assert "will NOT appear in your workspace" in task
+
+
+def test_retry_model_settings():
+    assert settings().coder_retry_model_or_default() == "coder"
+    assert settings(coder_fallbacks="a,b").coder_retry_fallbacks_or_default() == ["a", "b"]
+    big = settings(coder_retry_model="big", coder_fallbacks="big,a")
+    assert (big.coder_retry_model_or_default(), big.coder_retry_fallbacks_or_default()) == ("big", ["a"])
+    assert settings(coder_retry_model="big", coder_retry_fallbacks="c").coder_retry_fallbacks_or_default() == ["c"]

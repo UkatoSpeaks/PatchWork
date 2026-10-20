@@ -4,10 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from patchwork.agents.base import Agent, EventCallback, SupportsComplete, Tool
-from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, protect, read_only_tools, run_tests_tool, write_tools
+from patchwork.agents.toolkit import (
+    ALIAS_PREFIXES,
+    NO_REREAD,
+    TOOL_ALIASES,
+    protect,
+    read_only_tools,
+    repeat_hint,
+    run_tests_tool,
+    write_tools,
+)
 from patchwork.config import Settings
 from patchwork.tools import fs, shell
 
@@ -15,6 +24,10 @@ if TYPE_CHECKING:
     from patchwork.schemas import Subtask
 
 ROLE = "coder"
+
+# How a crew's tester works alongside the coder: at the same time ("parallel")
+# or before it ("sequential"); either way its tests are in another worktree.
+TesterMode = Literal["parallel", "sequential"]
 
 SYSTEM_PROMPT = f"""\
 You are the coder agent in Patchwork. You fix bugs and implement small features in a repository. All paths are relative to the repo root.
@@ -110,13 +123,19 @@ def build_coder(
     llm: SupportsComplete,
     test_command: str | None = None,
     protected_files: Collection[str] = (),
+    retry: bool = False,
+    tests_elsewhere: bool = False,
     on_event: EventCallback | None = None,
 ) -> Agent:
+    """``retry``: a crew coder retry, on CODER_RETRY_MODEL and its fallbacks.
+    ``tests_elsewhere``: the tester's new tests are in another worktree."""
     repo = Path(repo).resolve(strict=True)
     gate = TestGate()
+    model = settings.coder_retry_model_or_default() if retry else settings.model_for(ROLE)
+    fallbacks = settings.coder_retry_fallbacks_or_default() if retry else settings.fallbacks_for(ROLE)
     return Agent(
         role=ROLE,
-        model=settings.model_for(ROLE),
+        model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=build_tools(repo, test_command or settings.test_command, settings.test_timeout_seconds, gate, protected_files),
         verify_finish=gate.check,
@@ -124,7 +143,8 @@ def build_coder(
         nudge=gate.nudge,
         aliases=TOOL_ALIASES,
         alias_prefixes=ALIAS_PREFIXES,
-        fallback_models=settings.fallbacks_for(ROLE),
+        fallback_models=fallbacks,
+        repeat_hint=repeat_hint(tests_elsewhere),
         llm=llm,
         max_steps=settings.max_steps_per_agent,
         max_tokens=settings.max_tokens_per_run,
@@ -138,11 +158,23 @@ def build_task(
     issue: str,
     subtasks: Sequence[Subtask] = (),
     test_files: Sequence[str] = (),
+    tester: TesterMode | None = None,
 ) -> str:
-    """The first user message. Includes the top-level listing to save a step."""
+    """The first user message. Includes the top-level listing to save a step.
+
+    ``tester``: in a crew, how the tester works alongside this coder. Its new
+    tests are never in this coder's worktree, and the message says so."""
     parts = [f"Issue to fix:\n{issue.strip()}"]
     if subtasks:
         parts.append("Your subtasks from the lead's plan:\n" + format_subtasks(subtasks))
+    if tester is not None:
+        when = "is writing tests for this issue at the same time" if tester == "parallel" else "has written tests for this issue"
+        parts.append(
+            f"The tester agent {when}, in a separate workspace. Its new tests will NOT appear in your workspace, "
+            "so do not look for them. Implement from the issue and the acceptance criteria above. Check your work "
+            "by running the existing test suite with run_tests, plus quick checks of your own if useful (put them "
+            "in tests/test_coder_checks.py; the tester uses other file names)."
+        )
     if test_files:
         parts.append(
             "Tests written by the tester encode the expected behaviour. They fail now and are read-only "

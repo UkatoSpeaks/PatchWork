@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import type { RunEvent } from "../types";
+import { agentStats } from "../stats";
 import { allSpots, findPath, walkable } from "./layout";
 import { CREW, elapsedSeconds, initialScene, officeReducer, parseTestCounts, reduceEvents } from "./reducer";
 
@@ -178,5 +179,72 @@ describe("layout", () => {
         if (a.x !== b.x || a.y !== b.y) expect(findPath(a, b).length, `${agent} ${a.x},${a.y} -> ${b.x},${b.y}`).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+describe("model switches, coder failures and escalated retries", () => {
+  const base = reduceEvents(events, 1);
+  let seq = 1000;
+  const ev = (agent: RunEvent["agent"], type: RunEvent["type"], payload: Record<string, unknown>): RunEvent =>
+    ({ ...events[0], seq: seq++, agent, type, payload });
+  const run = (...list: RunEvent[]) => list.reduce(officeReducer, base);
+
+  const coderStart = ev("coder", "agent_started", { label: "coder", model: "groq/openai/gpt-oss-20b", attempt: 1 });
+  const coderSwitch = ev("coder", "note", {
+    step: 4, kind: "model_switch", is_error: true, from_model: "groq/openai/gpt-oss-20b", to_model: "groq/qwen/qwen3.8-27b",
+    reason: "bad_requests", text: "model kept failing on groq/openai/gpt-oss-20b (…), switching to groq/qwen/qwen3.8-27b",
+  });
+  const coderFailed = ev("coder", "agent_finished", {
+    label: "coder", success: false, stop_reason: "error", steps: 9, tokens: 5000,
+    models_used: ["groq/openai/gpt-oss-20b", "groq/qwen/qwen3.8-27b"],
+  });
+  const stuck = ev("orchestrator", "note", { kind: "coder_failed", text: "coder failed (error: …); continuing with a retry" });
+  const retryStart = ev("coder", "agent_started", {
+    label: "coder (retry 1: tests)", model: "groq/openai/gpt-oss-120b", attempt: 2, retry: 1, escalated: true,
+  });
+  const retryDone = ev("coder", "agent_finished", {
+    label: "coder (retry 1: tests)", success: true, stop_reason: "finished", steps: 5, tokens: 3000,
+    models_used: ["groq/openai/gpt-oss-120b"],
+  });
+
+  it("says it is switching models and shows the new model", () => {
+    const state = run(coderStart, coderSwitch);
+    const coder = state.agents.coder;
+    expect(coder.model).toBe("groq/qwen/qwen3.8-27b");
+    expect(["Switching to qwen3.8-27b 🧠", "Let me try a different brain", "New brain, same plan 🧠"]).toContain(coder.bubble?.text);
+    expect(coder.attempts).toEqual([{ label: "attempt 1", models: ["groq/openai/gpt-oss-20b", "groq/qwen/qwen3.8-27b"], outcome: "running" }]);
+  });
+
+  it("asks for help when the implement-phase coder fails before a retry", () => {
+    const coder = run(coderStart, coderFailed, stuck).agents.coder;
+    expect(coder.activity).toBe("failed");
+    expect(["I'm stuck… can someone help?", "Stuck. A second pair of eyes?", "I need a hand here…"]).toContain(coder.bubble?.text);
+  });
+
+  it("announces an escalated retry and records the model per attempt", () => {
+    const started = run(coderStart, coderSwitch, coderFailed, stuck, retryStart).agents.coder;
+    expect(["Bigger model, second try", "Bigger brain, let's go 🧠", "Second try, bigger model"]).toContain(started.bubble?.text);
+    expect(started.model).toBe("groq/openai/gpt-oss-120b");
+    const coder = officeReducer(run(coderStart, coderSwitch, coderFailed, stuck, retryStart), retryDone).agents.coder;
+    expect(coder.attempts).toEqual([
+      { label: "attempt 1", models: ["groq/openai/gpt-oss-20b", "groq/qwen/qwen3.8-27b"], outcome: "failed" },
+      { label: "retry 1", models: ["groq/openai/gpt-oss-120b"], outcome: "passed" },
+    ]);
+  });
+
+  it("starts a retry on the same model with the usual words", () => {
+    const sameModel = { ...retryStart, payload: { ...retryStart.payload, escalated: false } };
+    const coder = run(coderStart, coderFailed, sameModel).agents.coder;
+    expect(["On it", "Sure, fixing it now", "On it, one sec"]).toContain(coder.bubble?.text);
+  });
+
+  it("gives the stats tab the same attempts", () => {
+    const [coder] = agentStats([events[0], coderStart, coderSwitch, coderFailed, stuck, retryStart, retryDone]);
+    expect(coder.attempts.map((a) => [a.label, a.models.length, a.outcome])).toEqual([["attempt 1", 2, "failed"], ["retry 1", 1, "passed"]]);
+  });
+
+  it("lists one attempt per agent run in the fixture", () => {
+    const final = reduceEvents(events);
+    for (const name of CREW) expect(final.agents[name].attempts).toHaveLength(final.agents[name].runs);
   });
 });

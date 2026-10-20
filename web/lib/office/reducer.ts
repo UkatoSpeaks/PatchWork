@@ -31,6 +31,15 @@ export interface Bubble {
   wait?: number;
 }
 
+/** One run of an agent (e.g. the coder's first attempt, or retry 2) and the models it used. */
+export interface Attempt {
+  // "attempt 1", "retry 1", "round 2", ...
+  label: string;
+  // In order; more than one after a model switch.
+  models: string[];
+  outcome: "running" | "passed" | "failed" | "cancelled";
+}
+
 export interface AgentState {
   name: CrewAgent;
   inRun: boolean;
@@ -51,6 +60,7 @@ export interface AgentState {
   tokens: number;
   totalTokens: number;
   runs: number;
+  attempts: Attempt[];
 }
 
 export interface MonitorState {
@@ -89,7 +99,7 @@ export interface SceneState {
 function initialAgent(name: CrewAgent): AgentState {
   return {
     name, inRun: true, model: null, label: null, place: "lounge", trip: null, activity: "idle", bubble: null, said: null,
-    verdict: null, steps: 0, tokens: 0, totalTokens: 0, runs: 0,
+    verdict: null, steps: 0, tokens: 0, totalTokens: 0, runs: 0, attempts: [],
   };
 }
 
@@ -122,6 +132,40 @@ function phaseLabel(phase: string, payload: Record<string, any>): string {
   if (phase === "retry" && payload.attempt != null) return `retry ${payload.attempt}${payload.reason ? ` (${payload.reason})` : ""}`;
   if (phase === "implement" && payload.parallel != null) return payload.parallel ? "implement" : "implement (seq)";
   return phase;
+}
+
+function attemptLabel(agent: string, payload: Record<string, any>, run: number): string {
+  const label = String(payload.label ?? "");
+  const retry = num(payload.retry) || Number(label.match(/retry (\d+)/)?.[1] ?? 0);
+  if (retry > 0) return `retry ${retry}`;
+  const round = Number(label.match(/round (\d+)/)?.[1] ?? 0);
+  if (round > 0) return `round ${round}`;
+  if (run > 1) return `run ${run}`;
+  return agent === "reviewer" ? "round 1" : "attempt 1";
+}
+
+// Attempt bookkeeping shared with the stats tab (lib/stats.ts). Each returns a new list.
+
+/** agent_started: a new attempt on its starting model. */
+export function startAttempt(attempts: Attempt[], agent: string, payload: Record<string, any>): Attempt[] {
+  const models = payload.model ? [String(payload.model)] : [];
+  return [...attempts, { label: attemptLabel(agent, payload, attempts.length + 1), models, outcome: "running" }];
+}
+
+/** A model_switch note: the current attempt moved on to `to`. */
+export function switchAttempt(attempts: Attempt[], to: unknown): Attempt[] {
+  const last = attempts[attempts.length - 1];
+  if (!last || !to || last.models[last.models.length - 1] === to) return attempts;
+  return [...attempts.slice(0, -1), { ...last, models: [...last.models, String(to)] }];
+}
+
+/** agent_finished: the outcome, and every model it used (models_used) when given. */
+export function finishAttempt(attempts: Attempt[], payload: Record<string, any>): Attempt[] {
+  const last = attempts[attempts.length - 1];
+  if (!last) return attempts;
+  const outcome: Attempt["outcome"] = payload.stop_reason === "cancelled" ? "cancelled" : payload.success === true ? "passed" : "failed";
+  const used = Array.isArray(payload.models_used) && payload.models_used.length ? payload.models_used.map(String) : last.models;
+  return [...attempts.slice(0, -1), { ...last, models: used, outcome }];
 }
 
 export function officeReducer(state: SceneState, event: RunEvent): SceneState {
@@ -180,13 +224,15 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
     case "agent_started": {
       if (!actor) break;
       const label = String(p.label ?? actor);
+      const opening = p.escalated === true ? say.escalatedRetryPhrase(seed) : say.startPhrase(actor, label, next.phase, seed);
       update(actor, {
         inRun: true,
         model: p.model ?? agents[actor].model,
         label,
         place: workPlace(next, actor),
         activity: "thinking",
-        bubble: speech(say.startPhrase(actor, label, next.phase, seed), { ttl: 2 }),
+        bubble: speech(opening, { ttl: 2.5 }),
+        attempts: startAttempt(agents[actor].attempts, actor, p),
         verdict: actor === "reviewer" ? null : agents[actor].verdict,
         steps: 0,
         tokens: 0,
@@ -253,6 +299,21 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       break;
     }
     case "note": {
+      if (p.kind === "coder_failed" && agents.coder.inRun) {
+        // The implement-phase coder failed; the run goes on to a retry.
+        update("coder", { bubble: speech(say.helpPhrase(seed), { ttl: 4 }) });
+        break;
+      }
+      if (actor && p.kind === "model_switch") {
+        const to = p.to_model ?? null;
+        update(actor, {
+          ...backToWork(actor),
+          model: to ?? agents[actor].model,
+          attempts: switchAttempt(agents[actor].attempts, to),
+          bubble: speech(say.modelSwitchPhrase(to, seed), { ttl: 3 }),
+        });
+        break;
+      }
       if (!actor || p.kind !== "finish") break;
       const tool = toolName(p.tool ?? "finish");
       if (tool === "auto-finish") break;
@@ -273,6 +334,7 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
         place: "desk",
         activity,
         bubble,
+        attempts: finishAttempt(a.attempts, p),
         steps: num(p.steps, a.steps),
         tokens,
         totalTokens: a.totalTokens + (tokens - a.tokens),

@@ -75,7 +75,12 @@ class CliRenderer:
         else:
             how = "sequential" if p.get("sequential") else "parallel"
             self._line(f"Patchwork crew ({how}) | run {event.run_id} | repo={p['repo']}", bold=True)
-        self._line("Models: " + ", ".join(f"{role}={model}" for role, model in p.get("models", {}).items()))
+        models = p.get("models", {})
+        line = "Models: " + ", ".join(f"{role}={model}" for role, model in models.items())
+        retry_model = p.get("coder_retry_model")
+        if retry_model and retry_model != models.get("coder"):
+            line += f", coder retries={retry_model}"
+        self._line(line)
         budget = f"Budget per agent: {p.get('max_steps')} steps, {p.get('max_tokens', 0):,} tokens"
         if self.mode == "crew":
             budget += f"; up to {p.get('max_retries')} coder retries"
@@ -229,6 +234,9 @@ class CliRenderer:
         for index, row in enumerate(rows):
             cells = [cell.ljust(w) if i < 2 else cell.rjust(w) for i, (cell, w) in enumerate(zip(row, widths))]
             self._line("  ".join(cells), bold=index in (0, len(rows) - 1))
+        attempts = result.get("attempts") or []
+        if attempts:
+            self._line("coder: " + " -> ".join(_format_attempt(a) for a in attempts))
         if result["phases"]:
             self._line("Phases: " + " | ".join(f"{name} {secs:.1f}s" for name, secs in result["phases"].items()))
         usage = result.get("usage_today") or {}
@@ -270,6 +278,19 @@ class CliRenderer:
                 self._line(f"    git log --oneline {base}..{name}", dim=True)
                 self._line(f"    git diff {base} {name}", dim=True)
             self._line("Delete them:   git branch -D " + " ".join(kept))
+
+
+def _format_attempt(attempt: dict[str, Any]) -> str:
+    """"gpt-oss-20b (attempt 1, failed)" or "retry 1: gpt-oss-120b (passed)"."""
+    models = " then ".join(short_model(m) for m in attempt.get("models") or []) or "?"
+    if attempt.get("retry"):
+        return f"retry {attempt['retry']}: {models} ({attempt['outcome']})"
+    return f"{models} (attempt {attempt['attempt']}, {attempt['outcome']})"
+
+
+def short_model(model: str) -> str:
+    """"groq/openai/gpt-oss-120b" -> "gpt-oss-120b"."""
+    return model.rsplit("/", 1)[-1]
 
 
 def _throttle_inputs(p: dict[str, Any]) -> str:

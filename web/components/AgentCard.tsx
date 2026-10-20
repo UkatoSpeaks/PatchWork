@@ -6,6 +6,8 @@ import { formatTokens, shortModel } from "@/lib/api";
 import { drawPortrait } from "@/lib/office/characters";
 import type { AgentState } from "@/lib/office/reducer";
 
+import AttemptList, { showAttempts } from "./AttemptList";
+
 export type Status = "idle" | "walking" | "thinking" | "typing" | "testing" | "waiting" | "done" | "failed" | "cancelled";
 
 const STATUS_STYLE: Record<Status, string> = {
@@ -101,6 +103,7 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens, now, se
           {agent.runs} runs · {formatTokens(agent.totalTokens)} total
         </p>
       )}
+      {showAttempts(agent.attempts) && <AttemptList attempts={agent.attempts} />}
     </button>
   );
 }

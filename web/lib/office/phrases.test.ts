@@ -69,3 +69,29 @@ describe("phrases", () => {
     expect(say.toolPhrase("edit_file", { path: "ops.py", old: "a - b", new: "a + b" }, seed)).toMatch(/ops\.py|One-line fix/);
   });
 });
+
+describe("phrases for model switches and retries", () => {
+  it("names the new model, or asks for a different brain", () => {
+    const lines = new Set(Array.from({ length: 30 }, (_, i) => say.modelSwitchPhrase("groq/openai/gpt-oss-120b", say.seedOf("r", i))));
+    expect(lines).toEqual(new Set(["Switching to gpt-oss-120b 🧠", "Let me try a different brain", "New brain, same plan 🧠"]));
+    expect(say.modelSwitchPhrase(null, 0)).toBe("Let me try a different brain");
+  });
+
+  it("asks for help after a failure and announces the bigger model", () => {
+    expect(say.helpPhrase(0)).toBe("I'm stuck… can someone help?");
+    expect(say.escalatedRetryPhrase(0)).toBe("Bigger model, second try");
+  });
+
+  it("stays within the bubble limit, in sentence case", () => {
+    const seeds = Array.from({ length: 30 }, (_, i) => say.seedOf("r", i));
+    const lines = seeds.flatMap((seed) => [
+      say.modelSwitchPhrase("groq/meta-llama/a-really-long-model-name-for-testing-70b-versatile", seed),
+      say.helpPhrase(seed),
+      say.escalatedRetryPhrase(seed),
+    ]);
+    for (const line of lines) {
+      expect(line.length, line).toBeLessThanOrEqual(say.MAX_BUBBLE_CHARS);
+      expect(line[0], line).toBe(line[0].toUpperCase());
+    }
+  });
+});

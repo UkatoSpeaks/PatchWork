@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from patchwork.agents.base import Agent, EventCallback, SubmitSpec, SupportsComplete
-from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, read_only_tools
+from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, read_only_tools, repeat_hint
 from patchwork.config import Settings
 from patchwork.schemas import Plan
 from patchwork.tools import fs
@@ -39,6 +39,7 @@ def build_lead(*, repo: Path, settings: Settings, llm: SupportsComplete, on_even
         aliases=TOOL_ALIASES,
         alias_prefixes=ALIAS_PREFIXES,
         fallback_models=settings.fallbacks_for(ROLE),
+        repeat_hint=repeat_hint(),
         submit=SubmitSpec(
             name=SUBMIT_TOOL,
             description="Submit the plan. Ends your task.",

@@ -2,6 +2,7 @@ import { formatDuration, formatTokens } from "@/lib/api";
 import { PHASE_COLORS, WORK_COLORS, type AgentStats } from "@/lib/stats";
 
 import { ROLE } from "./AgentCard";
+import AttemptList from "./AttemptList";
 
 const secs = (s: number) => (s < 10 ? `${s.toFixed(1)}s` : formatDuration(s));
 
@@ -40,6 +41,20 @@ export default function StatsPanel({ agents, phases }: { agents: AgentStats[]; p
           </tbody>
         </table>
       </div>
+
+      {agents.some((a) => a.attempts.length > 0) && (
+        <section aria-label="Model per attempt" className="flex flex-col gap-2">
+          <h3 className="font-pixel text-sm font-bold">Model per attempt</h3>
+          <div className="grid grid-cols-[4.5rem_minmax(0,1fr)] gap-x-2 gap-y-2 sm:max-w-[32rem]">
+            {agents.filter((a) => a.attempts.length > 0).map((a) => (
+              <div key={a.agent} className="contents">
+                <span className="font-pixel text-xs font-bold">{ROLE[a.agent]}</span>
+                <AttemptList attempts={a.attempts} className="text-xs" />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {phases.length > 0 && (
         <section aria-label="Phase durations" className="flex flex-col gap-2">

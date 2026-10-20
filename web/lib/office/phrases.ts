@@ -183,6 +183,23 @@ export function verdictPhrase(approved: boolean, issues: number, seed: number): 
   return pick(["Looks good to me 👍", "Ship it 👍", "LGTM 👍", "Nice work, approved 👍"], seed);
 }
 
+/** "groq/openai/gpt-oss-120b" -> "gpt-oss-120b" */
+export const modelName = (model: unknown): string => String(model ?? "").split("/").pop() || "";
+
+/** An agent moving to its next model (daily limit, or the provider kept rejecting requests). */
+export function modelSwitchPhrase(model: unknown, seed: number): string {
+  const name = clip(modelName(model), 24);
+  const options = ["Let me try a different brain", "New brain, same plan 🧠"];
+  if (name) options.unshift(`Switching to ${name} 🧠`);
+  return fit(pick(options, seed));
+}
+
+/** The implement-phase coder failed; a retry follows. */
+export const helpPhrase = (seed: number) => pick(["I'm stuck… can someone help?", "Stuck. A second pair of eyes?", "I need a hand here…"], seed);
+
+/** A coder retry on a bigger model (CODER_RETRY_MODEL). */
+export const escalatedRetryPhrase = (seed: number) => pick(["Bigger model, second try", "Bigger brain, let's go 🧠", "Second try, bigger model"], seed);
+
 export const retryAskPhrase = (seed: number) => pick(["Can you fix this?", "Got a minute? A few notes", "Small fix needed here"], seed);
 
 export function finishPhrase(outcome: "done" | "failed" | "cancelled", seed: number): string {

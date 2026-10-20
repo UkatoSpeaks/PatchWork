@@ -4,12 +4,16 @@ Crew flow:
 1. plan: the lead reads the main repo (read-only) and submits a Plan.
 2. implement: the tester and the coder run concurrently (or one after the
    other with ``sequential``), each in its own git worktree, and commit to
-   their own branch. If one fails, the run stops: sequentially the coder is
-   not started; in parallel the other agent is cancelled.
-3. integrate: both branches are merged into a fresh result branch.
+   their own branch. If the tester fails, the run stops: sequentially the
+   coder is not started; in parallel it is cancelled. If the coder fails, the
+   tester still finishes and the run goes on; the failed attempt counts
+   toward the retry cap.
+3. integrate: the coder's branch (if it has commits) and the tester's are
+   merged into a fresh result branch.
 4. verify / review: the full suite runs in the result worktree, then the
    reviewer reads the diff. A failing suite or a review blocker starts a
-   fresh coder retry in the result worktree, up to ``max_retries`` in total.
+   fresh coder retry in the result worktree (on CODER_RETRY_MODEL), up to
+   ``max_retries`` in total.
 
 Success = the full suite passes in the result worktree and the reviewer
 approved. The diff and changed files come from git. Worktrees are always
@@ -35,7 +39,7 @@ from patchwork.agents.toolkit import is_test_module
 from patchwork.config import Settings
 from patchwork.events import AgentName, EventBus
 from patchwork.llm import LLMClient, llm_caller
-from patchwork.schemas import AgentRun, Plan, ReviewVerdict, RunResult
+from patchwork.schemas import AgentRun, CoderAttempt, Plan, ReviewVerdict, RunResult
 from patchwork.snapshot import Snapshot
 from patchwork.tools import shell
 from patchwork.workspace import MergeConflict, Workspace, WorkspaceError, ensure_repo
@@ -127,29 +131,34 @@ class Orchestrator:
             return
 
         with self._phase(run, "implement", parallel=not self.sequential):
+            tester_dir = workspace.add_worktree("tester")
             if self.sequential:
-                tester_dir = workspace.add_worktree("tester")
                 if not await self._implement_tester(run, issue, plan, workspace, tester_dir):
                     run.failed_agent = "tester"
                     self._emit("orchestrator", "note", kind="stopped", text="the tester failed; not starting the coder")
                     return
                 coder_dir = workspace.add_worktree("coder")
-                if not await self._implement_coder(run, issue, plan, workspace, coder_dir):
-                    run.failed_agent = "coder"
-                    return
+                coder_ok = await self._implement_coder(run, issue, plan, workspace, coder_dir)
             else:
-                tester_dir = workspace.add_worktree("tester")
                 coder_dir = workspace.add_worktree("coder")
-                run.failed_agent = await self._first_failure({
+                ok = await self._run_concurrently({
                     "tester": self._implement_tester(run, issue, plan, workspace, tester_dir),
                     "coder": self._implement_coder(run, issue, plan, workspace, coder_dir),
-                })
-                if run.failed_agent is not None:
+                }, fatal="tester")
+                if not ok["tester"]:
+                    run.failed_agent = "tester"
                     return
+                coder_ok = ok["coder"]
+            if not coder_ok:
+                self._coder_failed(run)
 
         with self._phase(run, "integrate"):
             result_dir = workspace.add_worktree("result")
             for name in ("coder", "tester"):
+                if name == "coder" and not workspace.has_commits("coder"):
+                    self._emit("orchestrator", "note", kind="merge_skipped",
+                               text="the coder committed nothing; merging only the tester's branch")
+                    continue
                 try:
                     files = workspace.merge("result", name)
                 except MergeConflict as exc:
@@ -197,19 +206,20 @@ class Orchestrator:
             if not await self._retry(run, issue, plan, workspace, result_dir, "review", feedback, tester_files):
                 return
 
-    async def _first_failure(self, jobs: dict[str, Coroutine[Any, Any, bool]]) -> str | None:
-        """Run the jobs concurrently. When one returns False, cancel the rest
-        (each records and commits what it did) and return its name."""
+    async def _run_concurrently(self, jobs: dict[str, Coroutine[Any, Any, bool]], fatal: str) -> dict[str, bool]:
+        """Run the jobs concurrently and return each one's success. When the
+        ``fatal`` job fails, cancel the rest (each records and commits what it
+        did; they count as failed). Other failures let the rest finish."""
         tasks = {asyncio.create_task(job): name for name, job in jobs.items()}
         pending = set(tasks)
-        failed = None
+        ok: dict[str, bool] = {}
         try:
-            while pending and failed is None:
+            while pending and ok.get(fatal) is not False:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                failed = next((tasks[t] for t in done if not t.result()), None)
-            if failed is not None and pending:
+                ok.update((tasks[t], t.result()) for t in done)
+            if pending:
                 others = ", ".join(sorted(tasks[t] for t in pending))
-                self._emit("orchestrator", "note", kind="cancelled", text=f"the {failed} failed; cancelling the {others}")
+                self._emit("orchestrator", "note", kind="cancelled", text=f"the {fatal} failed; cancelling the {others}")
         finally:
             # Also on an error or our own cancellation: never leave a sibling running.
             for task in pending:
@@ -218,7 +228,29 @@ class Orchestrator:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             self._cancelling.clear()
-        return failed
+        return {name: ok.get(name, False) for name in jobs}
+
+    def _coder_failed(self, run: RunResult) -> None:
+        """The implement-phase coder failed but the tester succeeded: go on to
+        integrate and the retry loop; the failed attempt counts as a retry."""
+        failed = next(r for r in reversed(run.runs) if r.agent == "coder").result
+        reason = f"{failed.stop_reason}: {_clip(failed.summary)}"
+        left = self.max_retries - self._retries_used(run)
+        text = (f"coder failed ({reason}); continuing with a retry" if left > 0
+                else f"coder failed ({reason}); no retries left, checking the merged result anyway")
+        self._emit("orchestrator", "note", kind="coder_failed", text=text, stop_reason=failed.stop_reason,
+                   retries_left=max(0, left))
+
+    @staticmethod
+    def _retries_used(run: RunResult) -> int:
+        """Retries so far, plus a failed implement-phase coder attempt."""
+        return run.retries + sum(1 for a in run.attempts if a.retry == 0 and a.outcome != "passed")
+
+    def _record_attempt(self, run: RunResult, entry: AgentRun, retry: int = 0, reason: str | None = None) -> None:
+        result = entry.result
+        outcome = "cancelled" if result.stop_reason == "cancelled" else "passed" if result.success else "failed"
+        run.attempts.append(CoderAttempt(attempt=len(run.attempts) + 1, retry=retry, reason=reason,
+                                         models=entry.models, outcome=outcome, stop_reason=result.stop_reason))
 
     async def _plan(self, issue: str, run: RunResult) -> Plan | None:
         with self._phase(run, "plan"):
@@ -243,10 +275,12 @@ class Orchestrator:
         return entry.result.success
 
     async def _implement_coder(self, run: RunResult, issue: str, plan: Plan, workspace: Workspace, path: Path) -> bool:
-        # The tester's tests don't exist yet; the coder's check is the existing suite.
+        # The tester's tests are in its own worktree; the coder's check is the existing suite.
         coder = build_coder(repo=path, settings=self.settings, llm=self.llm, test_command=self.test_command,
-                            on_event=self._forward("coder"))
-        entry = await self._run_agent(run, "coder", "coder", coder, build_task(path, issue, plan.for_role("coder")))
+                            tests_elsewhere=True, on_event=self._forward("coder"))
+        task = build_task(path, issue, plan.for_role("coder"), tester="sequential" if self.sequential else "parallel")
+        entry = await self._run_agent(run, "coder", "coder", coder, task, attempt=1)
+        self._record_attempt(run, entry)
         committed = workspace.commit_all("coder", f"patchwork {self.run_id}: coder")
         self._agent_finished(entry, committed=committed, branch=workspace.branch("coder"),
                              files=workspace.changed_files("coder"))
@@ -263,8 +297,9 @@ class Orchestrator:
         feedback: str,
         protected: list[str],
     ) -> bool:
-        """A fresh coder in the result worktree. False once the retry cap is reached."""
-        if run.retries >= self.max_retries:
+        """A fresh coder (on CODER_RETRY_MODEL) in the result worktree. False once
+        the retry cap is reached; a failed implement-phase coder counts toward it."""
+        if self._retries_used(run) >= self.max_retries:
             self._emit("orchestrator", "note", kind="retry_limit",
                        text=f"retry limit reached ({self.max_retries}); stopping")
             return False
@@ -274,10 +309,13 @@ class Orchestrator:
                    reason=reason, feedback=feedback)
         with self._phase(run, "retry", attempt=attempt, reason=reason):
             coder = build_coder(repo=path, settings=self.settings, llm=self.llm, test_command=self.test_command,
-                                protected_files=protected, on_event=self._forward("coder"))
+                                protected_files=protected, retry=True, on_event=self._forward("coder"))
             task = build_retry_task(path, issue, plan.for_role("coder"), workspace.diff("result"), feedback,
                                     run.tests_written)
-            entry = await self._run_agent(run, "coder", f"coder (retry {attempt}: {reason})", coder, task)
+            escalated = coder.model != self.settings.model_for("coder")
+            entry = await self._run_agent(run, "coder", f"coder (retry {attempt}: {reason})", coder, task,
+                                          attempt=len(run.attempts) + 1, retry=attempt, escalated=escalated)
+            self._record_attempt(run, entry, retry=attempt, reason=reason)
             committed = workspace.commit_all("result", f"patchwork {self.run_id}: coder retry {attempt} ({reason})")
             self._agent_finished(entry, committed=committed, attempt=attempt, reason=reason)
         return True
@@ -307,12 +345,15 @@ class Orchestrator:
 
     # --- agents and events ---------------------------------------------------------
 
-    async def _run_agent(self, run: RunResult, name: AgentName, label: str, agent: Agent, task: str) -> AgentRun:
-        """Run ``agent``. If the orchestrator cancels it (see ``_first_failure``),
-        the run so far is returned as a failure with stop reason "cancelled"."""
+    async def _run_agent(
+        self, run: RunResult, name: AgentName, label: str, agent: Agent, task: str, **info: Any
+    ) -> AgentRun:
+        """Run ``agent``. If the orchestrator cancels it (see ``_run_concurrently``),
+        the run so far is returned as a failure with stop reason "cancelled".
+        ``info`` is added to the agent_started event."""
         token = llm_caller.set(name)
         model = agent.model
-        self._emit(name, "agent_started", label=label, model=model)
+        self._emit(name, "agent_started", label=label, model=model, **info)
         started = time.monotonic()
         try:
             result = await agent.run(task)
@@ -365,6 +406,7 @@ class Orchestrator:
             max_steps=self.settings.max_steps_per_agent,
             max_tokens=self.settings.max_tokens_per_run,
             models={role: self.settings.model_for(role) for role in roles},
+            **({"coder_retry_model": self.settings.coder_retry_model_or_default()} if run.mode == "crew" else {}),
         )
 
     @contextmanager
@@ -390,6 +432,10 @@ class Orchestrator:
             elif event.kind == "tool_result":
                 self._emit(agent, "tool_result", step=event.step, tool=event.tool, summary=event.summary,
                            is_error=event.is_error)
+            elif event.kind == "model_switch":
+                self._emit(agent, "note", step=event.step, kind="model_switch", text=event.summary,
+                           is_error=event.is_error, from_model=event.arguments.get("from"),
+                           to_model=event.arguments.get("to"), reason=event.arguments.get("reason"))
             else:  # thought, note, finish
                 self._emit(agent, "note", step=event.step, kind=event.kind, tool=event.tool, text=event.summary,
                            is_error=event.is_error)
@@ -416,3 +462,8 @@ class Orchestrator:
 
     def _emit(self, agent: AgentName, type: str, **payload: Any) -> None:
         self.bus.publish(agent, type, **payload)  # type: ignore[arg-type]
+
+
+def _clip(text: str, limit: int = 120) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."

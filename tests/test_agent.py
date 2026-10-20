@@ -267,7 +267,9 @@ def test_daily_limit_switches_to_the_fallback_with_the_conversation_intact():
     result = run(agent)
     assert (result.success, result.summary) == (True, "done on backup")
     assert result.models_used == ["primary", "backup"]
-    assert "daily limit reached on primary, switching to backup" in events_of(notes)
+    [switch] = [e for e in notes if e.kind == "model_switch"]
+    assert switch.summary == "daily limit reached on primary, switching to backup"
+    assert switch.arguments == {"from": "primary", "to": "backup", "reason": "daily_limit"}
     # The backup got exactly the conversation the primary was about to answer.
     assert llm.requests_for("backup")[0] == llm.requests_for("primary")[1]
     assert "echo: one" in tool_results(llm.requests_for("backup")[0])
@@ -390,3 +392,156 @@ def test_coder_agent_fixes_toy_repo_with_scripted_llm(tmp_path: Path):
     assert tool_results[8].startswith("PASSED: 8 passed")
     source = (repo / "calculator" / "ops.py").read_text()
     assert "return a - b" in source and "return a / b" in source
+
+
+# --- provider 400s: switching models -----------------------------------------------------
+
+def parse_failed(generation=None):
+    """Groq's output_parse_failed; the real failure had an empty failed_generation."""
+    return BadRequest("Failed to parse the model output", code="output_parse_failed", failed_generation=generation)
+
+
+ECHO_TEXT = '{"name": "echo", "arguments": {"text": "%s"}}'
+
+
+def test_three_empty_generation_400s_switch_model_with_the_conversation_kept():
+    notes: list[AgentEvent] = []
+    llm = ScriptedLLM({
+        "small": [reply(("echo", {"text": "one"})), parse_failed(), parse_failed(), parse_failed()],
+        "big": [finish(summary="done on big")],
+    })
+    agent = make_agent(llm, on_event=notes.append, fallback_models=["big"])
+    agent.model = "small"
+    result = run(agent)
+    assert (result.success, result.summary) == (True, "done on big")
+    assert result.models_used == ["small", "big"]
+    [switch] = [e for e in notes if e.kind == "model_switch"]
+    assert switch.summary == (
+        "model kept failing on small (rejected 3 requests in a row (400, output_parse_failed)), switching to big"
+    )
+    assert switch.arguments == {"from": "small", "to": "big", "reason": "bad_requests"}
+    # The new model gets the same conversation the failing one kept rejecting.
+    assert llm.requests_for("big")[0] == llm.requests_for("small")[-1]
+    assert "echo: one" in tool_results(llm.requests_for("big")[0])
+
+
+def test_400s_with_a_failed_generation_also_count_toward_the_switch():
+    llm = ScriptedLLM({
+        "small": [parse_failed(ECHO_TEXT % "a"), parse_failed(ECHO_TEXT % "b"), parse_failed()],
+        "big": [finish()],
+    })
+    agent = make_agent(llm, fallback_models=["big"])
+    agent.model = "small"
+    result = run(agent)
+    assert result.success and result.models_used == ["small", "big"]
+    # The two calls written as text were run before the switch.
+    assert tool_results(llm.requests_for("big")[0]) == ["echo: a", "echo: b"]
+
+
+def test_with_no_other_model_failed_generations_are_still_used_as_replies():
+    llm = ScriptedLLM([parse_failed(ECHO_TEXT % n) for n in "abc"] + [finish()])
+    result = run(make_agent(llm))
+    assert result.success and result.steps_used == 4
+
+
+def test_every_model_failing_still_fails_the_agent():
+    notes: list[AgentEvent] = []
+    llm = ScriptedLLM({"small": [parse_failed()] * 3, "big": [parse_failed()] * 3})
+    agent = make_agent(llm, on_event=notes.append, fallback_models=["big"])
+    agent.model = "small"
+    result = run(agent)
+    assert (result.success, result.stop_reason) == (False, "error")
+    assert result.models_used == ["small", "big"]
+    assert result.summary == (
+        "LLM call failed: no usable model left for the test: "
+        "small (rejected 3 requests in a row (400, output_parse_failed)); "
+        "big (rejected 3 requests in a row (400, output_parse_failed)). Add models to TEST_FALLBACKS."
+    )
+    assert len([e for e in notes if e.kind == "model_switch"]) == 1
+
+
+def test_a_daily_limit_and_repeated_400s_together_exhaust_the_models():
+    llm = ScriptedLLM({"small": [parse_failed()] * 3, "big": [daily_limit("big")]})
+    agent = make_agent(llm, fallback_models=["big"])
+    agent.model = "small"
+    result = run(agent)
+    assert (result.success, result.stop_reason) == (False, "error")
+    assert result.summary == (
+        "no usable model left for the test: small (rejected 3 requests in a row (400, output_parse_failed)); "
+        "big (tokens per day (TPD), resets in 3m29s, around 17:35). Add models to TEST_FALLBACKS."
+    )
+
+
+def test_a_model_given_up_on_is_skipped_by_a_later_daily_limit_switch():
+    llm = ScriptedLLM({"a": [parse_failed()] * 3, "b": [daily_limit("b")], "c": [finish(summary="on c")]})
+    agent = make_agent(llm, fallback_models=["b", "c"])
+    agent.model = "a"
+    result = run(agent)
+    assert (result.success, result.summary, result.models_used) == (True, "on c", ["a", "b", "c"])
+
+
+# --- repeated identical calls ------------------------------------------------------------
+
+def peek_agent(llm, calls: list[str], **kwargs) -> Agent:
+    """An agent with a read-only `peek` tool (recording its runs) and the file-changing `echo`."""
+
+    def peek(args: EchoArgs) -> ToolOutput:
+        calls.append(args.text)
+        return ToolOutput(content=f"peeked at {args.text}: no matches")
+
+    def echo(args: EchoArgs) -> ToolOutput:
+        return ToolOutput(content="written", files_changed=["f.txt"])
+
+    tools = [
+        Tool(name="peek", description="Look.", args_model=EchoArgs, handler=peek),
+        Tool(name="echo", description="Write.", args_model=EchoArgs, handler=echo),
+    ]
+    return make_agent(llm, tools=tools, **kwargs)
+
+
+def test_a_third_identical_call_with_an_unchanged_result_is_not_run():
+    calls: list[str] = []
+    llm = ScriptedLLM([reply(("peek", {"text": "tests"}))] * 4 + [finish()])
+    result = run(peek_agent(llm, calls))
+    assert result.success
+    assert calls == ["tests", "tests"]  # the 3rd and 4th were not run
+    results = tool_results(llm.requests[-1])
+    assert results[2] == (
+        "You've made this exact call 3 times and the result hasn't changed. Do something different: "
+        "the result is already in your context above; use it, or call a different tool or change the arguments."
+    )
+    assert results[3].startswith("You've made this exact call 4 times")
+
+
+def test_a_file_change_or_different_arguments_reset_the_repeat_guard():
+    calls: list[str] = []
+    llm = ScriptedLLM([
+        reply(("peek", {"text": "a"})), reply(("peek", {"text": "a"})),
+        reply(("echo", {"text": "x"})),  # files changed: the result may differ now
+        reply(("peek", {"text": "a"})), reply(("peek", {"text": "b"})),
+        finish(),
+    ])
+    run(peek_agent(llm, calls))
+    assert calls == ["a", "a", "a", "b"]
+
+
+def test_repeat_guard_uses_the_tool_specific_hint():
+    llm = ScriptedLLM([reply(("peek", {"text": "x"}))] * 3 + [finish()])
+    run(peek_agent(llm, [], repeat_hint=lambda name, args: f"stop peeking at {args['text']}."))
+    assert tool_results(llm.requests[-1])[2].endswith("Do something different: stop peeking at x.")
+
+
+def test_crew_coder_searching_for_the_testers_tests_is_told_they_are_elsewhere(tmp_path: Path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_old.py").write_text("def test_old():\n    pass\n")
+    search = reply(("search_code", {"path": "tests", "pattern": "slugify"}))
+    llm = ScriptedLLM([search] * 3 + [reply(("read_file", {"path": "missing.py"}))] + [finish(success=False, summary="x")] * 2)
+    settings = Settings(_env_file=None, coder_model="fake")
+    run(build_coder(repo=tmp_path, settings=settings, llm=llm, tests_elsewhere=True))
+    results = tool_results(llm.requests[-1])
+    assert results[0] == "no matches" and "unchanged" in results[1]
+    assert results[2] == (
+        "You've made this exact call 3 times and the result hasn't changed. Do something different: the tester "
+        "writes the new tests in a separate workspace, so they won't appear in yours. Implement from the issue "
+        "and the plan's acceptance criteria, then run run_tests on the existing suite."
+    )

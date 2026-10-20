@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from patchwork.agents.base import Agent, EventCallback, SubmitSpec, SupportsComplete
-from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, read_only_tools
+from patchwork.agents.toolkit import ALIAS_PREFIXES, NO_REREAD, TOOL_ALIASES, read_only_tools, repeat_hint
 from patchwork.config import Settings
 from patchwork.schemas import ReviewVerdict
 
@@ -40,6 +40,7 @@ def build_reviewer(*, repo: Path, settings: Settings, llm: SupportsComplete, on_
         aliases=TOOL_ALIASES,
         alias_prefixes=ALIAS_PREFIXES,
         fallback_models=settings.fallbacks_for(ROLE),
+        repeat_hint=repeat_hint(),
         submit=SubmitSpec(name=SUBMIT_TOOL, description="Submit the review verdict. Ends your task.", schema_model=ReviewVerdict),
         llm=llm,
         max_steps=settings.max_steps_per_agent,

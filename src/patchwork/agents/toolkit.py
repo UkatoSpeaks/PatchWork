@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from patchwork.agents.base import Tool, ToolAlias, ToolOutput
+from patchwork.agents.base import RepeatHint, Tool, ToolAlias, ToolOutput
 from patchwork.tools import fs, shell
 
 # Appended to every role's system prompt.
@@ -252,6 +252,32 @@ def write_tools(
         ),
         Tool(name="write_file", description="Create or overwrite a whole file.", args_model=WriteFileArgs, handler=write_file),
     ]
+
+
+TESTS_ELSEWHERE_HINT = (
+    "the tester writes the new tests in a separate workspace, so they won't appear in yours. Implement from "
+    "the issue and the plan's acceptance criteria, then run run_tests on the existing suite."
+)
+_REPEAT_HINTS = {
+    "search_code": "search for a different pattern or in a different path, or read the file you need.",
+    "read_file": "the file content is already in your context above; edit the file or read another one.",
+    "list_dir": "the listing is already in your context above; read or search a specific file instead.",
+    "run_tests": "the tests give the same result; change the code before running them again.",
+}
+
+
+def repeat_hint(tests_elsewhere: bool = False) -> RepeatHint:
+    """Hints for an agent repeating an identical call. With ``tests_elsewhere``
+    (a crew coder: the tester's new tests are in another worktree), looking for
+    tests gets told why they are not there."""
+
+    def hint(name: str, arguments: dict[str, Any]) -> str | None:
+        if tests_elsewhere and name in ("search_code", "read_file", "list_dir"):
+            if any(isinstance(v, str) and "test" in v.lower() for v in arguments.values()):
+                return TESTS_ELSEWHERE_HINT
+        return _REPEAT_HINTS.get(name)
+
+    return hint
 
 
 # (result, target) -> optional finish summary. ``target`` is the normalized

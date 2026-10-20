@@ -267,16 +267,26 @@ class DailyLimitReached(LLMError):
 
 
 class AllModelsExhausted(LLMError):
-    """Every model an agent may use has hit its per-day limit."""
+    """Every model an agent may use has hit its per-day limit, or (``failing``)
+    kept getting its requests rejected."""
 
-    def __init__(self, role: str, limits: list[DailyLimitReached]) -> None:
-        super().__init__(
-            f"daily limit reached on every model the {role} may use: "
-            + "; ".join(limit.describe() for limit in limits)
-            + f". Try again after the reset, or add models to {role.upper()}_FALLBACKS."
-        )
+    def __init__(self, role: str, limits: list[DailyLimitReached], failing: Mapping[str, str] | None = None) -> None:
         self.role = role
         self.limits = limits
+        # model -> why it was given up on, e.g. "rejected 3 requests in a row (400, output_parse_failed)"
+        self.failing = dict(failing or {})
+        if not self.failing:
+            super().__init__(
+                f"daily limit reached on every model the {role} may use: "
+                + "; ".join(limit.describe() for limit in limits)
+                + f". Try again after the reset, or add models to {role.upper()}_FALLBACKS."
+            )
+            return
+        reasons = [f"{model} ({why})" for model, why in self.failing.items()] + [limit.describe() for limit in limits]
+        super().__init__(
+            f"no usable model left for the {role}: " + "; ".join(reasons)
+            + f". Add models to {role.upper()}_FALLBACKS."
+        )
 
 
 class BadRequest(LLMError):

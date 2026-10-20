@@ -25,8 +25,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from patchwork.llm import AllModelsExhausted, BadRequest, DailyLimitReached, LLMResponse, TokenUsage, ToolCall
 
 FINISH_TOOL = "finish"
-# Consecutive HTTP 400s without a failed_generation that are retried before the agent fails.
-MAX_BAD_REQUEST_RETRIES = 2
+# Consecutive HTTP 400s on one model (with or without a failed_generation) after
+# which the agent switches to its next model.
+MAX_BAD_REQUESTS_PER_MODEL = 3
+# With no model left to switch to, consecutive 400s without a failed_generation
+# are retried this many times before the agent fails.
+MAX_BAD_REQUEST_RETRIES = MAX_BAD_REQUESTS_PER_MODEL - 1
+# The Nth identical tool call (same name and arguments) whose result has not
+# changed is not run; the agent is told to do something different.
+REPEAT_CALL_LIMIT = 3
+DEFAULT_REPEAT_HINT = "the result is already in your context above; use it, or call a different tool or change the arguments."
 ELIDE_KEEP_CHARS = 300
 ELIDED_MARK = "\n[…older output elided to save tokens; re-run the tool if you need it]"
 
@@ -124,12 +132,14 @@ class AgentEvent(BaseModel):
     Kinds: ``llm_call`` (one completion, with its token usage), ``thought``
     (text the model wrote), ``tool_called`` (before a tool runs),
     ``tool_result`` (after), ``note`` (nudges, alias mappings, rejections,
-    auto-finish) and ``finish`` (the agent's last step).
+    auto-finish), ``model_switch`` (the agent moved to its next model;
+    ``arguments`` has ``from``, ``to`` and ``reason``: "daily_limit" or
+    "bad_requests") and ``finish`` (the agent's last step).
     """
 
     role: str
     step: int
-    kind: Literal["llm_call", "thought", "tool_called", "tool_result", "note", "finish"]
+    kind: Literal["llm_call", "thought", "tool_called", "tool_result", "note", "model_switch", "finish"]
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
@@ -174,6 +184,20 @@ class SupportsComplete(Protocol):
 
 
 EventCallback = Callable[[AgentEvent], None]
+
+
+# (tool name, arguments) -> a hint for an agent repeating that call, or None for the default.
+RepeatHint = Callable[[str, dict[str, Any]], str | None]
+
+
+class _Repeat(NamedTuple):
+    """The latest run of one exact tool call."""
+
+    # Consecutive runs that returned this same content.
+    count: int
+    content: str
+    # The agent's file-change counter after that run.
+    edits: int
 
 
 class _View(NamedTuple):
@@ -226,6 +250,7 @@ class Agent:
         alias_prefixes: Sequence[str] = (),
         fallback_models: Sequence[str] = (),
         nudge: Callable[[int], str | None] | None = None,
+        repeat_hint: RepeatHint | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         """``verify_finish`` checks a claimed success independently of the model:
@@ -240,7 +265,13 @@ class Agent:
         ``<tool>`` when that is one of ours.
 
         ``fallback_models`` are used in order once the current model hits a
-        per-day limit; the conversation carries over.
+        per-day limit, or the provider rejected ``MAX_BAD_REQUESTS_PER_MODEL``
+        requests to it in a row (HTTP 400); the conversation carries over.
+
+        A tool call identical to the last ``REPEAT_CALL_LIMIT - 1`` ones (same
+        name and arguments, same result, no file changed since) is not run;
+        the agent is told to do something different, with
+        ``repeat_hint(name, arguments)`` when that returns a hint.
 
         With ``submit``, success is reported only through the submit tool;
         ``finish`` remains available for giving up (success=false).
@@ -280,6 +311,7 @@ class Agent:
         self.partial_result: Callable[[str, StopReason], AgentResult] | None = None
         self.submit = submit
         self.nudge = nudge
+        self.repeat_hint = repeat_hint
         self.on_event = on_event
         self._schemas = [t.schema() for t in tools] + ([submit.schema()] if submit else []) + [FINISH.schema()]
 
@@ -295,8 +327,13 @@ class Agent:
         step = 0
         self.model = self.model_chain[0]
         self.models_used = []
-        # Models found exhausted (per-day limit) during this run.
+        # Models found exhausted (per-day limit) during this run, and models given
+        # up on after repeated 400s (model -> why).
         exhausted: dict[str, DailyLimitReached] = {}
+        failing: dict[str, str] = {}
+        # Exact tool call -> its latest run; and how many tool runs changed files.
+        repeats: dict[str, _Repeat] = {}
+        edits = 0
 
         def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
             return AgentResult(
@@ -337,7 +374,9 @@ class Agent:
 
         invalid_submits = 0
         text_only_streak = 0
+        # Consecutive 400s on the current model, and those without a failed_generation.
         bad_requests = 0
+        blank_bad_requests = 0
         while step < self.max_steps:
             if usage.total_tokens >= self.max_tokens:
                 return result(
@@ -350,20 +389,35 @@ class Agent:
                 messages.append({"role": "user", "content": note})
             self._compact(messages, views)
             try:
-                response = await self._complete(messages, step, usage, exhausted)
+                response = await self._complete(messages, step, usage, exhausted, failing)
             except BadRequest as exc:
                 code = exc.code or "no error code"
+                bad_requests += 1
+                blank_bad_requests = blank_bad_requests + 1 if exc.failed_generation is None else 0
+                if bad_requests >= MAX_BAD_REQUESTS_PER_MODEL:
+                    why = f"rejected {bad_requests} requests in a row (400, {code})"
+                    following = self._next_model(exhausted, {**failing, self.model: why})
+                    if following is not None:
+                        failing[self.model] = why
+                        self._switch_model(step, usage, following, "bad_requests",
+                                           f"model kept failing on {self.model} ({why}), switching to {following}")
+                        bad_requests = blank_bad_requests = 0
+                        continue
                 if exc.failed_generation is None:
-                    bad_requests += 1
-                    if bad_requests > MAX_BAD_REQUEST_RETRIES:
-                        summary = (
-                            f"LLM call failed: the provider rejected the request {bad_requests} times "
-                            f"in a row (400, {code}): {exc}"
-                        )
+                    if blank_bad_requests > MAX_BAD_REQUEST_RETRIES:
+                        failing[self.model] = f"rejected {blank_bad_requests} requests in a row (400, {code})"
+                        if len(self.model_chain) == 1:
+                            summary = (
+                                f"LLM call failed: the provider rejected the request {blank_bad_requests} times "
+                                f"in a row (400, {code}): {exc}"
+                            )
+                        else:
+                            summary = f"LLM call failed: {AllModelsExhausted(self.role, list(exhausted.values()), failing)}"
                         self._emit(step, usage, "note", summary=summary, is_error=True)
                         return result(False, summary, "error")
                     self._emit(step, usage, "note", is_error=True, summary=(
-                        f"provider rejected the request (400, {code}); retry {bad_requests}/{MAX_BAD_REQUEST_RETRIES}"
+                        f"provider rejected the request (400, {code}); "
+                        f"retry {blank_bad_requests}/{MAX_BAD_REQUEST_RETRIES}"
                     ))
                     if exc.code == "tool_use_failed":
                         unknown = re.search(r"call tool '([^']+)'", str(exc))
@@ -375,17 +429,16 @@ class Agent:
                     continue
                 # What the model actually wrote is handled like any reply: a tool
                 # call written as JSON text is run, prose follows the plain-text rules.
-                bad_requests = 0
                 self._emit(step, usage, "note", summary=f"provider could not parse the reply ({code}); using its text")
                 response = LLMResponse(model=self.model, content=exc.failed_generation)
             except AllModelsExhausted as exc:
                 self._emit(step, usage, "note", summary=str(exc), is_error=True)
-                return result(False, str(exc), "daily_limit")
+                return result(False, str(exc), "error" if exc.failing else "daily_limit")
             except Exception as exc:
                 self._emit(step, usage, "note", summary=f"LLM call failed: {exc}", is_error=True)
                 return result(False, f"LLM call failed: {type(exc).__name__}: {exc}", "error")
             else:
-                bad_requests = 0
+                bad_requests = blank_bad_requests = 0
 
             text_call_error = None
             if not response.tool_calls:
@@ -498,10 +551,28 @@ class Agent:
                     return result(finish.success, finish.summary, "finished")
 
                 self._emit(step, usage, "tool_called", tool=call.name, arguments=call.arguments)
+                key = _call_key(call)
+                seen = repeats.get(key)
+                if seen is not None and seen.edits == edits and seen.count >= REPEAT_CALL_LIMIT - 1:
+                    # Nothing changed since the identical calls before, so neither would the result.
+                    times = seen.count + 1
+                    repeats[key] = seen._replace(count=times)
+                    hint = (self.repeat_hint(call.name, call.arguments) if self.repeat_hint else None) or DEFAULT_REPEAT_HINT
+                    messages.append(_tool_message(call.id, (
+                        f"You've made this exact call {times} times and the result hasn't changed. "
+                        f"Do something different: {hint}"
+                    )))
+                    self._emit(step, usage, "tool_result", tool=call.name, arguments=call.arguments, is_error=True,
+                               summary=f"not run: the same call {times} times with an unchanged result")
+                    continue
                 output = await self._execute(call.name, call.arguments, call.parse_error)
+                if output.files_changed:
+                    edits += 1
                 for path in output.files_changed:
                     if path not in files_changed:
                         files_changed.append(path)
+                same = seen is not None and seen.content == output.content and seen.edits == edits
+                repeats[key] = _Repeat(seen.count + 1 if same else 1, output.content, edits)
                 content = output.content
                 summary = output.summary or _preview(content)
                 if output.view_key is not None:
@@ -535,10 +606,24 @@ class Agent:
         first = self.models_used[0] if self.models_used else self.model
         return [first, *[m for m in self.fallback_models if m != first]]
 
+    def _next_model(self, exhausted: dict[str, DailyLimitReached], failing: dict[str, str]) -> str | None:
+        """The first model in the chain not exhausted or given up on, if any."""
+        return next((m for m in self.model_chain if m not in exhausted and m not in failing), None)
+
+    def _switch_model(self, step: int, usage: TokenUsage, to: str, reason: str, summary: str) -> None:
+        self._emit(step, usage, "model_switch", summary=summary, is_error=True,
+                   arguments={"from": self.model, "to": to, "reason": reason})
+        self.model = to
+
     async def _complete(
-        self, messages: list[dict[str, Any]], step: int, usage: TokenUsage, exhausted: dict[str, DailyLimitReached]
+        self,
+        messages: list[dict[str, Any]],
+        step: int,
+        usage: TokenUsage,
+        exhausted: dict[str, DailyLimitReached],
+        failing: dict[str, str],
     ) -> LLMResponse:
-        """One LLM call. On a per-day limit, switch to the next fallback model and
+        """One LLM call. On a per-day limit, switch to the next usable model and
         call again with the same conversation; ``AllModelsExhausted`` once none is left."""
         while True:
             if not self.models_used or self.models_used[-1] != self.model:
@@ -553,13 +638,12 @@ class Agent:
                 )
             except DailyLimitReached as exc:
                 exhausted[self.model] = exc
-                chain = self.model_chain
-                following = [m for m in chain if m not in exhausted]
-                if not following:
-                    raise AllModelsExhausted(self.role, [exhausted[m] for m in chain]) from exc
-                self._emit(step, usage, "note", is_error=True,
-                           summary=f"daily limit reached on {self.model}, switching to {following[0]}")
-                self.model = following[0]
+                following = self._next_model(exhausted, failing)
+                if following is None:
+                    limits = [exhausted[m] for m in self.model_chain if m in exhausted]
+                    raise AllModelsExhausted(self.role, limits, failing) from exc
+                self._switch_model(step, usage, following, "daily_limit",
+                                   f"daily limit reached on {self.model}, switching to {following}")
 
     def _reject_finish(self, finish: FinishArgs) -> str | None:
         """Why a claimed success is not accepted, or None to accept the finish."""
@@ -694,6 +778,10 @@ class Agent:
     def _emit(self, step: int, usage: TokenUsage, kind: str, **fields: Any) -> None:
         if self.on_event:
             self.on_event(AgentEvent(role=self.role, step=step, kind=kind, tokens_used=usage.total_tokens, **fields))
+
+
+def _call_key(call: ToolCall) -> str:
+    return json.dumps([call.name, call.arguments, call.parse_error], sort_keys=True, default=str)
 
 
 def _tool_message(call_id: str, content: str) -> dict[str, Any]:
