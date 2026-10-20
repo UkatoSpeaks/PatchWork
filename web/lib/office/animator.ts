@@ -1,8 +1,9 @@
 // Moves the characters through the office. The reducer says where each agent
 // should be (a place); the animator walks them there one tile at a time, runs
 // errands (trips) there and back, and fills idle time with office life
-// (idle.ts). Scene moves always win: an idle plan is dropped the moment the
-// agent is needed. On a seek it snaps everyone into place.
+// (idle.ts). Scene moves always win: an idle plan or an errand is dropped the
+// moment the agent gets a task, and an active agent stays at its work spot
+// until the task is over. On a seek it snaps everyone into place.
 
 import type { CrewAgent } from "../types";
 import { bucketAssignments, idleBucket, idleEligible, idleLegs, restSpot, type IdleKind, type IdlePose, type Leg } from "./idle";
@@ -43,6 +44,9 @@ export interface ActorView {
   say: string | null;
 }
 
+// How many events after an errand starts a deep link (?at=N) still shows it.
+export const TRIP_FRESH_EVENTS = 2;
+
 const same = (a: Tile, b: Tile) => a.x === b.x && a.y === b.y;
 
 export class Actors {
@@ -77,15 +81,21 @@ export class Actors {
       const state = scene.agents[agent];
       const home = spotFor(agent, state.place);
       const trip = state.trip;
+      // A seek landing on (or just after) the event that started an errand still plays it.
+      const tripFresh = trip != null && trip.at != null && scene.events - trip.at <= TRIP_FRESH_EVENTS;
       if (snap) {
         Object.assign(actor, {
           px: home.x * TILE, py: home.y * TILE, tile: { x: home.x, y: home.y }, next: null, legs: [], home,
-          facing: home.facing, dwell: 0, tripKey: trip?.key ?? null, stop: { spot: home, dwell: 0 }, stopTime: 0,
+          facing: home.facing, dwell: 0, tripKey: tripFresh ? null : trip?.key ?? null, stop: { spot: home, dwell: 0 }, stopTime: 0,
           mode: "scene", idle: null,
         });
         continue;
       }
-      if (trip && trip.key !== actor.tripKey) {
+      if (state.active && actor.mode !== "scene") {
+        // A task starts: drop any errand or office life and go straight to work.
+        actor.tripKey = trip?.key ?? actor.tripKey;
+        this.interrupt(actor, home);
+      } else if (trip && trip.key !== actor.tripKey) {
         actor.tripKey = trip.key;
         const say = trip.say ? { text: trip.say, from: 0, to: 2.4 } : undefined;
         actor.legs = [{ spot: spotFor(agent, trip.to), dwell: 2.4, pose: "talk", say }, { spot: home, dwell: 0 }];
@@ -251,6 +261,8 @@ export class Actors {
       switch (stop.pose) {
         case "drink":
           return { ...view, pose: "drink", cup: "paper" };
+        case "coffee":
+          return { ...view, pose: "drink", cup: "mug" };
         case "type":
           return { ...view, pose: stop.spot.seat === "chair" ? "type" : "stand" };
         default:
@@ -260,6 +272,8 @@ export class Actors {
     if (!atHome) return view;
     if (state.place === "celebrate" && this.scene.outcome === "success") return { ...view, pose: "celebrate" };
     if (state.place === "coffee") return { ...view, pose: "drink", cup: "mug" };
+    // Waiting for the provider: a mug at the desk, not a trip to the kitchen.
+    if (actor.home.seat === "chair" && state.active && state.activity === "waiting") return { ...view, pose: "sit", cup: "mug" };
     if (actor.home.seat === "chair") return { ...view, pose: busy ? "type" : "sit" };
     if (same(actor.home, WHITEBOARD_SPOT)) return { ...view, pose: busy || state.activity === "thinking" ? "write" : "stand" };
     return view;

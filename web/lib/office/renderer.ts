@@ -10,7 +10,7 @@ import { drawFurniture, sortYOf, type FurnitureState } from "./furniture";
 import { COFFEE_MACHINE, COLS, FURNITURE, HEIGHT, MID_FACE, ROWS, TILE, WALL_ITEMS, WIDTH, tileKind } from "./layout";
 import { CREW, elapsedSeconds, type SceneState } from "./reducer";
 import * as W from "./scenery";
-import { drawConfetti, drawRainCloud } from "./sprites";
+import { AGENT_COLORS, drawConfetti, drawRainCloud } from "./sprites";
 
 type Ctx = CanvasRenderingContext2D;
 
@@ -75,8 +75,6 @@ interface Drawable {
   draw: () => void;
 }
 
-const WORKING = new Set(["thinking", "typing", "testing"]);
-
 export interface FrameInput {
   scene: SceneState;
   actors: Actors;
@@ -91,7 +89,8 @@ export function drawScene(ctx: Ctx, { scene, actors, t, outcomeSeconds, selected
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(drawBackground(), 0, 0);
 
-  const planned = scene.agents.lead.activity === "done" || scene.phase !== "plan" && scene.whiteboardLines > 0;
+  // The plan goes up when the lead submits it.
+  const planned = scene.whiteboardLines > 0;
   for (const item of WALL_ITEMS) {
     const x = item.x * TILE, y = item.y * TILE;
     if (item.kind === "window") W.drawWindow(ctx, x, y, item.w, t);
@@ -103,11 +102,11 @@ export function drawScene(ctx: Ctx, { scene, actors, t, outcomeSeconds, selected
   const views = Object.fromEntries(CREW.map((agent) => [agent, actors.view(agent)])) as Record<CrewAgent, ReturnType<Actors["view"]>>;
   const furnitureState: FurnitureState = {
     t,
+    // The monitor glows while its owner has a task; idle agents have theirs off.
     screen: (owner) => {
       const state = scene.agents[owner];
-      const atDesk = actors.isSeated(owner) && actors.actors[owner].home.seat === "chair";
-      if (WORKING.has(state.activity) || (atDesk && views[owner].pose === "type")) return { busy: state.activity === "typing" || state.activity === "testing" || views[owner].pose === "type" };
-      return null;
+      if (!state.active) return null;
+      return { busy: state.activity === "typing" || state.activity === "testing" };
     },
     coffeeInUse: CREW.some((agent) => {
       const actor = actors.actors[agent];
@@ -133,6 +132,13 @@ export function drawScene(ctx: Ctx, { scene, actors, t, outcomeSeconds, selected
       cup: view.cup,
     };
     const atDesk = (view.pose === "type" || view.pose === "sit") && actor.home.seat === "chair";
+    if (state.active) {
+      // A soft glow in the agent's colour under everyone with a task: on the floor,
+      // or on the chair seat (above the desk's edge) when seated. Drawn just before
+      // the body (a stable sort keeps it after the chair).
+      const cy = atDesk ? y + 9 : y + 15;
+      drawables.push({ sortY: y + 15, draw: () => drawActiveGlow(ctx, x + TILE / 2, cy, AGENT_COLORS[agent], t) });
+    }
     drawables.push({ sortY: y + 15, draw: () => drawCharacter(ctx, agent, x, y, { ...options, layer: "body" }) });
     // hands rest on the desk in front of the chair, so draw them after it
     if (atDesk) drawables.push({ sortY: y + 2 * TILE - 0.5, draw: () => drawCharacter(ctx, agent, x, y, { ...options, layer: "front" }) });
@@ -151,6 +157,19 @@ export function drawScene(ctx: Ctx, { scene, actors, t, outcomeSeconds, selected
     }
   }
   ctx.drawImage(drawVignette(), 0, 0);
+}
+
+/** A stepped pixel ellipse on the floor, gently pulsing. */
+function drawActiveGlow(ctx: Ctx, cx: number, cy: number, color: string, t: number): void {
+  const pulse = 0.28 + 0.07 * Math.sin(t / 420);
+  ctx.save();
+  ctx.fillStyle = color;
+  const rows: [number, number, number][] = [[-3, 6, 0.55], [-2, 9, 0.8], [-1, 11, 1], [0, 11, 1], [1, 9, 0.8], [2, 6, 0.55]];
+  for (const [dy, half, k] of rows) {
+    ctx.globalAlpha = pulse * k;
+    ctx.fillRect(Math.round(cx - half), Math.round(cy + dy), half * 2, 1);
+  }
+  ctx.restore();
 }
 
 // The whiteboard in the meeting room opens the plan when clicked.

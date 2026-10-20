@@ -12,7 +12,7 @@ import type { CrewAgent, Plan, RunDetail, RunEvent } from "@/lib/types";
 import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
 import InfoPanels, { type InfoTab } from "./InfoPanels";
-import OfficeCanvas from "./OfficeCanvas";
+import OfficeCanvas, { type AgentLines } from "./OfficeCanvas";
 import ReplayControls, { SPEEDS } from "./ReplayControls";
 import TopBar from "./TopBar";
 
@@ -47,7 +47,7 @@ export default function RunView({ id }: { id: string }) {
   const [speed, setSpeed] = useState(4);
   const [snapKey, setSnapKey] = useState(0);
   const [walking, setWalking] = useState<CrewAgent[]>([]);
-  const [saying, setSaying] = useState<Partial<Record<CrewAgent, string>>>({});
+  const [status, setStatus] = useState<Partial<Record<CrewAgent, AgentLines>>>({});
   const [selected, setSelected] = useState<CrewAgent | null>(null);
   const [logFilter, setLogFilter] = useState<LogFilter>("all");
   const [tab, setTab] = useState<InfoTab>("plan");
@@ -215,7 +215,7 @@ export default function RunView({ id }: { id: string }) {
         onSelect={select}
         onWhiteboard={openPlan}
         onWalkingChange={setWalking}
-        onBubblesChange={setSaying}
+        onStatusChange={setStatus}
       />
       <ReplayControls
         playing={playing}
@@ -238,7 +238,8 @@ export default function RunView({ id }: { id: string }) {
             walking={walking.includes(name)}
             maxSteps={scene.maxSteps}
             maxTokens={scene.maxTokens}
-            now={saying[name] ?? null}
+            task={status[name]?.task ?? null}
+            now={status[name]?.now ?? null}
             selected={selected === name}
             onSelect={() => select(selected === name ? null : name)}
           />

@@ -11,7 +11,10 @@ function withAgent(scene: SceneState, agent: CrewAgent, place: Place, activity: 
     ...scene,
     agents: {
       ...scene.agents,
-      [agent]: { ...scene.agents[agent], place, activity, trip: trip ? { to: "coderDesk", key: trip, say: "Can you fix this?" } : null },
+      [agent]: {
+        ...scene.agents[agent], place, activity, active: !["idle", "done", "failed", "cancelled"].includes(activity),
+        trip: trip ? { to: "coderDesk", key: trip, say: "Can you fix this?" } : null,
+      },
     },
   };
 }
@@ -62,20 +65,48 @@ describe("Actors", () => {
   });
 
   it("runs a trip there and back, saying its line at the far end", () => {
-    let scene = withAgent(initialScene(), "reviewer", "desk");
+    // The reviewer is idle (its review is done) when it hands over its notes.
+    let scene = withAgent(initialScene(), "reviewer", "desk", "done");
     const actors = new Actors(scene);
     actors.sync(scene, true);
-    scene = withAgent(scene, "reviewer", "desk", "thinking", 1);
+    scene = withAgent(scene, "reviewer", "desk", "done", 1);
     actors.sync(scene, false);
     const visit = spotFor("reviewer", "coderDesk");
     let said: string | null = null;
-    for (let t = 0; t < 30; t += 0.05) {
+    let back = false;
+    for (let t = 0; t < 30 && !back; t += 0.05) {
       actors.update(0.05, 8);
       if (at(actors, "reviewer", visit)) said = said ?? actors.view("reviewer").say;
+      back = said !== null && at(actors, "reviewer", spotFor("reviewer", "desk")) && !actors.isWalking("reviewer");
     }
     expect(said).toBe("Can you fix this?");
-    expect(at(actors, "reviewer", spotFor("reviewer", "desk"))).toBe(true);
-    expect(actors.isWalking("reviewer")).toBe(false);
+    expect(back).toBe(true);
+  });
+});
+
+describe("deep links to a handover", () => {
+  it("still play the reviewer's walk when landing on it, but not long after", () => {
+    const visit = spotFor("reviewer", "coderDesk");
+    const walks = (eventsSince: number) => {
+      const base = withAgent(initialScene(), "reviewer", "desk", "done");
+      const scene: SceneState = {
+        ...base,
+        events: 40 + eventsSince,
+        agents: { ...base.agents, reviewer: { ...base.agents.reviewer, trip: { to: "coderDesk", key: 1, say: "Can you fix this?", at: 40 } } },
+      };
+      const actors = new Actors(initialScene());
+      actors.sync(scene, true);
+      actors.sync(scene, false);
+      let visited = false;
+      for (let t = 0; t < 10; t += 0.05) {
+        actors.update(0.05, 8);
+        visited ||= at(actors, "reviewer", visit);
+      }
+      return visited;
+    };
+    expect(walks(0)).toBe(true);
+    expect(walks(2)).toBe(true);
+    expect(walks(10)).toBe(false);
   });
 });
 

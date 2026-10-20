@@ -35,8 +35,18 @@ class WriteFileArgs(BaseModel):
 
 class EditFileArgs(BaseModel):
     path: str
-    old: str = Field(description="exact existing text; must occur exactly once")
+    old: str = Field(description="exact existing text; must occur once, unless near_line is given")
     new: str = Field(description="replacement text")
+    near_line: int | None = Field(
+        default=None, ge=1, description="if old occurs more than once, edit the occurrence closest to this line"
+    )
+
+
+class ReplaceLinesArgs(BaseModel):
+    path: str
+    start_line: int = Field(ge=1, description="first line to replace (1-based)")
+    end_line: int = Field(ge=1, description="last line to replace (inclusive)")
+    text: str = Field(description='new text for those lines; "" deletes them')
 
 
 class InsertLinesArgs(BaseModel):
@@ -182,6 +192,7 @@ def read_only_tools(repo: Path) -> list[Tool]:
             view_key=f"read_file {rel}",
             view_version=hashlib.sha1(fs.resolve_in_root(repo, rel).read_bytes()).hexdigest(),
             view_span=(int(span.group(1)), int(span.group(2))) if span else None,
+            view_path=rel,
         )
 
     def list_dir(args: ListDirArgs) -> ToolOutput:
@@ -202,7 +213,13 @@ def read_only_tools(repo: Path) -> list[Tool]:
 
     return [
         Tool(name="search_code", description="Regex search; returns path:line: text.", args_model=SearchCodeArgs, handler=search_code),
-        Tool(name="read_file", description="Read up to 200 numbered lines from offset.", args_model=ReadFileArgs, handler=read_file),
+        Tool(
+            name="read_file",
+            description="Read up to 200 numbered lines from offset.",
+            args_model=ReadFileArgs,
+            handler=read_file,
+            shows_content_on_repeat=True,
+        ),
         Tool(name="list_dir", description="List a directory.", args_model=ListDirArgs, handler=list_dir),
     ]
 
@@ -213,8 +230,8 @@ def write_tools(
     guard: WriteGuard | None = None,
     on_change: Callable[[str], None] | None = None,
 ) -> list[Tool]:
-    """edit_file, insert_lines and write_file. ``guard`` sees the normalized
-    path before any write; ``on_change`` is told about each path written."""
+    """edit_file, replace_lines, insert_lines and write_file. ``guard`` sees the
+    normalized path before any write; ``on_change`` is told about each path written."""
 
     def checked(path: str) -> str:
         rel = fs.to_relative(repo, path)
@@ -226,8 +243,11 @@ def write_tools(
         if on_change is not None:
             on_change(rel)
         summary = message.split("\n", 1)[0].removesuffix("; it now reads:").rstrip(":")
-        if "\nWARNING: " in message:
+        warnings = [line for line in message.split("\n") if line.startswith("WARNING: ")]
+        if any(" is now defined " in w for w in warnings):
             summary += " (WARNING: duplicate definition)"
+        if any(" unreachable (after the " in w for w in warnings):
+            summary += " (WARNING: unreachable code)"
         return ToolOutput(content=message, summary=summary, files_changed=[rel])
 
     def write_file(args: WriteFileArgs) -> ToolOutput:
@@ -236,14 +256,29 @@ def write_tools(
 
     def edit_file(args: EditFileArgs) -> ToolOutput:
         rel = checked(args.path)
-        return changed(rel, fs.edit_file(repo, rel, args.old, args.new))
+        return changed(rel, fs.edit_file(repo, rel, args.old, args.new, args.near_line))
+
+    def replace_lines(args: ReplaceLinesArgs) -> ToolOutput:
+        rel = checked(args.path)
+        return changed(rel, fs.replace_lines(repo, rel, args.start_line, args.end_line, args.text))
 
     def insert_lines(args: InsertLinesArgs) -> ToolOutput:
         rel = checked(args.path)
         return changed(rel, fs.insert_lines(repo, rel, args.after_line, args.text))
 
     return [
-        Tool(name="edit_file", description="Replace one exact occurrence of old with new.", args_model=EditFileArgs, handler=edit_file),
+        Tool(
+            name="edit_file",
+            description="Replace one exact occurrence of old with new (near_line picks one of several).",
+            args_model=EditFileArgs,
+            handler=edit_file,
+        ),
+        Tool(
+            name="replace_lines",
+            description='Replace lines start_line..end_line (inclusive) with text; text="" deletes them.',
+            args_model=ReplaceLinesArgs,
+            handler=replace_lines,
+        ),
         Tool(
             name="insert_lines",
             description="Insert text after a line number (0 = top, -1 = end of file).",
@@ -260,7 +295,10 @@ TESTS_ELSEWHERE_HINT = (
 )
 _REPEAT_HINTS = {
     "search_code": "search for a different pattern or in a different path, or read the file you need.",
-    "read_file": "the file content is already in your context above; edit the file or read another one.",
+    "read_file": (
+        "the lines are shown again below. Act on them: edit with replace_lines (using these line numbers) "
+        "or edit_file with near_line, or read another file."
+    ),
     "list_dir": "the listing is already in your context above; read or search a specific file instead.",
     "run_tests": "the tests give the same result; change the code before running them again.",
 }

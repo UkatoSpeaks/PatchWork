@@ -41,12 +41,13 @@ function Portrait({ agent, animate, grey }: { agent: AgentState["name"]; animate
   return <canvas ref={ref} width={20} height={20} className="pixelated h-14 w-14 shrink-0 bg-cream-dark" aria-hidden />;
 }
 
-export default function AgentCard({ agent, walking, maxSteps, maxTokens, now, selected, onSelect }: {
+export default function AgentCard({ agent, walking, maxSteps, maxTokens, task, now, selected, onSelect }: {
   agent: AgentState;
   walking: boolean;
   maxSteps: number;
   maxTokens: number;
-  // what the agent is saying right now
+  // the status tag's two lines (task, current action); idle agents: no task, and what they say
+  task: string | null;
   now: string | null;
   selected: boolean;
   onSelect: () => void;
@@ -74,10 +75,16 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens, now, se
           </span>
         </div>
       </div>
-      <p className="w-full truncate font-pixel text-xs" title={now ?? undefined}>
-        <span className="text-ink-soft">now: </span>
-        {now ?? <span className="text-ink-soft">…</span>}
-      </p>
+      <div className="w-full font-pixel text-xs">
+        <p className="truncate" title={task ?? undefined}>
+          <span className="text-ink-soft">task: </span>
+          {task ? task.replace(/^Task: /, "") : <span className="text-ink-soft">none right now</span>}
+        </p>
+        <p className="truncate" title={now ?? undefined}>
+          <span className="text-ink-soft">now: </span>
+          {now ?? <span className="text-ink-soft">{agent.active ? "…" : "free"}</span>}
+        </p>
+      </div>
       <dl className="grid w-full grid-cols-2 gap-x-2 font-pixel text-xs">
         <dt className="text-ink-soft">steps</dt>
         <dd className="text-right tabular-nums">{agent.steps} / {maxSteps}</dd>

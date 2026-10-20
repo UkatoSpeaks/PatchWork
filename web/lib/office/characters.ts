@@ -193,6 +193,12 @@ function build(look: Look, o: DrawOptions, fr: Frame): Part[] {
       add(11, 16 + U, 3, 2, sleeve, true, 2);
       add(4, 18 + U - tapL, 3, 2, look.skin, true, 2);
       add(9, 18 + U - tapR, 3, 2, look.skin, true, 2);
+      if (pose === "sit" && o.cup) {
+        // a mug in the right hand, lifted now and then (waiting for the model at the desk)
+        const lift = fr.cupUp ? 3 : 0;
+        add(10, 15 + U - lift, 4, 4, o.cup === "paper" ? P.paper : "#f4efe6", true, 2);
+        if (o.cup !== "paper") add(14, 16 + U - lift, 1, 2, "#f4efe6", true, 2);
+      }
     } else if (pose === "scroll") {
       add(3, 15 + U, 3, 2, sleeve, true, 1);
       add(10, 15 + U, 3, 2, sleeve, true, 1);

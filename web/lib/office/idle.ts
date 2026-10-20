@@ -1,7 +1,8 @@
-// Office life for agents with nothing to do right now: the reviewer during
-// implementation, the lead after planning, the tester once it's done. They
-// fetch water, sit on the sofa, look out of a window, scroll at their desk or
-// chat with each other. Choices are deterministic: seeded by the run id and a
+// Office life for agents with nothing to do right now (not between their
+// agent_started and agent_finished): the reviewer during implementation, the
+// lead after planning, the tester once it's done. They fetch water or a
+// coffee, sit on the sofa, look out of a window, scroll at their desk or chat
+// with each other. Choices are deterministic: seeded by the run id and a
 // time bucket, so a deep link always starts the same way. Idle plans never
 // outrank the scene: the animator drops them as soon as an agent is needed.
 
@@ -13,8 +14,8 @@ import { CREW, type SceneState } from "./reducer";
 // How often idle agents pick something new to do (animation seconds).
 export const IDLE_BUCKET_S = 10;
 
-export type IdleKind = "rest" | "cooler" | "sofa" | "window" | "desk" | "chat";
-export type IdlePose = "drink" | "sofa" | "scroll" | "look" | "talk" | "type";
+export type IdleKind = "rest" | "cooler" | "coffee" | "sofa" | "window" | "desk" | "chat";
+export type IdlePose = "drink" | "coffee" | "sofa" | "scroll" | "look" | "talk" | "type";
 
 export interface Say {
   text: string;
@@ -45,7 +46,7 @@ export interface Assignment {
 export function idleEligible(scene: SceneState, agent: CrewAgent): boolean {
   const a = scene.agents[agent];
   if (!a.inRun || scene.outcome) return false;
-  if (a.activity !== "idle" && a.activity !== "done") return false;
+  if (a.active) return false;
   return a.place === "desk" || a.place === "lounge";
 }
 
@@ -72,7 +73,7 @@ export function bucketAssignments(runId: string, bucket: number, eligible: CrewA
   }
   const taken = new Set<IdleKind>();
   for (const agent of rest) {
-    const options: IdleKind[] = (["rest", "rest", "cooler", "sofa", "window", "desk"] as IdleKind[]).filter((k) => k === "rest" || !taken.has(k));
+    const options: IdleKind[] = (["rest", "rest", "cooler", "coffee", "sofa", "window", "desk"] as IdleKind[]).filter((k) => k === "rest" || !taken.has(k));
     const kind = options[Math.floor(random() * options.length)];
     taken.add(kind);
     out[agent] = { kind };
@@ -103,6 +104,8 @@ export function idleLegs(runId: string, agent: CrewAgent, bucket: number, assign
     }
     case "cooler":
       return [{ spot: IDLE_SPOTS.cooler[agent], dwell: 3.5 + random() * 1.5, pose: "drink", say: maybe(IDLE_PHRASES.cooler) }, back];
+    case "coffee":
+      return [{ spot: spotFor(agent, "coffee"), dwell: 4 + random() * 1.5, pose: "coffee", say: maybe(IDLE_PHRASES.coffee) }, back];
     case "sofa":
       return [{ spot: IDLE_SPOTS.sofa[agent], dwell: 5 + random() * 3, pose: "sofa", say: maybe(IDLE_PHRASES.sofa, 1) }, back];
     case "window":

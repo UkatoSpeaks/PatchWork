@@ -54,3 +54,12 @@ def finish(success=True, summary="done", **kwargs) -> LLMResponse:
 
 def tool_results(messages: list[dict[str, Any]]) -> list[str]:
     return [m["content"] for m in messages if m["role"] == "tool"]
+
+
+def results_as_sent(llm: ScriptedLLM, model: str | None = None) -> list[str]:
+    """Every tool result as the model first saw it, before later trimming."""
+    seen: list[str] = []
+    for request in llm.requests_for(model) if model else llm.requests:
+        results = tool_results(request)
+        seen.extend(results[len(seen):])
+    return seen

@@ -3,10 +3,12 @@
 import { useEffect, useRef } from "react";
 
 import { Actors } from "@/lib/office/animator";
-import { BubbleDirector, bubbleAnchor, placeBubble, resolveOverlaps, type ShownBubble } from "@/lib/office/bubbles";
+import { BubbleDirector, bubbleAnchor, layoutOverlay, type OverlayItem, type ShownBubble } from "@/lib/office/bubbles";
 import { HEIGHT, WIDTH } from "@/lib/office/layout";
 import { CREW, type SceneState } from "@/lib/office/reducer";
 import { drawScene, hitTest } from "@/lib/office/renderer";
+import { AGENT_COLORS } from "@/lib/office/sprites";
+import { StatusDirector, type StatusLines } from "@/lib/office/status";
 import type { CrewAgent } from "@/lib/types";
 
 interface Props {
@@ -19,16 +21,24 @@ interface Props {
   onSelect?: (agent: CrewAgent | null) => void;
   onWhiteboard?: () => void;
   onWalkingChange?: (walking: CrewAgent[]) => void;
-  // what each agent is saying right now (for the agent cards)
-  onBubblesChange?: (texts: Partial<Record<CrewAgent, string>>) => void;
+  // each agent's status tag lines right now, or what it is saying (for the agent cards)
+  onStatusChange?: (lines: Partial<Record<CrewAgent, AgentLines>>) => void;
+}
+
+/** For the agent cards: the tag's task line, and its action line (or what an idle agent says). */
+export interface AgentLines {
+  task: string | null;
+  now: string | null;
 }
 
 const ROLE: Record<CrewAgent, string> = { lead: "Lead", tester: "Tester", coder: "Coder", reviewer: "Reviewer" };
 
-export default function OfficeCanvas({ scene, snapKey, speed, playing, selected, onSelect, onWhiteboard, onWalkingChange, onBubblesChange }: Props) {
+export default function OfficeCanvas({ scene, snapKey, speed, playing, selected, onSelect, onWhiteboard, onWalkingChange, onStatusChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const bubbleRefs = useRef<Partial<Record<CrewAgent, HTMLDivElement | null>>>({});
+  const tagRefs = useRef<Partial<Record<CrewAgent, HTMLDivElement | null>>>({});
+  const statusRef = useRef(new StatusDirector());
   const sceneRef = useRef(scene);
   const speedRef = useRef(speed);
   const playingRef = useRef(playing);
@@ -38,8 +48,8 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
   const snapRef = useRef(snapKey);
   const outcomeAt = useRef<number | null>(null);
   const walkingRef = useRef("");
-  const callbacks = useRef({ onWalkingChange, onBubblesChange });
-  callbacks.current = { onWalkingChange, onBubblesChange };
+  const callbacks = useRef({ onWalkingChange, onStatusChange });
+  callbacks.current = { onWalkingChange, onStatusChange };
   speedRef.current = speed;
   playingRef.current = playing;
   selectedRef.current = selected;
@@ -50,7 +60,10 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
     const snap = snapRef.current !== snapKey;
     snapRef.current = snapKey;
     actorsRef.current.sync(scene, snap);
-    if (snap) directorRef.current.reset();
+    if (snap) {
+      directorRef.current.reset();
+      statusRef.current.reset();
+    }
     if (!scene.outcome) outcomeAt.current = null;
     else if (outcomeAt.current === null || snap) outcomeAt.current = performance.now();
   }, [scene, snapKey]);
@@ -63,6 +76,8 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
     let play = 0; // playback seconds: frozen while paused
     const shown: Partial<Record<CrewAgent, ShownBubble | null>> = {};
     const sizes: Partial<Record<CrewAgent, { w: number; h: number }>> = {};
+    const tagShown: Partial<Record<CrewAgent, string>> = {};
+    const tagSizes: Partial<Record<CrewAgent, { w: number; h: number }>> = {};
     let reported = "";
 
     const loop = (now: number) => {
@@ -83,21 +98,29 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
           callbacks.current.onWalkingChange?.(walking);
         }
 
-        // Speech bubbles: an HTML overlay positioned from the characters.
+        // Status tags and speech bubbles: an HTML overlay positioned from the characters.
         const width = canvas.clientWidth;
         overlayRef.current?.style.setProperty("--office-scale", String(width / WIDTH));
-        const texts: Partial<Record<CrewAgent, string>> = {};
+        const texts: Partial<Record<CrewAgent, AgentLines>> = {};
         const sceneTime = sceneRef.current.lastAt ? Date.parse(sceneRef.current.lastAt) : null;
-        const boxes: { agent: CrewAgent; el: HTMLDivElement; left: number; top: number; w: number; h: number; tail: number }[] = [];
+        const items: OverlayItem[] = [];
         for (const agent of CREW) {
           const el = bubbleRefs.current[agent];
-          if (!el) continue;
+          const tagEl = tagRefs.current[agent];
+          if (!el || !tagEl) continue;
           const state = sceneRef.current.agents[agent];
           const actor = actors.actors[agent];
           const view = actors.view(agent);
+          const lines = statusRef.current.next(agent, state, now / 1000, play, speedRef.current);
+          const tagText = lines ? `${lines.task}\n${lines.action}` : "";
+          if (tagText !== tagShown[agent]) {
+            tagShown[agent] = tagText;
+            renderTag(tagEl, lines);
+            tagSizes[agent] = lines ? { w: tagEl.offsetWidth, h: tagEl.offsetHeight } : undefined;
+          }
           const bubble = directorRef.current.next(
             agent,
-            { bubble: state.bubble, said: state.said, thinking: state.activity === "thinking", say: view.say, trip: actor.mode === "trip", sceneTime },
+            { bubble: state.bubble, said: state.said, say: view.say, trip: actor.mode === "trip", sceneTime },
             now / 1000,
             play,
             speedRef.current,
@@ -108,26 +131,35 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
             renderBubble(el, bubble, before?.key !== bubble?.key);
             sizes[agent] = bubble ? { w: el.offsetWidth, h: el.offsetHeight } : undefined;
           }
-          if (bubble) {
-            texts[agent] = bubble.style === "thought" ? "thinking…" : bubble.text;
-            const size = sizes[agent] ?? { w: el.offsetWidth, h: el.offsetHeight };
-            const anchor = bubbleAnchor(actor.px, actor.py, view.pose, width);
-            // the thought cloud's trailing dots hang lower than a speech tail
-            const lift = bubble.style === "thought" ? 9 : 0;
-            const { left, top, tail } = placeBubble({ x: anchor.x, y: anchor.y - lift }, size.w, size.h, width);
-            boxes.push({ agent, el, left, top, w: size.w, h: size.h + 8, tail });
+          texts[agent] = { task: lines?.task ?? null, now: lines?.action ?? bubble?.text ?? null };
+          if (!lines && !bubble) continue;
+          items.push({
+            agent,
+            anchor: bubbleAnchor(actor.px, actor.py, view.pose, width),
+            tag: lines ? (tagSizes[agent] ?? { w: tagEl.offsetWidth, h: tagEl.offsetHeight }) : null,
+            bubble: bubble ? (sizes[agent] ?? { w: el.offsetWidth, h: el.offsetHeight }) : null,
+          });
+        }
+        // Neighbours (e.g. the reviewer visiting the coder) mustn't cover each other.
+        const placed = layoutOverlay(items, width);
+        for (const item of items) {
+          const where = placed[item.agent]!;
+          const tagEl = tagRefs.current[item.agent]!;
+          const el = bubbleRefs.current[item.agent]!;
+          if (where.tag) {
+            tagEl.style.transform = `translate(${Math.round(where.tag.left)}px, ${Math.round(where.tag.top)}px)`;
+            tagEl.style.setProperty("--stem", `${Math.max(0, Math.round(where.tag.stem))}px`);
+            tagEl.style.setProperty("--stem-x", `${Math.round(item.anchor.x - where.tag.left)}px`);
+          }
+          if (where.bubble) {
+            el.style.transform = `translate(${Math.round(where.bubble.left)}px, ${Math.round(where.bubble.top)}px)`;
+            el.style.setProperty("--tail", `${Math.round(where.bubble.tail)}px`);
           }
         }
-        // Neighbours (two agents at the coffee machine) mustn't cover each other.
-        const tops = resolveOverlaps(boxes);
-        boxes.forEach((b, i) => {
-          b.el.style.transform = `translate(${Math.round(b.left)}px, ${Math.round(tops[i])}px)`;
-          b.el.style.setProperty("--tail", `${Math.round(b.tail)}px`);
-        });
         const textKey = JSON.stringify(texts);
         if (textKey !== reported) {
           reported = textKey;
-          callbacks.current.onBubblesChange?.(texts);
+          callbacks.current.onStatusChange?.(texts);
         }
       }
       frame = requestAnimationFrame(loop);
@@ -169,6 +201,19 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
         <div ref={overlayRef} className="pointer-events-none absolute inset-0 overflow-hidden" aria-live="polite">
           {CREW.map((agent) => (
             <div
+              key={`tag-${agent}`}
+              ref={(el) => {
+                tagRefs.current[agent] = el;
+              }}
+              className="office-tag"
+              data-agent={agent}
+              style={{ "--agent": AGENT_COLORS[agent] } as React.CSSProperties}
+              hidden
+              aria-label={`${ROLE[agent]} is working`}
+            />
+          ))}
+          {CREW.map((agent) => (
+            <div
               key={agent}
               ref={(el) => {
                 bubbleRefs.current[agent] = el;
@@ -183,6 +228,22 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
       </div>
     </div>
   );
+}
+
+/** Fill a status tag: the task on line 1, the current action on line 2. */
+function renderTag(el: HTMLDivElement, lines: StatusLines | null): void {
+  if (!lines) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const task = document.createElement("span");
+  task.className = "office-tag-task";
+  task.textContent = lines.task;
+  const action = document.createElement("span");
+  action.className = "office-tag-action";
+  action.textContent = lines.action;
+  el.replaceChildren(task, action);
 }
 
 /** Fill a bubble element (text or thinking dots); pop it in when it's a new bubble. */

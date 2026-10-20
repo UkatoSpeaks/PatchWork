@@ -270,6 +270,58 @@ body {
   }
 }
 
+/* --- status tags over active agents ---------------------------------------------
+   Two lines in a stepped pixel border in the agent's colour (--agent): the task,
+   then what the agent is doing now. A stem in the same colour runs down to the
+   head (--stem tall, at --stem-x) when tags have stacked up. */
+
+.office-tag {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  max-width: 34ch;
+  padding: 2px 5px 3px;
+  background: #fffaf0;
+  font-family: var(--font-mono);
+  font-size: clamp(9px, calc(var(--office-scale, 1.8) * 5.4px), 12px);
+  line-height: 1.2;
+  color: var(--color-ink);
+  box-shadow:
+    -2px 0 0 0 var(--agent),
+    2px 0 0 0 var(--agent),
+    0 -2px 0 0 var(--agent),
+    0 2px 0 0 var(--agent);
+  will-change: transform;
+}
+
+.office-tag[hidden] {
+  display: none;
+}
+
+.office-tag::after {
+  content: "";
+  position: absolute;
+  top: calc(100% + 2px);
+  left: calc(var(--stem-x, 50%) - 1px);
+  width: 2px;
+  height: var(--stem, 0px);
+  background: var(--agent);
+}
+
+.office-tag-task {
+  font-weight: 700;
+  /* darkened so small text stays readable on the light label */
+  color: color-mix(in srgb, var(--agent) 72%, #000);
+  white-space: nowrap;
+}
+
+.office-tag-action {
+  white-space: nowrap;
+}
+
 /* Scrollable panels keep their own scrollbar thin and on-palette. */
 .pixel-scroll {
   scrollbar-width: thin;

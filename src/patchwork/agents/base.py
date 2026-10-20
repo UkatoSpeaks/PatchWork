@@ -16,7 +16,7 @@ import asyncio
 import inspect
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Any, Literal, NamedTuple, Protocol
 
 import json_repair
@@ -35,8 +35,15 @@ MAX_BAD_REQUEST_RETRIES = MAX_BAD_REQUESTS_PER_MODEL - 1
 # changed is not run; the agent is told to do something different.
 REPEAT_CALL_LIMIT = 3
 DEFAULT_REPEAT_HINT = "the result is already in your context above; use it, or call a different tool or change the arguments."
-ELIDE_KEEP_CHARS = 300
-ELIDED_MARK = "\n[…older output elided to save tokens; re-run the tool if you need it]"
+# For a tool whose result is shown again with the warning (shows_content_on_repeat).
+SHOWN_AGAIN_HINT = "the result is shown again below; act on it instead of making the same call."
+# An attempt ends early as "stuck" after this many repeated-call blocks, or this
+# many errors in a row from one tool with the same error type.
+STUCK_BLOCKS = 3
+STUCK_ERRORS = 3
+# Older tool results become one line: "[trimmed: <tool>: <summary>]".
+TRIMMED_PREFIX = "[trimmed: "
+TRIMMED_SUFFIX = "; call the tool again if you need the full output]"
 
 
 class ToolOutput(BaseModel):
@@ -54,6 +61,9 @@ class ToolOutput(BaseModel):
     # whose span is already covered gets the short note instead.
     view_version: str | None = None
     view_span: tuple[int, int] | None = None
+    # The file a view shows (root-relative). The latest read of a file the agent
+    # has edited is never trimmed.
+    view_path: str | None = None
     # Set by a tool that has itself verified the task is complete: the run ends
     # with success and this summary.
     finish_summary: str | None = None
@@ -69,6 +79,10 @@ class Tool(BaseModel):
     args_model: type[BaseModel]
     # Takes an ``args_model`` instance; returns str or ToolOutput (sync or async).
     handler: Callable[[Any], Any]
+    # A read-only view (e.g. read_file) that still runs when the repeated-call
+    # guard trips: its output is shown again with the warning, so the agent is
+    # never left without the content it asked for.
+    shows_content_on_repeat: bool = False
 
     def schema(self) -> dict[str, Any]:
         return {
@@ -134,12 +148,13 @@ class AgentEvent(BaseModel):
     ``tool_result`` (after), ``note`` (nudges, alias mappings, rejections,
     auto-finish), ``model_switch`` (the agent moved to its next model;
     ``arguments`` has ``from``, ``to`` and ``reason``: "daily_limit" or
-    "bad_requests") and ``finish`` (the agent's last step).
+    "bad_requests"), ``stuck`` (the attempt is ended early, see STUCK_BLOCKS)
+    and ``finish`` (the agent's last step).
     """
 
     role: str
     step: int
-    kind: Literal["llm_call", "thought", "tool_called", "tool_result", "note", "model_switch", "finish"]
+    kind: Literal["llm_call", "thought", "tool_called", "tool_result", "note", "model_switch", "stuck", "finish"]
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
@@ -152,7 +167,10 @@ class AgentEvent(BaseModel):
 
 # "daily_limit": every model the agent may use hit its per-day limit.
 # "cancelled": stopped by the orchestrator (e.g. its parallel sibling failed).
-StopReason = Literal["finished", "max_steps", "max_tokens", "invalid_output", "error", "daily_limit", "cancelled"]
+# "stuck": going in circles (repeated-call blocks or the same tool error in a row).
+StopReason = Literal[
+    "finished", "max_steps", "max_tokens", "invalid_output", "error", "daily_limit", "cancelled", "stuck"
+]
 
 
 class AgentResult(BaseModel):
@@ -165,6 +183,8 @@ class AgentResult(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     stop_reason: StopReason
+    # LLM calls that returned a reply (for the average prompt size).
+    llm_calls: int = 0
     # The validated submit payload, for agents with a SubmitSpec.
     output: dict[str, Any] | None = None
     # Models the agent actually called, in order (more than one after a fallback).
@@ -205,6 +225,7 @@ class _View(NamedTuple):
     step: int
     version: str | None
     span: tuple[int, int] | None
+    path: str | None = None
 
 
 def _covers(old: _View, new: _View) -> bool:
@@ -240,8 +261,7 @@ class Agent:
         max_tokens: int = 60_000,
         max_output_tokens: int = 1024,
         tool_choice: str | None = "auto",
-        keep_recent_tool_results: int = 3,
-        keep_recent_views: int = 6,
+        keep_recent_tool_results: int = 2,
         max_tool_output_chars: int = 8_000,
         verify_finish: Callable[[], str | None] | None = None,
         verify_give_up: Callable[[], str | None] | None = None,
@@ -271,7 +291,12 @@ class Agent:
         A tool call identical to the last ``REPEAT_CALL_LIMIT - 1`` ones (same
         name and arguments, same result, no file changed since) is not run;
         the agent is told to do something different, with
-        ``repeat_hint(name, arguments)`` when that returns a hint.
+        ``repeat_hint(name, arguments)`` when that returns a hint. A tool with
+        ``shows_content_on_repeat`` (read_file) is run anyway: normally if the
+        earlier full result has been trimmed from the history, otherwise with
+        the warning in front of the content. ``STUCK_BLOCKS`` such warnings, or
+        ``STUCK_ERRORS`` errors in a row from one tool with the same error
+        type, end the run early with stop reason "stuck".
 
         With ``submit``, success is reported only through the submit tool;
         ``finish`` remains available for giving up (success=false).
@@ -279,9 +304,9 @@ class Agent:
         ``nudge(step)`` is called before each LLM call; a returned string is
         added to the conversation as a note for that turn.
 
-        The latest result of up to ``keep_recent_views`` views (see
-        ``ToolOutput.view_key``) is kept in full even when older than the
-        last ``keep_recent_tool_results`` tool results."""
+        Only the last ``keep_recent_tool_results`` tool results stay in full;
+        older ones become one-line summaries, except the latest read of each
+        file the agent has edited (see ``ToolOutput.view_path``)."""
         names = [t.name for t in tools]
         reserved = {FINISH_TOOL} | ({submit.name} if submit else set())
         if reserved & set(names):
@@ -298,7 +323,6 @@ class Agent:
         self.max_output_tokens = max_output_tokens
         self.tool_choice = tool_choice
         self.keep_recent_tool_results = keep_recent_tool_results
-        self.keep_recent_views = keep_recent_views
         self.max_tool_output_chars = max_tool_output_chars
         self.verify_finish = verify_finish
         self.verify_give_up = verify_give_up
@@ -322,9 +346,12 @@ class Agent:
         ]
         usage = TokenUsage()
         files_changed: list[str] = []
-        # Message index -> view, for view results still in full.
+        # Message index -> view, for view results still in full; and every tool
+        # message's one-line summary ("<tool>: <summary>"), used once it is trimmed.
         views: dict[int, _View] = {}
+        summaries: dict[int, str] = {}
         step = 0
+        llm_calls = 0
         self.model = self.model_chain[0]
         self.models_used = []
         # Models found exhausted (per-day limit) during this run, and models given
@@ -334,6 +361,10 @@ class Agent:
         # Exact tool call -> its latest run; and how many tool runs changed files.
         repeats: dict[str, _Repeat] = {}
         edits = 0
+        # Stuck detection: repeated-call blocks this run, and per tool the
+        # latest error type and how many times in a row the tool hit it.
+        blocks = 0
+        error_streaks: dict[str, tuple[str, int]] = {}
 
         def result(success: bool, summary: str, reason: StopReason, output: BaseModel | None = None) -> AgentResult:
             return AgentResult(
@@ -346,11 +377,21 @@ class Agent:
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
                 stop_reason=reason,
+                llm_calls=llm_calls,
                 output=output.model_dump() if output is not None else None,
                 models_used=list(self.models_used),
             )
 
         self.partial_result = lambda summary, reason: result(False, summary, reason)
+
+        def stuck(details: str) -> AgentResult:
+            summary = f"stuck: {details}"
+            self._emit(step, usage, "stuck", summary=summary, is_error=True)
+            return result(False, summary, "stuck")
+
+        def add_tool_message(call: ToolCall, content: str, summary: str) -> None:
+            summaries[len(messages)] = f"{call.name}: {summary}"
+            messages.append(_tool_message(call.id, content))
 
         def submitted(payload: BaseModel, arguments: dict[str, Any]) -> AgentResult:
             summary = str(getattr(payload, self.submit.summary_field, "") or f"called {self.submit.name}")
@@ -387,7 +428,7 @@ class Agent:
             if note:
                 self._emit(step, usage, "note", summary=note)
                 messages.append({"role": "user", "content": note})
-            self._compact(messages, views)
+            self._compact(messages, views, summaries, files_changed)
             try:
                 response = await self._complete(messages, step, usage, exhausted, failing)
             except BadRequest as exc:
@@ -462,6 +503,7 @@ class Agent:
                 response = response.model_copy(update={"tool_calls": [self._resolve_alias(c, step, usage) for c in response.tool_calls]})
 
             usage = usage + response.usage
+            llm_calls += 1
             self._emit(
                 step, usage, "llm_call",
                 prompt_tokens=response.usage.prompt_tokens, completion_tokens=response.usage.completion_tokens,
@@ -553,21 +595,32 @@ class Agent:
                 self._emit(step, usage, "tool_called", tool=call.name, arguments=call.arguments)
                 key = _call_key(call)
                 seen = repeats.get(key)
-                if seen is not None and seen.edits == edits and seen.count >= REPEAT_CALL_LIMIT - 1:
+                tool = self.tools.get(call.name)
+                repeated = seen is not None and seen.edits == edits and seen.count >= REPEAT_CALL_LIMIT - 1
+                times = seen.count + 1 if seen is not None else 1
+                shows_again = tool is not None and tool.shows_content_on_repeat
+                hint = None
+                if repeated:
+                    hint = (self.repeat_hint(call.name, call.arguments) if self.repeat_hint else None) or (
+                        SHOWN_AGAIN_HINT if shows_again else DEFAULT_REPEAT_HINT)
+                if repeated and not shows_again:
                     # Nothing changed since the identical calls before, so neither would the result.
-                    times = seen.count + 1
                     repeats[key] = seen._replace(count=times)
-                    hint = (self.repeat_hint(call.name, call.arguments) if self.repeat_hint else None) or DEFAULT_REPEAT_HINT
-                    messages.append(_tool_message(call.id, (
+                    summary = f"not run: the same call {times} times with an unchanged result"
+                    add_tool_message(call, (
                         f"You've made this exact call {times} times and the result hasn't changed. "
                         f"Do something different: {hint}"
-                    )))
+                    ), summary)
                     self._emit(step, usage, "tool_result", tool=call.name, arguments=call.arguments, is_error=True,
-                               summary=f"not run: the same call {times} times with an unchanged result")
+                               summary=summary)
+                    blocks += 1
+                    if blocks >= STUCK_BLOCKS:
+                        return stuck(f"blocked {blocks} times by the repeated-call guard (last: {call.name})")
                     continue
                 output = await self._execute(call.name, call.arguments, call.parse_error)
                 if output.files_changed:
                     edits += 1
+                    error_streaks.clear()
                 for path in output.files_changed:
                     if path not in files_changed:
                         files_changed.append(path)
@@ -575,15 +628,27 @@ class Agent:
                 repeats[key] = _Repeat(seen.count + 1 if same else 1, output.content, edits)
                 content = output.content
                 summary = output.summary or _preview(content)
+                blocked = False
                 if output.view_key is not None:
-                    view = _View(output.view_key, step, output.view_version, output.view_span)
+                    view = _View(output.view_key, step, output.view_version, output.view_span, output.view_path)
                     earlier = _earlier_view(messages, views, view, content)
-                    if earlier is not None:
+                    if earlier is not None and repeated and same and not output.is_error:
+                        # The earlier full copy is still in context, but the agent keeps
+                        # asking: warn, and show the lines again so it can act on them.
+                        # (If that copy had been trimmed, the read just runs normally.)
+                        content = (
+                            f"You've made this exact call {times} times and the result hasn't changed. "
+                            f"Do something different: {hint}\n{content}"
+                        )
+                        summary = f"repeated {times} times: shown again with a warning ({summary})"
+                        views[len(messages)] = view
+                        blocked = True
+                    elif earlier is not None:
                         content = _unchanged_note(earlier, view)
                         summary += " (unchanged, short note)"
                     else:
                         views[len(messages)] = view
-                messages.append(_tool_message(call.id, content))
+                add_tool_message(call, content, summary)
                 self._emit(
                     step,
                     usage,
@@ -591,8 +656,21 @@ class Agent:
                     tool=call.name,
                     arguments=call.arguments,
                     summary=summary,
-                    is_error=output.is_error,
+                    is_error=output.is_error or blocked,
                 )
+                if blocked:
+                    blocks += 1
+                    if blocks >= STUCK_BLOCKS:
+                        return stuck(f"blocked {blocks} times by the repeated-call guard (last: {call.name})")
+                if output.is_error:
+                    kind = _error_type(output.content)
+                    last_kind, count = error_streaks.get(call.name, ("", 0))
+                    count = count + 1 if kind == last_kind else 1
+                    error_streaks[call.name] = (kind, count)
+                    if count >= STUCK_ERRORS:
+                        return stuck(f"{call.name} failed {count} times in a row with the same error ({kind})")
+                elif not blocked:
+                    error_streaks.pop(call.name, None)
                 if output.finish_summary is not None:
                     self._emit(step, usage, "note", summary=output.finish_summary)
                     self._emit(step, usage, "finish", tool="auto-finish", summary=output.finish_summary)
@@ -741,22 +819,31 @@ class Agent:
             )
         return output
 
-    def _compact(self, messages: list[dict[str, Any]], views: dict[int, _View] | None = None) -> None:
+    def _compact(
+        self,
+        messages: list[dict[str, Any]],
+        views: dict[int, _View] | None = None,
+        summaries: dict[int, str] | None = None,
+        edited: Collection[str] = (),
+    ) -> None:
         """Shrink old tool results and old tool-call arguments in place.
 
         Every request resends the whole history, so on a tokens-per-minute
-        budget, stale file dumps and test logs are the main cost. The latest
-        result of each recent view (e.g. the last read of a file) is kept in
-        full so the model does not have to read it again; older results for
-        the same view are replaced with a stub.
+        budget, stale file dumps and test logs are the main cost. Only the
+        last ``keep_recent_tool_results`` results stay in full; older ones,
+        file reads included, become a one-line summary. The exception is the
+        latest read of each file in ``edited``, so the agent keeps the lines
+        it is changing. An older result for a view that a later one supersedes
+        becomes a stub.
         """
         views = views if views is not None else {}
+        summaries = summaries if summaries is not None else {}
         for index in sorted(views):
             old = views[index]
             if any(later > index and _supersedes(view, old) for later, view in views.items()):
                 messages[index] = {**messages[index], "content": f"[superseded by a later result for {old.key}]"}
                 del views[index]
-        pinned = set(sorted(views)[-self.keep_recent_views:]) if self.keep_recent_views > 0 else set()
+        pinned = {i for i, view in views.items() if view.path is not None and view.path in edited}
 
         tool_indexes = [i for i, m in enumerate(messages) if m["role"] == "tool"]
         keep = self.keep_recent_tool_results
@@ -766,11 +853,12 @@ class Agent:
         for i in range(cutoff):
             message = messages[i]
             if message["role"] == "tool":
-                if i in pinned:
-                    continue
                 content = message["content"]
-                if len(content) > ELIDE_KEEP_CHARS + len(ELIDED_MARK) and not content.endswith(ELIDED_MARK):
-                    messages[i] = {**message, "content": content[:ELIDE_KEEP_CHARS] + ELIDED_MARK}
+                if i in pinned or content.startswith((TRIMMED_PREFIX, "[superseded by ")):
+                    continue
+                line = TRIMMED_PREFIX + (summaries.get(i) or _preview(content, 120)) + TRIMMED_SUFFIX
+                if len(line) < len(content):
+                    messages[i] = {**message, "content": line}
                     views.pop(i, None)
             elif message["role"] == "assistant" and message.get("tool_calls"):
                 messages[i] = {**message, "tool_calls": [_shrink_call(c) for c in message["tool_calls"]]}
@@ -778,6 +866,13 @@ class Agent:
     def _emit(self, step: int, usage: TokenUsage, kind: str, **fields: Any) -> None:
         if self.on_event:
             self.on_event(AgentEvent(role=self.role, step=step, kind=kind, tokens_used=usage.total_tokens, **fields))
+
+
+def _error_type(content: str) -> str:
+    """What kind of error a tool returned, ignoring numbers and details: the
+    first sentence, e.g. "ValueError: old text occurs N times in core.py (at lines N, N)"."""
+    first = re.split(r"\.\s|;\s|\n", content.strip().removeprefix("ERROR: "), maxsplit=1)[0]
+    return re.sub(r"\d+", "N", first)[:120]
 
 
 def _call_key(call: ToolCall) -> str:

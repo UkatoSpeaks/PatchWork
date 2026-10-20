@@ -6,13 +6,13 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from patchwork.agents.base import ELIDED_MARK, Agent, AgentEvent, Tool, ToolOutput
+from patchwork.agents.base import TRIMMED_PREFIX, TRIMMED_SUFFIX, Agent, AgentEvent, Tool, ToolOutput
 from patchwork.agents.coder import build_coder, build_task
 from patchwork.config import Settings
 from patchwork.llm import BadRequest, DailyLimitReached, LLMResponse, ToolCall
 
 from conftest import TOY_CALCULATOR
-from scripted import ScriptedLLM, finish, reply, tool_results
+from scripted import ScriptedLLM, finish, reply, results_as_sent, tool_results
 
 
 class EchoArgs(BaseModel):
@@ -339,14 +339,16 @@ def test_finish_with_failure():
     assert (result.success, result.stop_reason, result.summary) == (False, "finished", "cannot reproduce")
 
 
-def test_old_tool_results_are_compacted():
+def test_old_tool_results_become_one_line_summaries():
     big = "x" * 2000
     llm = ScriptedLLM([reply(("echo", {"text": big})) for _ in range(4)] + [finish()])
-    run(make_agent(llm, keep_recent_tool_results=2))
+    run(make_agent(llm))  # keeps the 2 most recent results in full by default
 
     last = llm.requests[-1]
     tool_contents = [m["content"] for m in last if m["role"] == "tool"]
-    assert [c.endswith(ELIDED_MARK) for c in tool_contents] == [True, True, False, False]
+    assert [c.startswith(TRIMMED_PREFIX) for c in tool_contents] == [True, True, False, False]
+    assert tool_contents[0] == f"{TRIMMED_PREFIX}echo: echo: {'x' * 151}...{TRIMMED_SUFFIX}"
+    assert "\n" not in tool_contents[0]
     # Old tool-call arguments are shrunk too; recent ones are untouched.
     assistant_args = [m["tool_calls"][0]["function"]["arguments"] for m in last if m.get("tool_calls")]
     assert len(assistant_args[0]) < 400
@@ -380,7 +382,7 @@ def test_coder_agent_fixes_toy_repo_with_scripted_llm(tmp_path: Path):
     assert result.success
     assert result.summary == "fixed subtract, divide and mean"
     assert result.files_changed == ["calculator/ops.py", "calculator/stats.py"]
-    tool_results = [m["content"] for m in llm.requests[-1] if m["role"] == "tool"]
+    tool_results = results_as_sent(llm)
     assert tool_results[0] == "calculator/ops.py:9: def subtract(a, b):"
     assert "return b - a" in tool_results[1]
     assert tool_results[2].startswith("edited calculator/ops.py at line 11; it now reads:\n")
@@ -538,7 +540,7 @@ def test_crew_coder_searching_for_the_testers_tests_is_told_they_are_elsewhere(t
     llm = ScriptedLLM([search] * 3 + [reply(("read_file", {"path": "missing.py"}))] + [finish(success=False, summary="x")] * 2)
     settings = Settings(_env_file=None, coder_model="fake")
     run(build_coder(repo=tmp_path, settings=settings, llm=llm, tests_elsewhere=True))
-    results = tool_results(llm.requests[-1])
+    results = results_as_sent(llm)
     assert results[0] == "no matches" and "unchanged" in results[1]
     assert results[2] == (
         "You've made this exact call 3 times and the result hasn't changed. Do something different: the tester "

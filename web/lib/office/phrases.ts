@@ -3,7 +3,7 @@
 // so a replay or a deep link (?at=N) always shows the same words.
 
 import type { CrewAgent } from "../types";
-import { argsOf, basename, clip, toolName } from "./labels";
+import { clip } from "./labels";
 
 export const MAX_BUBBLE_CHARS = 40;
 
@@ -34,69 +34,7 @@ export function pick<T>(options: readonly T[], seed: number): T {
 }
 
 const fit = (text: string) => clip(text, MAX_BUBBLE_CHARS);
-const file = (path: string) => clip(basename(path), 18);
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-
-/** The function an edit touches, from `def name(` in its new or old text. */
-function editedFunction(args: Record<string, unknown>): string | null {
-  for (const key of ["new", "new_text", "content", "old", "old_text"]) {
-    const value = args[key];
-    if (typeof value !== "string") continue;
-    const match = value.match(/\bdef\s+([A-Za-z_]\w*)\s*\(/) ?? value.match(/\bclass\s+([A-Za-z_]\w*)/);
-    if (match) return match[1];
-  }
-  return null;
-}
-
-function isOneLiner(args: Record<string, unknown>): boolean {
-  const a = args.old, b = args.new;
-  return typeof a === "string" && typeof b === "string" && !a.trim().includes("\n") && !b.trim().includes("\n");
-}
-
-const looksLikeTest = (path: string) => /(^|\/)tests?\/|test_[^/]*$|_test\.\w+$/.test(path.replace(/\\/g, "/"));
-
-/** What an agent says as it calls a tool. */
-export function toolPhrase(tool: string, rawArgs: unknown, seed: number): string {
-  const args = argsOf(rawArgs);
-  const path = typeof args.path === "string" ? args.path : "";
-  const name = toolName(tool);
-  const f = path ? file(path) : "";
-  switch (name) {
-    case "read_file":
-      return fit(pick(f ? [`Let me look at ${f}…`, `Checking ${f}`, `What's in ${f}?`, `Reading ${f}`] : ["Let me read that…", "Reading a file"], seed));
-    case "list_dir": {
-      const dir = path ? `${file(path)}/` : "the repo";
-      return fit(pick([`What's in ${dir}?`, `Looking around ${dir}`, `Let me see ${dir}`, `Browsing ${dir}`], seed));
-    }
-    case "search_code": {
-      const pattern = clip(String(args.pattern ?? args.query ?? "").trim(), 16);
-      if (!pattern) return pick(["Searching the code…", "Where is that used?"], seed);
-      return fit(pick([`Where is '${pattern}' used?`, `Searching for ${pattern}…`, `Any '${pattern}' around?`, `Hunting for ${pattern}`], seed));
-    }
-    case "edit_file":
-    case "insert_lines":
-    case "replace_lines": {
-      const fn = editedFunction(args);
-      const options = [f ? `Editing ${f}` : "Editing the code", f ? `Patching ${f}` : "Patching things up"];
-      if (fn) options.push(`Fixing ${clip(fn, 20)}()`, `Updating ${clip(fn, 20)}()`);
-      if (isOneLiner(args)) options.push("One-line fix, nice");
-      return fit(pick(options, seed));
-    }
-    case "write_file":
-      if (looksLikeTest(path)) return fit(pick(["Writing tests first", "These should fail for now", f ? `Writing ${f}` : "Writing a test file", "Test time!"], seed));
-      return fit(pick(f ? [`Writing ${f}`, `New file: ${f}`, `Creating ${f}`] : ["Writing a new file"], seed));
-    case "run_tests":
-      return pick(["Running the tests…", "Let's run the tests", "Fingers crossed…", "Test run, here we go"], seed);
-    case "submit_plan":
-      return pick(["Here's the plan", "Plan's ready", "Okay, here's the plan"], seed);
-    case "submit_review":
-      return pick(["Writing up my review", "Okay, my verdict…", "Review notes, done"], seed);
-    case "finish":
-      return pick(["Wrapping up", "That should do it", "Let me wrap this up"], seed);
-    default:
-      return fit(name ? `${name.replace(/_/g, " ")}…` : "Working on it…");
-  }
-}
 
 /** pytest-style "3 failed, 7 passed, 1 error" -> counts. */
 export function testCounts(summary: string): { passed: number | null; failed: number | null } {
@@ -131,8 +69,6 @@ export function testResultPhrase(agent: CrewAgent, summary: string, passed: bool
   return pick(options, seed);
 }
 
-export const toolErrorPhrase = (seed: number) => pick(["Hmm, that didn't work", "Oops, let me retry", "That's odd…"], seed);
-
 /** "groq/openai/gpt-oss-120b" -> "Groq" */
 export function providerName(model: unknown): string {
   const first = String(model ?? "").split("/")[0];
@@ -140,20 +76,6 @@ export function providerName(model: unknown): string {
   const known: Record<string, string> = { groq: "Groq", openai: "OpenAI", anthropic: "Anthropic", gemini: "Gemini", ollama: "Ollama" };
   return known[first.toLowerCase()] ?? first.charAt(0).toUpperCase() + first.slice(1);
 }
-
-/** The first thing said on the way to the coffee machine. */
-export function coffeePhrase(kind: "rate_limited" | "throttled", model: unknown, seed: number): string {
-  const provider = providerName(model);
-  const options =
-    kind === "rate_limited"
-      ? ["Rate limited. Coffee time ☕", `${provider} needs a break, so do I`, "Too many requests. Coffee ☕", "Quota hit. Coffee break ☕"]
-      : ["Pacing myself. Coffee ☕", `${provider} needs a break, so do I`, "Saving tokens. Coffee time ☕", "Token budget's low. Coffee ☕"];
-  return fit(pick(options, seed));
-}
-
-export const countdownText = (seconds: number) => `☕ ${Math.max(0, Math.ceil(seconds))}s left`;
-
-export const shortWaitPhrase = (seed: number) => pick(["One sec…", "Just a moment…", "Hold on…"], seed);
 
 export function startPhrase(agent: CrewAgent, label: string, phase: string | null, seed: number): string {
   if (/retry/i.test(label)) return pick(["On it", "Sure, fixing it now", "On it, one sec"], seed);
@@ -195,6 +117,12 @@ export function modelSwitchPhrase(model: unknown, seed: number): string {
 }
 
 /** The implement-phase coder failed; a retry follows. */
+/** An attempt ended early because the agent kept repeating itself. */
+export const stuckPhrase = (seed: number) => pick(["I'm going in circles…", "I'm going in circles… stopping"], seed);
+
+/** An edit left unreachable code behind (the harness warned about it). */
+export const deadCodePhrase = (seed: number) => pick(["Oops, dead code", "Oops, dead code. Fixing it"], seed);
+
 export const helpPhrase = (seed: number) => pick(["I'm stuck… can someone help?", "Stuck. A second pair of eyes?", "I need a hand here…"], seed);
 
 /** A coder retry on a bigger model (CODER_RETRY_MODEL). */
@@ -220,6 +148,7 @@ export const celebratePhrase = (seed: number) => pick(["We did it! 🎉", "Merge
 export const IDLE_PHRASES = {
   emails: ["Checking emails", "Inbox zero, almost", "Answering emails"],
   cooler: ["Water break", "Staying hydrated", "Ahh, cold water"],
+  coffee: ["Coffee time ☕", "One more coffee", "Fresh pot!"],
   window: ["Nice view", "Looks like rain", "Sunny out there"],
   sofa: ["Quick breather", "Ahh, comfy", "Five minutes…"],
   desk: ["Just scrolling", "Reading the news", "Catching up on chat"],

@@ -28,7 +28,7 @@ import time
 from collections.abc import Coroutine, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from patchwork.agents.base import Agent, AgentEvent, AgentResult, EventCallback, SupportsComplete
 from patchwork.agents.coder import build_coder, build_retry_task, build_task
@@ -170,16 +170,25 @@ class Orchestrator:
         tester_files = workspace.changed_files("tester")
 
         review_round = 0
+        # (reason, feedback) still to act on: set after a failed retry that changed
+        # nothing, since checking the same code again would give the same answer.
+        pending: tuple[str, str] | None = None
         while True:
+            if pending is not None:
+                reason, feedback = pending
+                outcome = await self._retry(run, issue, plan, workspace, result_dir, reason, feedback, tester_files)
+                if outcome is None:
+                    return
+                pending = (reason, feedback) if outcome == "unchanged" else None
+                continue
+
             with self._phase(run, "verify"):
                 result = shell.run_tests(result_dir, self.test_command, timeout=self.settings.test_timeout_seconds)
                 run.tests_passed = result.passed
                 self._emit("orchestrator", "tests_run", passed=result.passed, summary=result.summary_line(),
                            reasons=result.failure_reasons(), output=result.render())
             if not result.passed:
-                feedback = "The full test suite fails in the merged result:\n" + result.render()
-                if not await self._retry(run, issue, plan, workspace, result_dir, "tests", feedback, tester_files):
-                    return
+                pending = ("tests", "The full test suite fails in the merged result:\n" + result.render())
                 continue
 
             review_round += 1
@@ -200,11 +209,9 @@ class Orchestrator:
                 return
             if run.verdict.approved:
                 return
-            feedback = "The reviewer found problems that must be fixed:\n" + "\n".join(
+            pending = ("review", "The reviewer found problems that must be fixed:\n" + "\n".join(
                 f"- [{i.severity}] {i.file}: {i.description}" for i in run.verdict.issues
-            )
-            if not await self._retry(run, issue, plan, workspace, result_dir, "review", feedback, tester_files):
-                return
+            ))
 
     async def _run_concurrently(self, jobs: dict[str, Coroutine[Any, Any, bool]], fatal: str) -> dict[str, bool]:
         """Run the jobs concurrently and return each one's success. When the
@@ -296,13 +303,15 @@ class Orchestrator:
         reason: str,
         feedback: str,
         protected: list[str],
-    ) -> bool:
-        """A fresh coder (on CODER_RETRY_MODEL) in the result worktree. False once
-        the retry cap is reached; a failed implement-phase coder counts toward it."""
+    ) -> Literal["changed", "unchanged"] | None:
+        """A fresh coder (on CODER_RETRY_MODEL) in the result worktree. None once
+        the retry cap is reached (a failed implement-phase coder counts toward
+        it); "unchanged" if the retry failed (e.g. got stuck) without changing
+        anything, so the same feedback still applies; "changed" otherwise."""
         if self._retries_used(run) >= self.max_retries:
             self._emit("orchestrator", "note", kind="retry_limit",
                        text=f"retry limit reached ({self.max_retries}); stopping")
-            return False
+            return None
         run.retries += 1
         attempt = run.retries
         self._emit("orchestrator", "retry_started", attempt=attempt, max_retries=self.max_retries,
@@ -318,7 +327,13 @@ class Orchestrator:
             self._record_attempt(run, entry, retry=attempt, reason=reason)
             committed = workspace.commit_all("result", f"patchwork {self.run_id}: coder retry {attempt} ({reason})")
             self._agent_finished(entry, committed=committed, attempt=attempt, reason=reason)
-        return True
+        if entry.result.success or committed:
+            return "changed"
+        left = self.max_retries - self._retries_used(run)
+        why = f"retry {attempt} failed ({entry.result.stop_reason}) and changed nothing"
+        self._emit("orchestrator", "note", kind="retry_unchanged", stop_reason=entry.result.stop_reason,
+                   text=f"{why}; " + ("trying again with the same feedback" if left > 0 else "no retries left"))
+        return "unchanged"
 
     # --- solo -------------------------------------------------------------------
 
@@ -386,6 +401,7 @@ class Orchestrator:
             summary=result.summary,
             stop_reason=result.stop_reason,
             steps=result.steps_used,
+            llm_calls=result.llm_calls,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             tokens=result.tokens_used,

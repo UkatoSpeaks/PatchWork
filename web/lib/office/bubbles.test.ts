@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { BubbleDirector, bubbleAnchor, MIN_HOLD_S, placeBubble, resolveOverlaps, type BubbleInputs } from "./bubbles";
+import { BubbleDirector, bubbleAnchor, countdown, layoutOverlay, MIN_HOLD_S, overlaps, placeBubble, resolveOverlaps, TAIL_PX, type BubbleInputs, type OverlayItem } from "./bubbles";
 import { WIDTH } from "./layout";
 import type { Bubble } from "./reducer";
 
 const speech = (seq: number, text: string, extra: Partial<Bubble> = {}): Bubble => ({ seq, text, style: "speech", ...extra });
-const inputs = (patch: Partial<BubbleInputs> = {}): BubbleInputs => ({ bubble: null, said: null, thinking: false, say: null, trip: false, ...patch });
+const inputs = (patch: Partial<BubbleInputs> = {}): BubbleInputs => ({ bubble: null, said: null, say: null, trip: false, ...patch });
 
 describe("bubble placement", () => {
   it("scales with the canvas size", () => {
@@ -49,16 +49,16 @@ describe("BubbleDirector", () => {
       const d = new BubbleDirector();
       expect(d.next("coder", inputs({ bubble: speech(1, "Checking ops.py") }), 0, 0, speed)?.text).toBe("Checking ops.py");
       // cleared right away by the next event: still shown until the hold is over
-      const cleared = inputs({ said: speech(1, "Checking ops.py"), thinking: true });
+      const cleared = inputs({ said: speech(1, "Checking ops.py") });
       expect(d.next("coder", cleared, (MIN_HOLD_S / speed) * 0.9, 0, speed)?.text).toBe("Checking ops.py");
-      expect(d.next("coder", cleared, (MIN_HOLD_S / speed) * 1.1, 0, speed)?.style).toBe("thought");
+      expect(d.next("coder", cleared, (MIN_HOLD_S / speed) * 1.1, 0, speed)).toBeNull();
     }
   });
 
   it("shows a line said and cleared between two frames", () => {
     const d = new BubbleDirector();
-    d.next("coder", inputs({ thinking: true, said: speech(1, "old") }), 0, 0, 4);
-    const shown = d.next("coder", inputs({ thinking: true, said: speech(2, "Editing ops.py") }), 1, 1, 4);
+    d.next("coder", inputs({ said: speech(1, "old") }), 0, 0, 4);
+    const shown = d.next("coder", inputs({ said: speech(2, "Editing ops.py") }), 1, 1, 4);
     expect(shown?.text).toBe("Editing ops.py");
   });
 
@@ -71,19 +71,62 @@ describe("BubbleDirector", () => {
     expect(deepLink.next("tester", inputs({ bubble: done, sceneTime: 1_020_000 }), 0, 0, 1)).toBeNull();
   });
 
-  it("turns a coffee break into a countdown", () => {
-    const d = new BubbleDirector();
-    const coffee = inputs({ bubble: speech(3, "Rate limited. Coffee time ☕", { wait: 12 }) });
-    expect(d.next("lead", coffee, 0, 0, 1)?.text).toBe("Rate limited. Coffee time ☕");
-    expect(d.next("lead", coffee, 1.6, 1.6, 1)?.text).toMatch(/^☕ \d+s left$/);
+  it("counts a provider wait down to zero by about when the replay moves on", () => {
+    expect(countdown(12, 0, 1)).toBe(12);
+    // at 4x, a 12s wait is compressed into the replay's 2s maximum gap
+    expect(countdown(12, 1, 4)).toBeCloseTo(6);
+    expect(countdown(12, 2.5, 4)).toBe(0);
   });
 
-  it("prefers news over thinking, and thinking over idle chatter", () => {
+  it("prefers news over idle chatter, and never shows a thought cloud", () => {
     const d = new BubbleDirector();
     expect(d.next("lead", inputs({ say: "Nice view" }), 0, 0, 1)?.text).toBe("Nice view");
     const e = new BubbleDirector();
-    expect(e.next("lead", inputs({ say: "Nice view", thinking: true }), 0, 0, 1)?.style).toBe("thought");
+    expect(e.next("lead", inputs({ say: "Nice view", bubble: speech(4, "Done ✓") }), 0, 0, 1)?.text).toBe("Done ✓");
+    expect(new BubbleDirector().next("coder", inputs(), 0, 0, 1)).toBeNull();
     const f = new BubbleDirector();
     expect(f.next("reviewer", inputs({ say: "Can you fix this?", trip: true, bubble: speech(9, "Not yet") }), 0, 0, 1)?.text).toBe("Can you fix this?");
+  });
+});
+
+describe("status tags and bubbles together", () => {
+  const item = (agent: OverlayItem["agent"], x: number, y: number, tag = true, bubble = false): OverlayItem => ({
+    agent, anchor: { x, y }, tag: tag ? { w: 150, h: 30 } : null, bubble: bubble ? { w: 120, h: 24 } : null,
+  });
+  const boxesOf = (placed: ReturnType<typeof layoutOverlay>, items: OverlayItem[]) =>
+    items.flatMap((i) => [
+      ...(placed[i.agent]?.tag ? [{ agent: i.agent, kind: "tag", left: placed[i.agent]!.tag!.left, top: placed[i.agent]!.tag!.top, w: i.tag!.w, h: i.tag!.h }] : []),
+      ...(placed[i.agent]?.bubble ? [{ agent: i.agent, kind: "bubble", left: placed[i.agent]!.bubble!.left, top: placed[i.agent]!.bubble!.top, w: i.bubble!.w, h: i.bubble!.h + TAIL_PX }] : []),
+    ]);
+
+  it("puts the tag just above the head and the bubble above the tag", () => {
+    const items = [item("coder", 300, 400, true, true)];
+    const placed = layoutOverlay(items, 1000).coder!;
+    expect(placed.tag!.top + 30).toBeLessThanOrEqual(400);
+    expect(placed.tag!.stem).toBeGreaterThanOrEqual(0);
+    expect(placed.tag!.stem).toBeLessThan(6);
+    expect(placed.bubble!.top + 24 + TAIL_PX).toBeLessThanOrEqual(placed.tag!.top);
+  });
+
+  it("stacks tags of agents that are close, so none overlap", () => {
+    // the reviewer standing beside the coder's desk, both with tags and bubbles
+    const items = [item("coder", 300, 400, true, true), item("reviewer", 340, 400, true, true), item("tester", 330, 395)];
+    const placed = layoutOverlay(items, 1000);
+    const boxes = boxesOf(placed, items);
+    expect(boxes).toHaveLength(5);
+    for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+      expect(overlaps(boxes[i], boxes[j]), `${boxes[i].agent} ${boxes[i].kind} vs ${boxes[j].agent} ${boxes[j].kind}`).toBe(false);
+    }
+    // each bubble is still above its own agent's tag, and every stem reaches its head
+    for (const agent of ["coder", "reviewer"] as const) expect(placed[agent]!.bubble!.top).toBeLessThan(placed[agent]!.tag!.top);
+    for (const i of items) expect(placed[i.agent]!.tag!.top + 30 + placed[i.agent]!.tag!.stem).toBeCloseTo(i.anchor.y);
+  });
+
+  it("leaves agents far apart where they are, and handles agents without a tag", () => {
+    const items = [item("lead", 100, 200), item("reviewer", 800, 200, false, true)];
+    const placed = layoutOverlay(items, 1000);
+    expect(placed.lead!.tag!.top).toBe(200 - 30 - 3);
+    expect(placed.reviewer!.tag).toBeNull();
+    expect(placed.reviewer!.bubble!.top).toBe(200 - 24 - TAIL_PX);
   });
 });

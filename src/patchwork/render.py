@@ -214,19 +214,21 @@ class CliRenderer:
 
     def _render_table(self, result: dict[str, Any]) -> None:
         self._section("Agents: tokens and time")
-        rows = [("agent", "model", "steps", "prompt", "completion", "total", "time")]
+        rows = [("agent", "model", "steps", "prompt", "avg prompt", "completion", "total", "time")]
         runs = result["runs"]
         limit = f"/{self.max_steps}" if self.max_steps else ""
         for run in runs:
             r = run["result"]
             rows.append((
                 run["label"], " -> ".join(r.get("models_used") or [run["model"]]), f"{r['steps_used']}{limit}",
-                f"{r['prompt_tokens']:,}",
+                f"{r['prompt_tokens']:,}", _average(r["prompt_tokens"], r.get("llm_calls")),
                 f"{r['completion_tokens']:,}", f"{r['tokens_used']:,}", f"{run['duration_s']:.1f}s",
             ))
+        prompt_total = sum(r["result"]["prompt_tokens"] for r in runs)
+        calls = sum(r["result"].get("llm_calls") or 0 for r in runs)
         rows.append((
             "total", "", str(sum(r["result"]["steps_used"] for r in runs)),
-            f"{sum(r['result']['prompt_tokens'] for r in runs):,}",
+            f"{prompt_total:,}", _average(prompt_total, calls),
             f"{sum(r['result']['completion_tokens'] for r in runs):,}",
             f"{result['total_tokens']:,}", f"{sum(r['duration_s'] for r in runs):.1f}s",
         ))
@@ -286,6 +288,13 @@ def _format_attempt(attempt: dict[str, Any]) -> str:
     if attempt.get("retry"):
         return f"retry {attempt['retry']}: {models} ({attempt['outcome']})"
     return f"{models} (attempt {attempt['attempt']}, {attempt['outcome']})"
+
+
+def _average(prompt_tokens: int, llm_calls: int | None) -> str:
+    """Prompt tokens per LLM call; "-" for runs recorded before calls were counted."""
+    if not llm_calls:
+        return "-"
+    return f"{round(prompt_tokens / llm_calls):,}"
 
 
 def short_model(model: str) -> str:

@@ -13,7 +13,7 @@ from patchwork.tools import fs
 from patchwork.tools.fs import InvalidPython
 from patchwork.tools.shell import run_tests
 
-from scripted import ScriptedLLM, finish, reply, tool_results
+from scripted import ScriptedLLM, finish, reply, results_as_sent, tool_results
 
 MODULE = "".join(f"x{i} = {i}\n" for i in range(1, 21))  # 20 lines
 
@@ -131,7 +131,7 @@ def test_repeated_read_of_unchanged_file_returns_a_short_note(repo: Path):
         reply(("read_file", {"path": "m.py"})),
         finish(),
     ])
-    asyncio.run(_agent(repo, llm).run("go"))
+    asyncio.run(_agent(repo, llm, keep_recent_tool_results=10).run("go"))
     results = tool_results(llm.requests[-1])
     assert results[1] == (
         "[read_file m.py, lines 1-20: unchanged since your read at step 1 (lines 1-20), "
@@ -142,28 +142,32 @@ def test_repeated_read_of_unchanged_file_returns_a_short_note(repo: Path):
     assert results[3].startswith(" 1| x1 = 11")
 
 
-def test_latest_read_of_each_file_survives_trimming(repo: Path):
+def test_trimming_keeps_only_the_latest_read_of_an_edited_file(repo: Path):
     big = "".join(f"line_{i} = {i}\n" for i in range(100))
     (repo / "big.py").write_text(big)
     (repo / "other.py").write_text(big)
     llm = ScriptedLLM(
-        [reply(("read_file", {"path": "big.py"}))]
-        + [reply(("search_code", {"pattern": f"line_{i} ="})) for i in range(4)]
+        [reply(("read_file", {"path": "other.py"})), reply(("read_file", {"path": "big.py"}))]
+        + [reply(("edit_file", {"path": "big.py", "old": "line_99 = 99", "new": "line_99 = 0"}))]
+        + [reply(("search_code", {"pattern": f"line_{i}"})) for i in range(1, 4)]
         + [finish()]
     )
-    asyncio.run(_agent(repo, llm, keep_recent_tool_results=2, keep_recent_views=1).run("go"))
+    asyncio.run(_agent(repo, llm).run("go"))
     results = tool_results(llm.requests[-1])
-    # With only the newest view pinned, the read is trimmed like any other old result.
-    assert results[0].endswith("re-run the tool if you need it]")
+    # A read of a file the agent never edited becomes one line, like any old result.
+    assert results[0] == (
+        "[trimmed: read_file: other.py: lines 1-100 of 100; call the tool again if you need the full output]"
+    )
+    # The latest read of the edited file stays in full, even though it is now stale.
+    assert results[1] == big_read(big)
+    assert results[2].startswith("[trimmed: edit_file: edited big.py at line 100")
+    assert [r.startswith("[trimmed: ") for r in results[3:]] == [True, False, False]
 
-    llm = ScriptedLLM(
-        [reply(("read_file", {"path": "big.py"}))]
-        + [reply(("search_code", {"pattern": f"line_{i} ="})) for i in range(4)]
-        + [finish()]
-    )
-    asyncio.run(_agent(repo, llm, keep_recent_tool_results=2, keep_recent_views=6).run("go"))
-    results = tool_results(llm.requests[-1])
-    assert results[0] == fs.read_file(repo, "big.py")  # pinned in full
+
+def big_read(text: str) -> str:
+    lines = text.splitlines()
+    width = len(str(len(lines)))
+    return "\n".join(f"{n:>{width}}| {line}" for n, line in enumerate(lines, 1)) + f"\n[big.py: lines 1-{len(lines)} of {len(lines)}]"
 
 
 def test_tool_call_written_as_json_text_is_executed(repo: Path):
@@ -236,7 +240,7 @@ def test_unknown_tool_returns_the_tool_list_and_the_run_continues(repo: Path, as
     assert result.success and result.steps_used == 3
     assert tool_results(llm.requests[1])[-1] == (
         "ERROR: unknown tool 'repo_browser.fetch'. The only tools you can call are: "
-        "search_code, read_file, list_dir, edit_file, insert_lines, write_file, finish. Call one of them."
+        "search_code, read_file, list_dir, edit_file, replace_lines, insert_lines, write_file, finish. Call one of them."
     )
 
 
@@ -313,7 +317,7 @@ def test_reads_of_an_unchanged_file_at_other_offsets_get_the_short_note(repo: Pa
     ])
     events = []
     asyncio.run(_agent(repo, llm, on_event=events.append).run("go"))
-    results = tool_results(llm.requests[-1])
+    results = results_as_sent(llm)
     assert results[1] == (
         "[read_file m.py, lines 10-20: unchanged since your read at step 1 (lines 1-20), "
         "which is still in your context above; not repeated]"

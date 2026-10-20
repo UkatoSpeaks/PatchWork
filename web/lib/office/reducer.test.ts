@@ -39,53 +39,56 @@ describe("officeReducer", () => {
     expect(CREW.every((name) => state.agents[name].place === "lounge" && state.agents[name].activity === "idle")).toBe(true);
   });
 
-  it("sends the lead to the whiteboard during planning, then back to the office", () => {
+  it("plans at the lead's cabin desk; the whiteboard shows the plan once it is submitted", () => {
     const planning = after((e) => e.type === "agent_started" && e.agent === "lead");
     expect(planning.phase).toBe("plan");
-    expect(planning.agents.lead.place).toBe("whiteboard");
-    expect(planning.agents.lead.activity).toBe("thinking");
+    expect(planning.agents.lead).toMatchObject({ place: "desk", active: true, activity: "thinking", task: "Task: plan the fix" });
+    const beforeSubmit = reduceEvents(events, events.findIndex((e) => e.type === "agent_finished" && e.agent === "lead"));
+    expect(beforeSubmit.whiteboardLines).toBe(0);
+    expect(beforeSubmit.agents.lead.place).toBe("desk");
     const planned = after((e) => e.type === "agent_finished" && e.agent === "lead");
-    expect(planned.agents.lead.place).toBe("desk");
-    expect(planned.agents.lead.activity).toBe("done");
-    expect(planned.whiteboardLines).toBe(2);
+    expect(planned.agents.lead).toMatchObject({ place: "desk", active: false, activity: "done", task: null });
+    expect(planned.whiteboardLines).toBeGreaterThan(0);
+    expect(planned.subtasks.map((s) => s.role)).toContain("coder");
   });
 
-  it("types with a speech bubble in plain language on tool calls", () => {
+  it("shows tool calls on the status tag, not in speech bubbles", () => {
+    const before = reduceEvents(events, events.findIndex((e) => e.type === "tool_called" && e.agent === "coder" && e.payload.tool === "edit_file"));
     const state = after((e) => e.type === "tool_called" && e.agent === "coder" && e.payload.tool === "edit_file");
     expect(state.agents.coder.activity).toBe("typing");
-    expect(state.agents.coder.bubble).toMatchObject({ style: "speech", seq: 23 });
-    expect(state.agents.coder.bubble?.text).toMatch(/core\.py|One-line fix|editing the code/i);
+    expect(state.agents.coder.action).toMatch(/^Editing .*\.py/);
+    expect(state.agents.coder.bubble).toEqual(before.agents.coder.bubble); // no new bubble
     expect(state.agents.coder.steps).toBe(2);
     const testing = after((e) => e.type === "tool_called" && e.payload.tool === "run_tests");
     expect(testing.agents.tester.activity).toBe("testing");
-    expect(testing.agents.tester.bubble?.text).toMatch(/test|crossed/i);
+    expect(testing.agents.tester.action).toBe("Running tests…");
   });
 
-  it("reports test results in words, and waits for the model in a thought cloud", () => {
+  it("reports test results in words, and goes back to thinking after a tool", () => {
     const result = after((e) => e.type === "tool_result" && e.payload.tool === "run_tests");
     expect(result.agents.tester.bubble?.text).toMatch(/fail|red/i); // the tester's tests fail first, as planned
     const read = after((e) => e.type === "tool_result" && e.agent === "coder");
     expect(read.agents.coder.activity).toBe("thinking");
-    expect(read.agents.coder.bubble).toBeNull();
-    // ...but the line it just said is kept for the overlay
-    expect(read.agents.coder.said?.text).toMatch(/core\.py/);
+    expect(read.agents.coder.action).toBe("Thinking…");
   });
 
-  it("sends rate-limited agents for coffee and back", () => {
+  it("keeps rate-limited agents at their desk, counting the wait down on the tag", () => {
     const throttled = after((e) => e.type === "throttled");
-    expect(throttled.agents.lead.place).toBe("coffee");
+    expect(throttled.agents.lead.place).toBe("desk");
     expect(throttled.agents.lead.activity).toBe("waiting");
-    expect(throttled.agents.lead.bubble).toMatchObject({ style: "speech", wait: 12 });
-    expect(throttled.agents.lead.bubble?.text).toMatch(/coffee|break/i);
+    expect(throttled.agents.lead.wait).toMatchObject({ seconds: 12, model: expect.stringMatching(/^groq\//) });
     const limited = after((e) => e.type === "rate_limited");
-    expect(limited.agents.coder.place).toBe("coffee");
-    expect(limited.agents.coder.bubble?.wait).toBe(8.5);
+    expect(limited.agents.coder.place).toBe("desk");
+    expect(limited.agents.coder.wait?.seconds).toBe(8.5);
+    // No coffee-break bubble: waits are not moments.
+    const before = reduceEvents(events, events.findIndex((e) => e.type === "rate_limited"));
+    expect(limited.agents.coder.bubble).toEqual(before.agents.coder.bubble);
     // The next LLM call ends the wait.
     const index = events.findIndex((e) => e.type === "rate_limited");
     const resumed = reduceEvents(events, index + 2);
     expect(resumed.agents.coder.place).toBe("desk");
     expect(resumed.agents.coder.activity).toBe("thinking");
-    expect(resumed.agents.coder.bubble).toBeNull();
+    expect(resumed.agents.coder.wait).toBeNull();
   });
 
   it("stays put for a short shared cooldown", () => {

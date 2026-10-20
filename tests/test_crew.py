@@ -17,7 +17,7 @@ from patchwork.schemas import Plan, ReviewVerdict
 from patchwork.snapshot import Snapshot
 
 from conftest import TOY_STATS, copy_toy
-from scripted import ScriptedLLM, finish, reply, tool_results
+from scripted import ScriptedLLM, finish, reply, results_as_sent, tool_results
 
 TEST_COMMAND = "python -m pytest -q --tb=short -p no:cacheprovider"
 
@@ -212,7 +212,7 @@ def test_is_test_path(path, allowed):
 
 def test_tester_write_guard_is_enforced_in_the_tool_layer(stats_repo: Path):
     original = (stats_repo / "stats" / "core.py").read_text()
-    edit, _insert, write = write_tools(stats_repo, guard=tests_only)
+    edit, _replace, _insert, write = write_tools(stats_repo, guard=tests_only)
     for tool, args in [
         (write, {"path": "stats/core.py", "content": "pwned"}),
         (write, {"path": "tests/../stats/core.py", "content": "pwned"}),
@@ -416,7 +416,7 @@ def test_tester_does_not_auto_finish_on_syntax_error_or_full_suite(stats_repo: P
         reply(("run_tests", {"path": "tests/test_median.py::test_median_odd"})),
     ])
     result = run(build_tester(repo=stats_repo, settings=settings(), llm=llm))
-    results = tool_results(llm.requests[-1])
+    results = results_as_sent(llm)
     assert results[1].startswith("FAILED (exit 2)") and "SyntaxError" in results[1]
     assert results[3].startswith("FAILED (exit 1): 3 failed, 6 passed")
     assert result.success and result.steps_used == 5

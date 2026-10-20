@@ -4,18 +4,22 @@
 // canvas walks them there tile by tile. Speech is chosen here too (seeded by
 // run id + event seq, see phrases.ts); how long a bubble stays up is the
 // overlay's business (bubbles.ts).
+//
+// Where agents are: an ACTIVE agent (from its agent_started to its
+// agent_finished) sits at its own work spot for the whole task, even while it
+// waits for the provider; its status tag (status.ts) says what it is doing.
+// Speech bubbles are only for moments: a result, a handoff, a model switch,
+// finishing. IDLE agents are free for office life (idle.ts).
 
 import type { CrewAgent, RunEvent } from "../types";
 import { toolName } from "./labels";
 import * as say from "./phrases";
+import { actionPhrase, taskLine, THINKING, type PlannedTask, type Wait } from "./status";
 
 export const CREW: CrewAgent[] = ["lead", "tester", "coder", "reviewer"];
 
 export type Place = "lounge" | "desk" | "whiteboard" | "coffee" | "merge" | "coderDesk" | "celebrate";
 export type Activity = "idle" | "thinking" | "typing" | "testing" | "waiting" | "done" | "failed" | "cancelled";
-
-// Rate-limit waits shorter than this don't send the agent to the coffee machine.
-export const COFFEE_MIN_WAIT_S = 2;
 
 export interface Bubble {
   text: string;
@@ -27,8 +31,6 @@ export interface Bubble {
   ttl?: number;
   // When it was said (ms since the epoch, the event's timestamp).
   at?: number;
-  // A coffee break of this many seconds: the bubble counts it down.
-  wait?: number;
 }
 
 /** One run of an agent (e.g. the coder's first attempt, or retry 2) and the models it used. */
@@ -46,8 +48,16 @@ export interface AgentState {
   model: string | null;
   label: string | null;
   place: Place;
+  // Has a task in the current phase: between its agent_started and agent_finished.
+  active: boolean;
+  // Status tag line 1 (the task, "Task: add slugify()") and line 2 (the current
+  // action, "Reading core.py"); a provider wait replaces line 2 while it lasts.
+  task: string | null;
+  action: string | null;
+  wait: Wait | null;
   // A there-and-back errand (e.g. the reviewer visiting the coder); a new key means a new trip.
-  trip: { to: Place; key: number; say?: string } | null;
+  // `at`: the scene's event count when it was set (a deep link landing just after still plays it).
+  trip: { to: Place; key: number; say?: string; at?: number } | null;
   activity: Activity;
   bubble: Bubble | null;
   // The last speech bubble, kept after `bubble` clears, so a line set and
@@ -90,15 +100,19 @@ export interface SceneState {
   retries: number;
   outcome: "success" | "failure" | null;
   failedAgent: CrewAgent | null;
-  // Plan-phase lead steps, drawn as lines on the whiteboard.
+  // Lines of the submitted plan on the whiteboard (0 until the lead submits it).
   whiteboardLines: number;
+  subtasks: PlannedTask[];
+  // The latest retry_started: its reason and the feedback the coder got.
+  retry: { reason: string; feedback: string } | null;
   events: number;
   tripCounter: number;
 }
 
 function initialAgent(name: CrewAgent): AgentState {
   return {
-    name, inRun: true, model: null, label: null, place: "lounge", trip: null, activity: "idle", bubble: null, said: null,
+    name, inRun: true, model: null, label: null, place: "lounge", active: false, task: null, action: null, wait: null,
+    trip: null, activity: "idle", bubble: null, said: null,
     verdict: null, steps: 0, tokens: 0, totalTokens: 0, runs: 0, attempts: [],
   };
 }
@@ -109,7 +123,8 @@ export function initialScene(): SceneState {
     phase: null, phaseLabel: "waiting", startedAt: null, lastAt: null, totalTokens: 0,
     agents: Object.fromEntries(CREW.map((name) => [name, initialAgent(name)])) as Record<CrewAgent, AgentState>,
     monitor: { status: "idle", passed: null, failed: null, summary: "" },
-    merges: [], reviewRound: 0, retries: 0, outcome: null, failedAgent: null, whiteboardLines: 0, events: 0, tripCounter: 0,
+    merges: [], reviewRound: 0, retries: 0, outcome: null, failedAgent: null, whiteboardLines: 0, subtasks: [], retry: null,
+    events: 0, tripCounter: 0,
   };
 }
 
@@ -120,10 +135,8 @@ const num = (value: unknown, fallback = 0): number => {
 };
 export const FINISHED: Activity[] = ["done", "failed", "cancelled"];
 
-/** Where an agent works while active: the lead plans at the whiteboard. */
-function workPlace(state: SceneState, agent: CrewAgent): Place {
-  return agent === "lead" && state.phase === "plan" ? "whiteboard" : "desk";
-}
+/** Where an agent works while active: its own desk (the lead's is in its cabin). */
+export const WORK_PLACE: Place = "desk";
 
 export const parseTestCounts = say.testCounts;
 
@@ -182,10 +195,7 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
     agents[name] = { ...agents[name], ...patch };
   };
   const actor = isCrew(event.agent) ? event.agent : null;
-  // An agent that does something while at the coffee machine has stopped waiting.
-  const backToWork = (name: CrewAgent): Partial<AgentState> =>
-    agents[name].place === "coffee" ? { place: workPlace(next, name) } : {};
-  const active = (name: CrewAgent) => !FINISHED.includes(agents[name].activity);
+  const active = (name: CrewAgent) => agents[name].active;
   const seed = say.seedOf(state.runId ?? event.run_id, event.seq, event.agent);
   const said = Date.parse(event.timestamp);
   const speech = (text: string, extra: Partial<Bubble> = {}): Bubble => ({
@@ -225,11 +235,19 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       if (!actor) break;
       const label = String(p.label ?? actor);
       const opening = p.escalated === true ? say.escalatedRetryPhrase(seed) : say.startPhrase(actor, label, next.phase, seed);
+      const task = taskLine(actor, label, num(p.retry), next.reviewRound, {
+        mode: next.mode, issue: next.issue, subtasks: next.subtasks, retry: next.retry,
+      });
       update(actor, {
         inRun: true,
         model: p.model ?? agents[actor].model,
         label,
-        place: workPlace(next, actor),
+        place: WORK_PLACE,
+        active: true,
+        task,
+        action: THINKING,
+        wait: null,
+        trip: null,
         activity: "thinking",
         bubble: speech(opening, { ttl: 2.5 }),
         attempts: startAttempt(agents[actor].attempts, actor, p),
@@ -246,56 +264,49 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       // tokens_used is the agent run's running total (usage.total_tokens).
       const tokens = Math.max(a.tokens, num(p.tokens_used));
       const added = tokens - a.tokens;
-      const waiting = a.activity === "waiting";
       update(actor, {
-        ...backToWork(actor),
         steps: Math.max(a.steps, num(p.step)),
         tokens,
         totalTokens: a.totalTokens + added,
         activity: active(actor) ? "thinking" : a.activity,
-        bubble: waiting ? null : a.bubble,
+        // The model replied, so any wait is over.
+        wait: null,
       });
       next.totalTokens = state.totalTokens + added;
-      if (actor === "lead" && next.phase === "plan") next.whiteboardLines = state.whiteboardLines + 1;
       break;
     }
     case "tool_called": {
       if (!actor) break;
       const tool = toolName(p.tool);
       update(actor, {
-        ...backToWork(actor),
         steps: Math.max(agents[actor].steps, num(p.step)),
         activity: tool === "run_tests" ? "testing" : "typing",
-        bubble: speech(say.toolPhrase(tool, p.arguments, seed)),
+        action: actionPhrase(tool, p.arguments),
+        wait: null,
       });
       break;
     }
     case "tool_result": {
       if (!actor) break;
       const a = agents[actor];
-      // Back to waiting for the model (a thought cloud), unless there's news.
-      let bubble: Bubble | null = null;
+      // Back to waiting for the model. Only news gets a bubble: a test result,
+      // or dead code left behind.
+      let bubble = a.bubble;
+      const summary = String(p.summary ?? "");
       if (toolName(p.tool) === "run_tests") {
-        const summary = String(p.summary ?? "");
         bubble = speech(say.testResultPhrase(actor, summary, /^PASSED/i.test(summary.trim()), seed), { ttl: 3 });
-      } else if (p.is_error === true) {
-        bubble = speech(say.toolErrorPhrase(seed), { ttl: 2.5 });
+      } else if (/WARNING: unreachable code/.test(summary)) {
+        bubble = speech(say.deadCodePhrase(seed), { ttl: 3 });
       }
-      update(actor, { activity: active(actor) ? "thinking" : a.activity, bubble });
+      update(actor, { activity: active(actor) ? "thinking" : a.activity, action: active(actor) ? THINKING : null, bubble });
       break;
     }
     case "rate_limited":
     case "throttled": {
       const delay = num(p.delay_s);
       if (!actor || !active(actor) || delay <= 0) break;
-      const coffee = delay >= COFFEE_MIN_WAIT_S;
-      update(actor, {
-        activity: "waiting",
-        bubble: coffee
-          ? speech(say.coffeePhrase(event.type, p.model ?? agents[actor].model, seed), { wait: delay })
-          : { text: say.shortWaitPhrase(seed), style: "thought", seq: event.seq },
-        place: coffee ? "coffee" : agents[actor].place,
-      });
+      // Stays at its desk with a mug; the status tag counts the wait down.
+      update(actor, { activity: "waiting", wait: { seconds: delay, model: p.model ?? agents[actor].model, seq: event.seq } });
       break;
     }
     case "note": {
@@ -307,17 +318,15 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       if (actor && p.kind === "model_switch") {
         const to = p.to_model ?? null;
         update(actor, {
-          ...backToWork(actor),
           model: to ?? agents[actor].model,
           attempts: switchAttempt(agents[actor].attempts, to),
           bubble: speech(say.modelSwitchPhrase(to, seed), { ttl: 3 }),
         });
         break;
       }
-      if (!actor || p.kind !== "finish") break;
-      const tool = toolName(p.tool ?? "finish");
-      if (tool === "auto-finish") break;
-      update(actor, { ...backToWork(actor), bubble: speech(say.toolPhrase(tool, null, seed)) });
+      if (!actor || !active(actor)) break;
+      if (p.kind === "stuck") update(actor, { action: "Going in circles…", wait: null });
+      else if (p.kind === "finish" && toolName(p.tool ?? "finish") !== "auto-finish") update(actor, { action: actionPhrase("finish", null), wait: null });
       break;
     }
     case "agent_finished": {
@@ -329,9 +338,19 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       let bubble: Bubble;
       if (activity === "done" && actor === "lead" && state.phase === "plan" && subtasks) bubble = speech(say.planPhrase(subtasks, seed), { ttl: 3 });
       else if (activity === "done" && actor === "reviewer" && a.verdict && a.bubble) bubble = a.bubble; // keep the verdict up
+      else if (p.stop_reason === "stuck") bubble = speech(say.stuckPhrase(seed), { ttl: 4 });
       else bubble = speech(say.finishPhrase(activity, seed), activity === "failed" ? {} : { ttl: 3 });
+      if (actor === "lead" && subtasks) {
+        // The plan goes up on the meeting-room whiteboard; the lead stays in its cabin.
+        next.subtasks = subtasks.map((s: Record<string, unknown>) => ({ role: String(s.role ?? ""), description: String(s.description ?? "") }));
+        next.whiteboardLines = Math.min(8, 1 + subtasks.length * 2);
+      }
       update(actor, {
-        place: "desk",
+        place: WORK_PLACE,
+        active: false,
+        task: null,
+        action: null,
+        wait: null,
         activity,
         bubble,
         attempts: finishAttempt(a.attempts, p),
@@ -352,7 +371,7 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
       next.merges = [...state.merges, { branch: String(p.branch ?? ""), ok }];
       const owner = String(p.branch ?? "").split("/").pop();
       for (const name of ["tester", "coder"] as const) {
-        if (!agents[name].inRun) continue;
+        if (!agents[name].inRun || agents[name].active) continue;
         update(name, { place: "merge", ...(owner === name ? { bubble: speech(say.mergePhrase(name, ok, seed), { ttl: 2.5 }) } : {}) });
       }
       break;
@@ -368,8 +387,10 @@ export function officeReducer(state: SceneState, event: RunEvent): SceneState {
     }
     case "retry_started": {
       next.retries = num(p.attempt, state.retries + 1);
+      next.retry = { reason: String(p.reason ?? ""), feedback: String(p.feedback ?? "") };
       next.tripCounter = state.tripCounter + 1;
-      if (agents.reviewer.inRun) update("reviewer", { trip: { to: "coderDesk", key: next.tripCounter, say: say.retryAskPhrase(seed) } });
+      // After a rejection, the idle reviewer walks over to hand over its notes; it never leaves a task to do so.
+      if (p.reason === "review" && agents.reviewer.inRun && !agents.reviewer.active) update("reviewer", { trip: { to: "coderDesk", key: next.tripCounter, say: say.retryAskPhrase(seed), at: next.events } });
       break;
     }
     case "run_finished": {

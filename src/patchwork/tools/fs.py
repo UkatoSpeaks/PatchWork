@@ -14,6 +14,7 @@ import os
 import re
 import warnings
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from pydantic import BaseModel
 
@@ -121,20 +122,25 @@ def read_file(
 def write_file(root: str | os.PathLike[str], path: str, content: str) -> str:
     """Create or overwrite a file (parent directories are created).
 
-    The result shows the changed region, plus a warning if a .py file now
-    defines a top-level name twice.
+    The result shows the changed region, plus warnings if a .py file now
+    defines a top-level name twice or has unreachable code.
     """
-    return _write_file(root, path, content) + _duplicate_warning(root, path)
+    return _write_file(root, path, content) + _python_warnings(root, path)
 
 
-def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> str:
-    """Replace the single exact occurrence of ``old`` with ``new``; see ``_edit_file``."""
-    return _edit_file(root, path, old, new) + _duplicate_warning(root, path)
+def edit_file(root: str | os.PathLike[str], path: str, old: str, new: str, near_line: int | None = None) -> str:
+    """Replace one exact occurrence of ``old`` with ``new``; see ``_edit_file``."""
+    return _edit_file(root, path, old, new, near_line) + _python_warnings(root, path)
 
 
 def insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text: str) -> str:
     """Insert ``text`` after line ``after_line``; see ``_insert_lines``."""
-    return _insert_lines(root, path, after_line, text) + _duplicate_warning(root, path)
+    return _insert_lines(root, path, after_line, text) + _python_warnings(root, path)
+
+
+def replace_lines(root: str | os.PathLike[str], path: str, start_line: int, end_line: int, text: str) -> str:
+    """Replace lines ``start_line``..``end_line`` with ``text``; see ``_replace_lines``."""
+    return _replace_lines(root, path, start_line, end_line, text) + _python_warnings(root, path)
 
 
 def duplicate_definitions(text: str) -> dict[str, list[int]]:
@@ -166,15 +172,56 @@ def _decorator_name(node: ast.expr) -> str:
     return node.id if isinstance(node, ast.Name) else ""
 
 
-def _duplicate_warning(root: str | os.PathLike[str], path: str) -> str:
+class Unreachable(NamedTuple):
+    first: int
+    last: int
+    # The statement that ends the block: "return", "raise", "continue" or "break".
+    after: str
+    after_line: int
+
+
+_TERMINATORS = {ast.Return: "return", ast.Raise: "raise", ast.Continue: "continue", ast.Break: "break"}
+
+
+def unreachable_code(text: str) -> list[Unreachable]:
+    """Statements that follow a return/raise/continue/break in the same block."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    found: list[Unreachable] = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list) or not block or not isinstance(block[0], ast.stmt):
+                continue
+            for index, stmt in enumerate(block[:-1]):
+                kind = _TERMINATORS.get(type(stmt))
+                if kind is not None:
+                    rest = block[index + 1:]
+                    last = max(s.end_lineno or s.lineno for s in rest)
+                    found.append(Unreachable(rest[0].lineno, last, kind, stmt.lineno))
+                    break
+    return sorted(found)
+
+
+def _python_warnings(root: str | os.PathLike[str], path: str) -> str:
+    """Warnings for a .py file just written: duplicate top-level definitions and
+    unreachable code. The file has been written either way."""
     target = resolve_in_root(root, path)
     if target.suffix != ".py" or not target.is_file():
         return ""
+    text = _read_text(target)
     notes = []
-    for name, lines in duplicate_definitions(_read_text(target)).items():
+    for name, lines in duplicate_definitions(text).items():
         times = "twice" if len(lines) == 2 else f"{len(lines)} times"
         where = ", ".join(str(n) for n in lines[:-1]) + f" and {lines[-1]}"
         notes.append(f"WARNING: {name} is now defined {times} (lines {where}); remove one")
+    for dead in unreachable_code(text):
+        where = f"line {dead.first} is" if dead.first == dead.last else f"lines {dead.first}-{dead.last} are"
+        notes.append(f"WARNING: {where} unreachable (after the {dead.after} on line {dead.after_line})")
     return "".join("\n" + note for note in notes)
 
 
@@ -206,8 +253,9 @@ def _write_file(root: str | os.PathLike[str], path: str, content: str) -> str:
     return head + f"; changed lines {first}-{last}:\n" + render_region(lines, first, last)
 
 
-def _edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> str:
-    """Replace the single exact occurrence of ``old`` with ``new``.
+def _edit_file(root: str | os.PathLike[str], path: str, old: str, new: str, near_line: int | None = None) -> str:
+    """Replace the single exact occurrence of ``old`` with ``new``; with
+    ``near_line``, the occurrence closest to that line when there are several.
 
     Much cheaper in tokens than rewriting a whole file. Matching ignores CRLF
     vs LF; the file keeps its original line endings. A .py file is only
@@ -232,12 +280,12 @@ def _edit_file(root: str | os.PathLike[str], path: str, old: str, new: str) -> s
             old_n, new_n, count = stripped_old, stripped_new if stripped_new is not None else new_n, 1
     if count == 0:
         raise ValueError(_not_found_message(rel, text, old_n))
+    index = text.index(old_n)
     if count > 1:
         starts = [m.start() for m in re.finditer(re.escape(old_n), text)]
-        lines_at = ", ".join(str(text[:i].count("\n") + 1) for i in starts[:10])
-        raise ValueError(f"old text occurs {count} times in {rel} (at lines {lines_at}); include more context")
-
-    index = text.index(old_n)
+        if near_line is None:
+            raise ValueError(_ambiguous_message(rel, text, old_n, starts))
+        index = min(starts, key=lambda i: (abs(text[:i].count("\n") + 1 - near_line), i))
     updated = text[:index] + new_n + text[index + len(old_n):]
     check_python(rel, updated)
     _write_text(target, updated, crlf)
@@ -278,6 +326,56 @@ def _insert_lines(root: str | os.PathLike[str], path: str, after_line: int, text
     return (
         f"inserted {count} line(s) into {rel} after line {position}; it now reads:\n"
         + render_region(updated.splitlines(), position + 1, position + count)
+    )
+
+
+def _ambiguous_message(rel: str, text: str, old: str, starts: list[int]) -> str:
+    lines_at = [text[:i].count("\n") + 1 for i in starts]
+    shown = ", ".join(str(n) for n in lines_at[:10]) + (", ..." if len(lines_at) > 10 else "")
+    # Suggest the last occurrence: a stray copy is usually the later one.
+    first = lines_at[-1]
+    last = first + len(old.rstrip("\n").split("\n")) - 1
+    return (
+        f"old text occurs {len(starts)} times in {rel} (at lines {shown}). Pass near_line to pick one "
+        f"(e.g. near_line={first}), or use replace_lines({rel}, {first}, {last}, '') to delete lines "
+        f"{first}-{last} (or pass the new text instead of ''), or include more context"
+    )
+
+
+def _replace_lines(root: str | os.PathLike[str], path: str, start_line: int, end_line: int, text: str) -> str:
+    """Replace 1-based lines ``start_line``..``end_line`` (inclusive) with
+    ``text``; an empty ``text`` deletes them.
+
+    Like edit_file: keeps line endings, refuses unparseable .py results, and
+    returns the changed region, numbered.
+    """
+    target = resolve_in_root(root, path)
+    if not target.is_file():
+        raise _not_a_file(root, path, target)
+    rel = _rel_of(root, target)
+    crlf = _is_crlf(target)
+    lines = _to_lf(_read_text(target)).splitlines(keepends=True)
+    if not 1 <= start_line <= end_line <= len(lines):
+        raise ValueError(
+            f"need 1 <= start_line <= end_line <= {len(lines)} ({rel} has {len(lines)} lines); "
+            f"got start_line={start_line}, end_line={end_line}"
+        )
+    new = _to_lf(text)
+    if new and not new.endswith("\n"):
+        new += "\n"
+    updated = "".join(lines[:start_line - 1]) + new + "".join(lines[end_line:])
+    check_python(rel, updated)
+    _write_text(target, updated, crlf)
+
+    span = f"line {start_line}" if start_line == end_line else f"lines {start_line}-{end_line}"
+    added = new.count("\n")
+    now = updated.splitlines()
+    if added == 0:
+        # Show the lines that closed up around the gap.
+        return f"deleted {span} of {rel}; it now reads:\n" + render_region(now, start_line, start_line - 1)
+    return (
+        f"replaced {span} of {rel} with {added} line(s); it now reads:\n"
+        + render_region(now, start_line, start_line + added - 1)
     )
 
 

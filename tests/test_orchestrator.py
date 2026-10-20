@@ -604,3 +604,51 @@ def test_retry_model_settings():
     big = settings(coder_retry_model="big", coder_fallbacks="big,a")
     assert (big.coder_retry_model_or_default(), big.coder_retry_fallbacks_or_default()) == ("big", ["a"])
     assert settings(coder_retry_model="big", coder_retry_fallbacks="c").coder_retry_fallbacks_or_default() == ["c"]
+
+
+def test_a_stuck_retry_counts_and_the_run_moves_on_to_the_next_retry(stats_git: Path):
+    # Retry 1 keeps failing the same way (different arguments, so the repeated-call guard never trips).
+    stuck = [reply(("edit_file", {"path": "stats/core.py", "old": f"no such text {n}", "new": "x"})) for n in range(3)]
+    fix = [
+        reply(("edit_file", {"path": "stats/core.py", "old": "    ordered = sorted(values)",
+                             "new": "    ordered = sorted(values)  # copy; input is not modified"})),
+        reply(("run_tests", {})),
+        finish(summary="addressed review"),
+    ]
+    result, events, llm, lines = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script() + stuck + fix,
+         "reviewer": [submit_review(approved=False, issues=[BLOCKER], summary="Needs work."), submit_review()]},
+    )
+    assert result.success and result.retries == 2
+    assert [(a.retry, a.outcome, a.stop_reason) for a in result.attempts] == [
+        (0, "passed", "finished"), (1, "failed", "stuck"), (2, "passed", "finished")]
+    retry_1 = next(r for r in result.runs if r.label.startswith("coder (retry 1"))
+    assert retry_1.result.steps_used == 3
+    assert retry_1.result.summary.startswith("stuck: edit_file failed 3 times in a row with the same error")
+    # Retry 1 changed nothing, so retry 2 starts straight away with the same feedback:
+    # no second suite run or review in between.
+    assert [e.payload["attempt"] for e in of(events, "retry_started")] == [1, 2]
+    assert of(events, "retry_started")[1].payload["feedback"] == of(events, "retry_started")[0].payload["feedback"]
+    assert [e.payload["approved"] for e in of(events, "review_verdict")] == [False, True]
+    assert len(of(events, "tests_run")) == 2
+    assert any(e.payload.get("kind") == "retry_unchanged" for e in of(events, "note", "orchestrator"))
+    assert "retry 1 failed (stuck) and changed nothing; trying again with the same feedback" in lines
+    assert any(e.payload.get("kind") == "stuck" for e in of(events, "note", "coder"))
+    # The final table reports the average prompt size per agent run.
+    header = next(line for line in lines if line.startswith("agent "))
+    assert "avg prompt" in header
+    assert any(line.startswith("coder (retry 1: review)") and "  100  " in line for line in lines)
+
+
+def test_a_stuck_last_retry_ends_the_run(stats_git: Path):
+    stuck = [reply(("edit_file", {"path": "stats/core.py", "old": f"no such text {n}", "new": "x"})) for n in range(3)]
+    result, events, *_ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script() + stuck,
+         "reviewer": [submit_review(approved=False, issues=[BLOCKER], summary="Needs work.")]},
+        max_retries=1,
+    )
+    assert not result.success and result.failed_agent is None and result.retries == 1
+    assert result.attempts[-1].stop_reason == "stuck"
+    assert of(events, "note", "orchestrator")[-1].payload["kind"] == "retry_limit"
