@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from patchwork.server import MAX_GAP_S, create_app, replay
+from patchwork.server import MAX_GAP_S, EventTail, create_app, follow
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "runs"
 RUN_ID = "20261019-120000-f1x7"
@@ -67,6 +68,9 @@ def test_list_runs_newest_first_skipping_empty(client: TestClient) -> None:
     assert done["started_at"] == "2026-10-19T06:30:00.000+00:00"
     # In progress: no result yet, tokens summed from agent_finished events.
     assert live["success"] is None and live["finished"] is False
+    assert done["status"] == "finished"
+    # No run lock names it, so it crashed or was killed.
+    assert live["status"] == "stopped"
     assert live["total_tokens"] == 2540
 
 
@@ -119,7 +123,7 @@ def test_cors_allows_the_dev_frontend(client: TestClient) -> None:
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
 
 
-def test_replay_scales_gaps_and_caps_them(monkeypatch) -> None:
+def test_replay_scales_gaps_and_caps_them(monkeypatch, tmp_path: Path) -> None:
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -132,9 +136,69 @@ def test_replay_scales_gaps_and_caps_them(monkeypatch) -> None:
         {"type": "note", "timestamp": "2026-10-19T06:30:04.000+00:00"},  # no gap, no sleep
         {"type": "note", "timestamp": "2026-10-19T06:31:04.000+00:00"},  # 60s / 4 = 15s, capped
     ]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
     async def collect() -> list[str]:
-        return [frame async for frame in replay(events, speed=4)]
+        return [frame async for frame in follow(path, speed=4, start=0, alive=lambda: False)]
 
     frames = asyncio.run(collect())
     assert sleeps == [1.0, MAX_GAP_S]
     assert len(frames) == 5 and frames[-1].startswith("event: end")
+
+
+def test_a_run_holding_the_lock_with_a_live_process_is_running(client: TestClient, runs: Path) -> None:
+    (runs / ".patchwork.lock").write_text(json.dumps({"pid": os.getpid(), "run_id": "20261019-140000-live"}))
+    assert client.get("/api/runs").json()[0]["status"] == "running"
+    assert client.get("/api/runs/20261019-140000-live").json()["summary"]["status"] == "running"
+    # A lock whose process is gone doesn't count.
+    (runs / ".patchwork.lock").write_text(json.dumps({"pid": 999_999_999, "run_id": "20261019-140000-live"}))
+    assert client.get("/api/runs").json()[0]["status"] == "stopped"
+
+
+def test_event_tail_returns_only_new_complete_lines(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"type": "a"}\n{"type": "b"', encoding="utf-8")
+    tail = EventTail(path)
+    assert [e["type"] for e in tail.read_new()] == ["a"]
+    assert tail.read_new() == []
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('}\nnot json\n{"type": "c"}\n')
+    assert [e["type"] for e in tail.read_new()] == ["b", "c"]
+
+
+def _event(seq: int, type: str = "note") -> str:
+    return json.dumps({"seq": seq, "type": type, "agent": "orchestrator", "timestamp": "2026-10-19T06:30:00+00:00"}) + "\n"
+
+
+def test_follow_goes_live_then_sends_new_events_until_the_run_stops(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text(_event(1) + _event(2), encoding="utf-8")
+    state = {"alive": True}
+
+    async def run() -> list[tuple[str, dict]]:
+        frames: list[str] = []
+        stream = follow(path, speed=0, start=0, alive=lambda: state["alive"], poll_s=0.01)
+        async for frame in stream:
+            frames.append(frame)
+            if frame.startswith("event: live"):
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(_event(3))
+            elif '"seq": 3' in frame:
+                state["alive"] = False
+        return parse_sse("".join(frames))
+
+    frames = asyncio.run(run())
+    assert [name for name, _ in frames] == ["message", "message", "live", "message", "end"]
+    assert [data["seq"] for name, data in frames if name == "message"] == [1, 2, 3]
+    assert frames[-1] == ("end", {"events": 3})
+
+
+def test_follow_ends_at_run_finished_even_while_alive(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text(_event(1) + _event(2, "run_finished"), encoding="utf-8")
+
+    async def run() -> list[tuple[str, dict]]:
+        return parse_sse("".join([f async for f in follow(path, speed=0, start=0, alive=lambda: True, poll_s=0.01)]))
+
+    assert [name for name, _ in asyncio.run(run())] == ["message", "message", "end"]
