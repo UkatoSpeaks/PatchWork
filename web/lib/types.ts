@@ -32,6 +32,8 @@ export interface RunEvent {
   payload: Record<string, any>;
 }
 
+export type RunStatus = "finished" | "running" | "stopped";
+
 export interface RunSummary {
   run_id: string;
   started_at: string | null;
@@ -40,6 +42,8 @@ export interface RunSummary {
   issue: string;
   success: boolean | null;
   finished: boolean;
+  // finished: has a result; running: its process is alive; stopped: it crashed or was killed
+  status: RunStatus;
   total_tokens: number;
   duration_s: number | null;
   events: number;

@@ -79,7 +79,11 @@ body {
   user-select: none;
 }
 
-.pixel-btn:hover {
+.pixel-btn:disabled {
+  cursor: not-allowed;
+}
+
+.pixel-btn:hover:not(:disabled) {
   background: #fff6dc;
 }
 
@@ -326,4 +330,25 @@ body {
 .pixel-scroll {
   scrollbar-width: thin;
   scrollbar-color: var(--color-ink-soft) var(--color-cream-dark);
+}
+
+/* Blinking square for LIVE badges. */
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: currentColor;
+  animation: live-blink 1.2s steps(1) infinite;
+}
+
+@keyframes live-blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot {
+    animation: none;
+  }
 }

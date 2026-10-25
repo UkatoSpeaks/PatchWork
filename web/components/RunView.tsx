@@ -7,7 +7,7 @@ import { fileRoles } from "@/lib/diff";
 import { logEntries, type LogFilter } from "@/lib/log";
 import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
 import { agentStats, phaseDurations, phaseSegments } from "@/lib/stats";
-import type { CrewAgent, Plan, RunDetail, RunEvent } from "@/lib/types";
+import type { CrewAgent, Plan, RunDetail, RunEvent, RunStatus } from "@/lib/types";
 
 import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
@@ -35,7 +35,9 @@ const typing = (target: EventTarget | null) =>
 /**
  * Replays a run. Normal playback streams events over SSE (/stream) and feeds
  * them to the reducer one by one; seeking rebuilds the scene by reducing
- * events[0..n] from the full log fetched once (/events).
+ * events[0..n] from the log fetched once (/events). For a run that is still
+ * going, the stream turns live once it has caught up: new events are appended
+ * to the log as the run writes them. A running run opens live.
  */
 export default function RunView({ id }: { id: string }) {
   const [events, setEvents] = useState<RunEvent[] | null>(null);
@@ -51,6 +53,8 @@ export default function RunView({ id }: { id: string }) {
   const [selected, setSelected] = useState<CrewAgent | null>(null);
   const [logFilter, setLogFilter] = useState<LogFilter>("all");
   const [tab, setTab] = useState<InfoTab>("plan");
+  const [live, setLive] = useState(false);
+  const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
   const indexRef = useRef(0);
   const closeRef = useRef<(() => void) | null>(null);
   const panelsRef = useRef<HTMLElement>(null);
@@ -58,7 +62,24 @@ export default function RunView({ id }: { id: string }) {
   const stop = useCallback(() => {
     closeRef.current?.();
     closeRef.current = null;
+    setLive(false);
   }, []);
+
+  /** Re-read the run detail (status, result with the diff), e.g. once a live run ends. */
+  const refreshDetail = useCallback(
+    (retry = true) => {
+      fetchRun(id).then(
+        (d) => {
+          setDetail(d);
+          setRunStatus(d.summary.status);
+          // result.json is written just after the run_finished line; try once more if we beat it.
+          if (retry && d.summary.status === "finished" && !d.result) setTimeout(() => refreshDetail(false), 1500);
+        },
+        () => undefined,
+      );
+    },
+    [id],
+  );
 
   const start = useCallback(
     (from: number, atSpeed: number) => {
@@ -67,31 +88,46 @@ export default function RunView({ id }: { id: string }) {
         onEvent: (event, i) => {
           // Ignore anything that doesn't follow on from where we are (e.g. after a seek).
           if (i !== indexRef.current) return;
+          // Events past the end of the log we loaded are new: the run wrote them just now.
+          setEvents((prev) => (prev && i === prev.length ? [...prev, event] : prev));
           indexRef.current = i + 1;
           setIndex(i + 1);
           setScene((s) => officeReducer(s, event));
         },
+        onLive: () => {
+          setLive(true);
+          setRunStatus("running");
+        },
         onEnd: () => {
           closeRef.current = null;
+          setLive(false);
           setPlaying(false);
+          refreshDetail();
         },
         onError: () => {
           closeRef.current = null;
+          setLive(false);
           setPlaying(false);
           setError(`lost the event stream from ${API_URL}`);
         },
       });
+      setError(null);
       setPlaying(true);
     },
-    [id, stop],
+    [id, stop, refreshDetail],
   );
 
   useEffect(() => {
     let cancelled = false;
+    // The detail (plan, result with the diff, status) is optional: the scene works without it.
+    const detailLoaded = fetchRun(id).catch(() => null);
     fetchEvents(id).then(
-      (loaded) => {
+      async (loaded) => {
+        const d = await detailLoaded;
         if (cancelled) return;
         setEvents(loaded);
+        setDetail(d);
+        setRunStatus(d?.summary.status ?? null);
         // ?tab=plan|diff|stats opens that panel.
         const tabParam = new URLSearchParams(window.location.search).get("tab");
         if (tabParam === "plan" || tabParam === "diff" || tabParam === "stats") setTab(tabParam);
@@ -103,14 +139,19 @@ export default function RunView({ id }: { id: string }) {
           setIndex(target);
           setScene(reduceEvents(loaded, target));
           setSnapKey((k) => k + 1);
+        } else if (d?.summary.status === "running") {
+          // Still going: show where it is now and follow it.
+          indexRef.current = loaded.length;
+          setIndex(loaded.length);
+          setScene(reduceEvents(loaded, loaded.length));
+          setSnapKey((k) => k + 1);
+          start(loaded.length, 0);
         } else {
           start(0, 4);
         }
       },
       (e: Error) => !cancelled && setError(e.message),
     );
-    // The detail (plan, result with the diff) is optional: the scene works without it.
-    fetchRun(id).then((d) => !cancelled && setDetail(d), () => undefined);
     return () => {
       cancelled = true;
       stop();
@@ -132,11 +173,26 @@ export default function RunView({ id }: { id: string }) {
     [events, playing, speed, start, stop],
   );
 
+  /** Jump to the newest event and follow the run from there. */
+  const goLive = () => {
+    if (!events) return;
+    stop();
+    const n = events.length;
+    indexRef.current = n;
+    setIndex(n);
+    setScene(reduceEvents(events, n));
+    setSnapKey((k) => k + 1);
+    // Speed 0: anything written since we loaded the log arrives at once.
+    start(n, 0);
+  };
+
   const playPause = () => {
     if (!events) return;
     if (playing) {
       stop();
       setPlaying(false);
+    } else if (indexRef.current >= events.length && runStatus === "running") {
+      goLive();
     } else if (indexRef.current >= events.length) {
       seek(0, true);
     } else {
@@ -164,9 +220,9 @@ export default function RunView({ id }: { id: string }) {
     panelsRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   };
 
-  // Keyboard: space plays / pauses, left / right step one event, 1-4 pick the speed.
-  const keys = useRef({ playPause, seek, changeSpeed, index });
-  keys.current = { playPause, seek, changeSpeed, index };
+  // Keyboard: space plays / pauses, left / right step one event, 1-4 pick the speed, L goes live.
+  const keys = useRef({ playPause, seek, changeSpeed, goLive, index, canGoLive: false });
+  keys.current = { playPause, seek, changeSpeed, goLive, index, canGoLive: runStatus === "running" && !live };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey || typing(event.target)) return;
@@ -179,6 +235,8 @@ export default function RunView({ id }: { id: string }) {
         k.seek(k.index + (event.key === "ArrowLeft" ? -1 : 1), false);
       } else if (/^[1-4]$/.test(event.key)) {
         k.changeSpeed(SPEEDS[Number(event.key) - 1]);
+      } else if ((event.key === "l" || event.key === "L") && k.canGoLive) {
+        k.goLive();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -205,7 +263,7 @@ export default function RunView({ id }: { id: string }) {
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-8 [&>*]:min-w-0">
-      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} />
+      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} live={live} status={runStatus} />
       <OfficeCanvas
         scene={scene}
         snapKey={snapKey}
@@ -224,12 +282,22 @@ export default function RunView({ id }: { id: string }) {
         total={events?.length ?? 0}
         current={events ? describe(events[index - 1]) : "loading events…"}
         phases={phases}
+        live={live}
+        canGoLive={runStatus === "running" && !live}
+        onGoLive={goLive}
         onPlayPause={playPause}
         onRestart={() => seek(0, true)}
         onSpeed={changeSpeed}
         onSeek={(n) => seek(n)}
       />
-      {error && <p className="font-pixel text-sm text-terracotta">{error}</p>}
+      {error && (
+        <p className="flex flex-wrap items-center gap-3 font-pixel text-sm text-terracotta" role="alert">
+          {error}
+          <button type="button" className="pixel-btn px-2 py-0.5 text-xs text-ink" onClick={() => start(indexRef.current, speed)}>
+            ↻ reconnect
+          </button>
+        </p>
+      )}
       <section aria-label="Agents" className="flex flex-wrap gap-8">
         {shown.map((name) => (
           <AgentCard

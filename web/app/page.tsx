@@ -6,12 +6,23 @@ import { useEffect, useState } from "react";
 import { API_URL, fetchRuns, formatDuration, formatTokens, modeLabel } from "@/lib/api";
 import type { RunSummary } from "@/lib/types";
 
+// How often the list is re-read: quickly while a run is going, slowly otherwise.
+const REFRESH_RUNNING_MS = 3000;
+const REFRESH_IDLE_MS = 10000;
+
 function OutcomeBadge({ run }: { run: RunSummary }) {
-  const [label, color] =
-    run.success === true ? ["PASS", "bg-moss text-paper"]
-    : run.success === false ? ["FAIL", "bg-terracotta text-paper"]
-    : ["UNFINISHED", "bg-cream-dark text-ink"];
-  return <span className={`pixel-box-sm px-2 py-0.5 font-pixel text-xs font-bold tracking-wider ${color}`}>{label}</span>;
+  if (run.status === "running") {
+    return (
+      <span className="pixel-box-sm inline-flex items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper">
+        <span aria-hidden className="live-dot" /> LIVE
+      </span>
+    );
+  }
+  const [label, color, title] =
+    run.success === true ? ["PASS", "bg-moss text-paper", "Tests pass and the reviewer approved"]
+    : run.success === false ? ["FAIL", "bg-terracotta text-paper", "The run finished without a fix"]
+    : ["STOPPED", "bg-[#9a948c] text-paper", "The run ended without a result: it crashed or was stopped"];
+  return <span title={title} className={`pixel-box-sm px-2 py-0.5 font-pixel text-xs font-bold tracking-wider ${color}`}>{label}</span>;
 }
 
 function formatStart(iso: string | null): string {
@@ -56,15 +67,49 @@ export default function RunsPage() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [stale, setStale] = useState(false);
+  const running = runs?.some((r) => r.status === "running") ?? false;
+
+  // Load the list, then keep it fresh so new and live runs show up without a reload.
   useEffect(() => {
-    fetchRuns().then(setRuns, (e: Error) => setError(e.message));
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let loadedOnce = false;
+    const load = () => {
+      fetchRuns().then(
+        (loaded) => {
+          if (cancelled) return;
+          loadedOnce = true;
+          setRuns(loaded);
+          setError(null);
+          setStale(false);
+          timer = setTimeout(load, loaded.some((r) => r.status === "running") ? REFRESH_RUNNING_MS : REFRESH_IDLE_MS);
+        },
+        (e: Error) => {
+          if (cancelled) return;
+          // Keep showing the list we have; only a first load failure replaces it.
+          if (loadedOnce) setStale(true);
+          else setError(e.message);
+          timer = setTimeout(load, REFRESH_IDLE_MS);
+        },
+      );
+    };
+    load();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   return (
     <section className="pt-4">
       <h1 className="mb-1 font-pixel text-xl font-bold">Runs</h1>
-      <p className="mb-8 text-sm text-ink-soft">Pick a run to watch the crew replay it in the office.</p>
-      {error && (
+      <p className="mb-8 text-sm text-ink-soft">
+        Pick a run to watch the crew replay it in the office.
+        {running && " A LIVE run opens at the present moment and follows along."}
+        {stale && <span className="ml-2 font-pixel text-terracotta">(lost the API, retrying…)</span>}
+      </p>
+      {error && !runs && (
         <div className="pixel-box bg-paper p-5 text-sm">
           <p className="font-pixel text-base font-bold text-terracotta">Can&apos;t reach the API</p>
           <p className="mt-2">

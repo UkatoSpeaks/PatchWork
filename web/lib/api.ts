@@ -14,11 +14,15 @@ export const fetchRuns = () => getJson<RunSummary[]>("/api/runs");
 export const fetchRun = (id: string) => getJson<RunDetail>(`/api/runs/${encodeURIComponent(id)}`);
 export const fetchEvents = (id: string) => getJson<RunEvent[]>(`/api/runs/${encodeURIComponent(id)}/events`);
 
-/** Replay events[start..] over SSE at `speed` (0: as fast as possible). Returns a close function. */
+/**
+ * Replay events[start..] over SSE at `speed` (0: as fast as possible). For a run
+ * that is still going, `onLive` fires once the replay has caught up; after that,
+ * new events arrive as the run writes them. Returns a close function.
+ */
 export function streamEvents(
   id: string,
   { speed, start }: { speed: number; start: number },
-  handlers: { onEvent: (event: RunEvent, index: number) => void; onEnd: () => void; onError: () => void },
+  handlers: { onEvent: (event: RunEvent, index: number) => void; onLive?: () => void; onEnd: () => void; onError: () => void },
 ): () => void {
   const url = `${API_URL}/api/runs/${encodeURIComponent(id)}/stream?speed=${speed}&start=${start}`;
   const source = new EventSource(url);
@@ -31,6 +35,9 @@ export function streamEvents(
     if (closed) return;
     handlers.onEvent(JSON.parse(message.data) as RunEvent, Number(message.lastEventId));
   };
+  source.addEventListener("live", () => {
+    if (!closed) handlers.onLive?.();
+  });
   source.addEventListener("end", () => {
     close();
     handlers.onEnd();

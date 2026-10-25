@@ -2,6 +2,33 @@ import Link from "next/link";
 
 import { formatDuration, formatTokens, modeLabel } from "@/lib/api";
 import { elapsedSeconds, type SceneState } from "@/lib/office/reducer";
+import type { RunStatus } from "@/lib/types";
+
+/** LIVE while following a running run; RUNNING when it runs but we're replaying the past; STOPPED when it died. */
+function StatusBadge({ live, status }: { live: boolean; status: RunStatus | null }) {
+  if (live) {
+    return (
+      <span className="pixel-box-sm inline-flex shrink-0 items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper" title="Following the run as it happens">
+        <span aria-hidden className="live-dot" /> LIVE
+      </span>
+    );
+  }
+  if (status === "running") {
+    return (
+      <span className="pixel-box-sm shrink-0 bg-mustard px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-ink" title="The run is still going; you're watching an earlier moment">
+        RUNNING
+      </span>
+    );
+  }
+  if (status === "stopped") {
+    return (
+      <span className="pixel-box-sm shrink-0 bg-[#9a948c] px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper" title="The run ended without a result: it crashed or was stopped">
+        STOPPED
+      </span>
+    );
+  }
+  return null;
+}
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -12,7 +39,13 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-export default function TopBar({ runId, scene, issue }: { runId: string; scene: SceneState; issue: string }) {
+export default function TopBar({ runId, scene, issue, live, status }: {
+  runId: string;
+  scene: SceneState;
+  issue: string;
+  live: boolean;
+  status: RunStatus | null;
+}) {
   const phaseColor =
     scene.outcome === "success" ? "bg-moss text-paper" : scene.outcome === "failure" ? "bg-terracotta text-paper" : "bg-mustard text-ink";
   const text = (issue || scene.issue).trim();
@@ -27,6 +60,9 @@ export default function TopBar({ runId, scene, issue }: { runId: string; scene: 
             {oneLine}
           </p>
         )}
+        <span className="ml-auto shrink-0">
+          <StatusBadge live={live} status={status} />
+        </span>
       </div>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-5">
         <Stat label="run">{runId}</Stat>

@@ -11,13 +11,18 @@ interface Props {
   total: number;
   current: string;
   phases: PhaseSegment[];
+  // following a running run as it happens
+  live: boolean;
+  // the run is still going but we're not at its newest event
+  canGoLive: boolean;
+  onGoLive: () => void;
   onPlayPause: () => void;
   onRestart: () => void;
   onSpeed: (speed: number) => void;
   onSeek: (index: number) => void;
 }
 
-export default function ReplayControls({ playing, speed, index, total, current, phases, onPlayPause, onRestart, onSpeed, onSeek }: Props) {
+export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek }: Props) {
   return (
     <div className="pixel-box flex flex-col gap-4 bg-paper p-4">
       <div className="flex flex-wrap items-center gap-4">
@@ -27,14 +32,25 @@ export default function ReplayControls({ playing, speed, index, total, current, 
         <button type="button" className="pixel-btn px-3 py-1.5 text-sm" onClick={onRestart}>
           ↺ restart
         </button>
-        <div className="flex items-center gap-3" role="group" aria-label="Replay speed">
+        {live && (
+          <span className="inline-flex items-center gap-1.5 bg-terracotta px-2 py-1 font-pixel text-sm font-bold text-paper" role="status">
+            <span aria-hidden className="live-dot" /> live
+          </span>
+        )}
+        {canGoLive && (
+          <button type="button" className="pixel-btn inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold text-terracotta" onClick={onGoLive} title="Jump to now and follow the run (L)">
+            <span aria-hidden className="live-dot" /> go live
+          </button>
+        )}
+        <div className={`flex items-center gap-3 ${live ? "opacity-50" : ""}`} role="group" aria-label="Replay speed">
           {SPEEDS.map((s, i) => (
             <button
               key={s}
               type="button"
               className="pixel-btn px-2 py-1 text-sm"
               aria-pressed={speed === s}
-              title={`${s}x speed (key ${i + 1})`}
+              disabled={live}
+              title={live ? "Live events play as they happen" : `${s}x speed (key ${i + 1})`}
               onClick={() => onSpeed(s)}
             >
               {s}x
