@@ -7,6 +7,7 @@ import { AGENT_COLORS } from "@/lib/office/sprites";
 import type { AgentName } from "@/lib/types";
 
 import { ROLE } from "./AgentCard";
+import Skeleton from "./Skeleton";
 
 const FILTERS: LogFilter[] = ["all", "lead", "tester", "coder", "reviewer", "orchestrator"];
 
@@ -31,10 +32,12 @@ interface Props {
   onOpen: (index: number) => void;
   // as tall as the screen allows on wide screens (beside the office)
   tall?: boolean;
+  // the events are still loading
+  loading?: boolean;
 }
 
 /** Every event as a readable line. Future lines are dimmed; clicking one opens its details and seeks there. */
-export default function ActivityLog({ entries, index, inspected, filter, onFilter, onOpen, tall = false }: Props) {
+export default function ActivityLog({ entries, index, inspected, filter, onFilter, onOpen, tall = false, loading = false }: Props) {
   const listRef = useRef<HTMLOListElement>(null);
   const shown = useMemo(() => filterLog(entries, filter), [entries, filter]);
   const present = new Set(entries.map((e) => e.agent));
@@ -74,7 +77,16 @@ export default function ActivityLog({ entries, index, inspected, filter, onFilte
         </div>
       </div>
       <ol ref={listRef} className={`pixel-scroll relative h-[22rem] ${tall ? "xl:h-[calc(100dvh-17rem)] xl:min-h-[22rem]" : ""} overflow-y-auto overflow-x-hidden bg-cream/60 font-mono text-xs [font-variant-ligatures:none]`} aria-label="Events">
-        {shown.length === 0 && <li className="p-3 text-ink-soft">No events for this agent.</li>}
+        {loading &&
+          Array.from({ length: 12 }, (_, i) => (
+            <li key={i} aria-hidden className="flex items-center gap-2 border-l-4 border-cream-dark px-2 py-1.5">
+              <Skeleton className="h-3 w-9" />
+              <Skeleton className="h-3 w-16" />
+              <Skeleton className={`h-3 ${["w-3/5", "w-2/5", "w-1/2", "w-2/3"][i % 4]}`} />
+            </li>
+          ))}
+        {loading && <li className="sr-only">Loading events…</li>}
+        {!loading && shown.length === 0 && <li className="p-3 text-ink-soft">No events for this agent.</li>}
         {shown.map((entry) => {
           const past = entry.index < index;
           const current = entry.index === index - 1;

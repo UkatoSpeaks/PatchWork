@@ -60,6 +60,13 @@ export default function HelpOverlay({ onClose }: { onClose: () => void }) {
         aria-labelledby="help-title"
         className="help-panel pixel-box pixel-scroll flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col gap-5 overflow-y-auto bg-paper p-6"
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          // Keep Tab inside the panel: its only control is the close button.
+          if (event.key === "Tab") {
+            event.preventDefault();
+            closeRef.current?.focus();
+          }
+        }}
       >
         <div className="flex items-center justify-between gap-4">
           <h2 id="help-title" className="font-pixel text-xl font-bold">Keys and clicks</h2>

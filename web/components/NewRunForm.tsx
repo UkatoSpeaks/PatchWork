@@ -10,6 +10,7 @@ import { AGENT_COLORS } from "@/lib/office/sprites";
 import type { LaunchConfig, RepoCheck, RunEvent, ToyRepo } from "@/lib/types";
 
 import { ROLE } from "./AgentCard";
+import Skeleton from "./Skeleton";
 
 const DRAFT_KEY = "patchwork:new-run";
 const CHECK_DELAY_MS = 400;
@@ -284,17 +285,45 @@ export default function NewRunForm() {
 
             {draft.source === "toy" ? (
               <div className="flex flex-col gap-3">
-                {toys === null && <p className="font-pixel text-sm text-ink-soft">Loading toy repos…</p>}
+                {toys === null && (
+                  <div aria-busy="true" className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                    <span className="sr-only">Loading toy repos…</span>
+                    {Array.from({ length: 3 }, (_, i) => (
+                      <div key={i} className="pixel-box-sm flex flex-col gap-2 bg-paper p-3">
+                        <Skeleton className="h-4 w-24" />
+                        <Skeleton className="h-3 w-full" />
+                        <Skeleton className="h-3.5 w-20" />
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {toys?.length === 0 && <p className="text-sm text-ink-soft">No toy repos found (they live in toy_repos/ in a source checkout).</p>}
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3" role="radiogroup" aria-label="Toy repos">
-                  {toys?.map((toy) => {
+                <div
+                  className="grid grid-cols-1 gap-4 sm:grid-cols-3"
+                  role="radiogroup"
+                  aria-label="Toy repos"
+                  onKeyDown={(event) => {
+                    // Arrow keys move the choice, as in any radio group.
+                    if (!toys?.length || !["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"].includes(event.key)) return;
+                    event.preventDefault();
+                    const at = Math.max(0, toys.findIndex((t) => t.name === draft.toy));
+                    const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1;
+                    const next = toys[(at + step + toys.length) % toys.length];
+                    pickToy(next);
+                    event.currentTarget.querySelector<HTMLElement>(`[data-toy="${next.name}"]`)?.focus();
+                  }}
+                >
+                  {toys?.map((toy, i) => {
                     const picked = draft.toy === toy.name;
+                    const focusable = picked || (!toys.some((t) => t.name === draft.toy) && i === 0);
                     return (
                       <button
                         key={toy.name}
                         type="button"
                         role="radio"
                         aria-checked={picked}
+                        tabIndex={focusable ? 0 : -1}
+                        data-toy={toy.name}
                         onClick={() => pickToy(toy)}
                         className={`pixel-box-sm flex min-w-0 flex-col gap-1.5 p-3 text-left transition-transform hover:-translate-y-0.5 ${picked ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"}`}
                       >
@@ -468,7 +497,15 @@ export default function NewRunForm() {
                 )}
               </dl>
             ) : (
-              <p className="font-pixel text-xs text-ink-soft">Reading .env…</p>
+              <div aria-busy="true" className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-2">
+                <span className="sr-only">Reading .env…</span>
+                {Array.from({ length: 4 }, (_, i) => (
+                  <div key={i} className="contents">
+                    <Skeleton className="h-3 w-14" />
+                    <Skeleton className="h-3 w-24" />
+                  </div>
+                ))}
+              </div>
             )}
             <p className="text-[11px] text-ink-soft">Models come from .env.</p>
           </section>

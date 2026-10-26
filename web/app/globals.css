@@ -97,7 +97,8 @@ body {
 }
 
 .pixel-btn:active,
-.pixel-btn[aria-pressed="true"] {
+.pixel-btn[aria-pressed="true"],
+.pixel-btn[aria-selected="true"] {
   transform: translateY(2px);
   box-shadow:
     -3px 0 0 0 var(--ink),
@@ -107,7 +108,8 @@ body {
     inset 3px 3px 0 0 rgba(43, 37, 35, 0.18);
 }
 
-.pixel-btn[aria-pressed="true"] {
+.pixel-btn[aria-pressed="true"],
+.pixel-btn[aria-selected="true"] {
   background: var(--color-mustard);
 }
 
@@ -513,4 +515,43 @@ body {
   .help-panel {
     animation: none;
   }
+}
+
+/* --- loading placeholders --------------------------------------------------------- */
+.skeleton {
+  min-height: 0.75rem;
+  background: linear-gradient(90deg, var(--color-cream-dark) 0 35%, #f6eedc 50%, var(--color-cream-dark) 65% 100%);
+  background-size: 300% 100%;
+  animation: skeleton 1.4s steps(8) infinite;
+}
+
+@keyframes skeleton {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}
+
+/* --- accessibility ---------------------------------------------------------------- */
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -4rem;
+  z-index: 60;
+  padding: 6px 12px;
+  font-family: var(--font-pixel);
+  background: var(--color-ink);
+  color: var(--color-paper);
+}
+
+.skip-link:focus {
+  top: 1rem;
 }

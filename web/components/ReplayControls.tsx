@@ -113,6 +113,7 @@ export default function ReplayControls({ playing, speed, index, total, current, 
             value={index}
             onChange={(e) => onSeek(Number(e.target.value))}
             aria-label="Event position (left / right arrow keys step one event)"
+            aria-valuetext={total ? `Event ${index} of ${total}${current && index ? `: ${current}` : ""}` : "No events yet"}
           />
           {phases.length > 0 && total > 0 && <PhaseTimeline phases={phases} index={index} total={total} onSeek={onSeek} />}
         </div>

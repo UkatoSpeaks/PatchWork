@@ -38,6 +38,10 @@ function planFrom(detail: RunDetail | null, events: RunEvent[] | null): Plan | n
 const typing = (target: EventTarget | null) =>
   target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
 
+/** Tabs and radio groups use the arrow keys themselves. */
+const ownsArrows = (target: EventTarget | null) =>
+  target instanceof HTMLElement && target.closest('[role="tablist"], [role="radiogroup"]') !== null;
+
 /**
  * Replays a run. Normal playback streams events over SSE (/stream) and feeds
  * them to the reducer one by one; seeking rebuilds the scene by reducing
@@ -308,6 +312,8 @@ export default function RunView({ id }: { id: string }) {
         k.playPause();
       } else if (event.key === "Escape" && k.inspect !== null) {
         setInspect(null);
+      } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && ownsArrows(event.target)) {
+        return;
       } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && k.inspect !== null) {
         event.preventDefault();
         const to = event.key === "ArrowLeft" ? k.neighbours.prev : k.neighbours.next;
@@ -355,7 +361,7 @@ export default function RunView({ id }: { id: string }) {
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-8 [&>*]:min-w-0">
-      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} live={live} status={runStatus} />
+      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} live={live} status={runStatus} loading={!events} />
       {error && (
         <p className="flex flex-wrap items-center gap-3 font-pixel text-sm text-terracotta" role="alert">
           {error}
@@ -396,7 +402,7 @@ export default function RunView({ id }: { id: string }) {
           </section>
         </div>
         <div className="min-w-0 xl:sticky xl:top-4 xl:self-start">
-          <ActivityLog entries={entries} index={index} inspected={inspect} filter={logFilter} onFilter={filterLog} onOpen={openEvent} tall />
+          <ActivityLog entries={entries} index={index} inspected={inspect} filter={logFilter} onFilter={filterLog} onOpen={openEvent} tall loading={!events} />
         </div>
       </div>
       <InfoPanels
@@ -409,6 +415,7 @@ export default function RunView({ id }: { id: string }) {
         roleOf={roleOf}
         agents={stats}
         phases={durations}
+        loading={!events}
       />
       {/* Last in the page, so it stays pinned to the bottom of the screen all the way down. */}
       <div className="sticky bottom-3 z-30">
@@ -431,6 +438,9 @@ export default function RunView({ id }: { id: string }) {
         />
       </div>
       {help && <HelpOverlay onClose={() => setHelp(false)} />}
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {events && (scene.outcome ? `Run ${scene.outcome === "success" ? "succeeded" : "failed"}.` : live ? `Live. Phase: ${scene.phaseLabel}.` : `Phase: ${scene.phaseLabel}.`)}
+      </p>
       {inspect !== null && events?.[inspect] && (
         <EventDrawer
           events={events}

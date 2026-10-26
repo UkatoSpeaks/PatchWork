@@ -52,6 +52,17 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
   callbacks.current = { onWalkingChange, onStatusChange };
   speedRef.current = speed;
   playingRef.current = playing;
+  // Reduced motion: characters jump to where they're going instead of walking.
+  const reducedRef = useRef(false);
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const apply = () => {
+      reducedRef.current = query.matches;
+    };
+    apply();
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
   selectedRef.current = selected;
 
   useEffect(() => {
@@ -87,7 +98,7 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
       const actors = actorsRef.current;
       if (actors) {
         // Walk faster at higher replay speeds so trips fit in the (capped) gaps.
-        actors.update(dt, 5 + Math.min(speedRef.current, 8) * 1.2);
+        actors.update(dt, reducedRef.current ? 10_000 : 5 + Math.min(speedRef.current, 8) * 1.2);
         const outcome = outcomeAt.current === null ? null : (now - outcomeAt.current) / 1000;
         drawScene(ctx, { scene: sceneRef.current, actors, t: now, outcomeSeconds: outcome, selected: selectedRef.current });
 
@@ -198,7 +209,7 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
             event.currentTarget.style.cursor = pick(event) ? "pointer" : "default";
           }}
         />
-        <div ref={overlayRef} className="pointer-events-none absolute inset-0 overflow-hidden" aria-live="polite">
+        <div ref={overlayRef} className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden>
           {CREW.map((agent) => (
             <div
               key={`tag-${agent}`}

@@ -10,6 +10,7 @@ export default function PageFrame({ children }: { children: React.ReactNode }) {
   const width = wide ? "max-w-[110rem]" : "max-w-6xl";
   return (
     <>
+      <a href="#main" className="skip-link">Skip to content</a>
       <header className={`mx-auto flex ${width} items-center justify-between px-4 pt-6 pb-2 sm:px-6`}>
         <Link href="/" className="pixel-link flex items-center gap-3 font-pixel text-2xl font-bold tracking-wide">
           <span aria-hidden className="inline-grid h-7 w-7 grid-cols-2 grid-rows-2 gap-[2px] bg-ink p-[2px]">
@@ -22,7 +23,7 @@ export default function PageFrame({ children }: { children: React.ReactNode }) {
         </Link>
         <span className="hidden font-pixel text-sm text-ink-soft sm:block">a crew of four, fixing issues</span>
       </header>
-      <main className={`mx-auto ${width} px-4 pb-16 sm:px-6`}>{children}</main>
+      <main id="main" tabIndex={-1} className={`mx-auto ${width} px-4 pb-16 outline-none sm:px-6`}>{children}</main>
     </>
   );
 }

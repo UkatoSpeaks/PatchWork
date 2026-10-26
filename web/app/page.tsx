@@ -21,6 +21,8 @@ import {
 } from "@/lib/runList";
 import type { RunSummary } from "@/lib/types";
 
+import Skeleton from "@/components/Skeleton";
+
 // How often the list is re-read: quickly while a run is going, slowly otherwise.
 const REFRESH_RUNNING_MS = 3000;
 const REFRESH_IDLE_MS = 10000;
@@ -171,6 +173,45 @@ function Summary({ stats }: { stats: ListStats }) {
   );
 }
 
+/** The page's shape while the first list loads: the summary strip and a few cards. */
+function ListSkeleton() {
+  return (
+    <div aria-busy="true" className="flex flex-col gap-6">
+      <span className="sr-only">Loading runs…</span>
+      <div className="pixel-box grid grid-cols-2 gap-x-6 gap-y-5 bg-paper p-5 sm:grid-cols-3 lg:grid-cols-5">
+        {Array.from({ length: 5 }, (_, i) => (
+          <div key={i} className="flex flex-col gap-2">
+            <Skeleton className="h-2.5 w-16" />
+            <Skeleton className="h-6 w-20" />
+            <Skeleton className="h-2.5 w-28" />
+          </div>
+        ))}
+      </div>
+      <Skeleton className="h-10 w-full" />
+      <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3">
+        {Array.from({ length: 6 }, (_, i) => (
+          <div key={i} className="pixel-box flex flex-col gap-3 bg-paper p-4">
+            <div className="flex items-center justify-between">
+              <Skeleton className="h-3 w-24" />
+              <Skeleton className="h-5 w-12" />
+            </div>
+            <Skeleton className="h-4 w-28" />
+            <div className="flex min-h-[3.75rem] flex-col gap-2">
+              <Skeleton className="h-3.5 w-full" />
+              <Skeleton className="h-3.5 w-4/5" />
+            </div>
+            <div className="grid grid-cols-4 gap-2 border-t-2 border-dashed border-ink/20 pt-3">
+              {Array.from({ length: 4 }, (_, j) => (
+                <Skeleton key={j} className="h-6 w-full" />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function RunsPage() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -265,7 +306,7 @@ export default function RunsPage() {
           </p>
         </div>
       )}
-      {!error && runs === null && <p className="font-pixel text-ink-soft">Loading runs…</p>}
+      {!error && runs === null && <ListSkeleton />}
       {runs && runs.length === 0 && (
         <div className="pixel-box flex flex-col items-start gap-3 bg-paper p-5 text-sm">
           <p className="font-pixel text-base font-bold">No runs yet</p>
