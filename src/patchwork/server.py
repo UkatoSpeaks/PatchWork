@@ -14,6 +14,22 @@ once finished, ``result.json`` (the RunResult).
   replay has caught up it sends a ``live`` event and then each new event as
   it is written. A final ``end`` event closes the stream.
 
+Starting runs (the "New run" page):
+
+- ``GET /api/config``: the models from .env, defaults, whether the API key is
+  set and which run (if any) is going.
+- ``GET /api/toy-repos``: the toy repos with their ISSUE.md.
+- ``GET /api/repo-check?path=...``: whether a folder can be used as-is.
+- ``POST /api/runs`` (JSON ``LaunchRequest``): start a crew run in the
+  background; returns ``{"run_id": ...}`` (201), 400 for a bad request and 409
+  while another run is going.
+- ``GET /api/launches/{run_id}``: a started run's process: ``starting``,
+  ``running`` or ``exited`` (with the end of its console output).
+
+These are only served to the dashboard's origins (and to clients that send no
+Origin, like curl), and POST requires a JSON body, so other web pages can't
+start runs.
+
 Every summary has a ``status``: ``finished`` (it has a result or a
 ``run_finished`` event), ``running`` (the run lock in ``runs/`` names it and
 its process is alive) or ``stopped`` (neither: it crashed or was killed).
@@ -29,10 +45,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from patchwork.launcher import LaunchError, Launcher, LaunchRequest
 from patchwork.runlock import LOCK_NAME, pid_alive, read_lock
 
 # Longest pause between two replayed events, after dividing by the speed, so
@@ -216,10 +233,22 @@ async def follow(
         quiet_s += poll_s
 
 
-def create_app(runs_dir: Path | str = "runs") -> FastAPI:
+def dashboard_only(request: Request) -> None:
+    """Refuse requests from other web pages: a browser always sends Origin on
+    cross-site requests, and a JSON POST needs a CORS preflight we only grant
+    to the dashboard."""
+    origin = request.headers.get("origin")
+    if origin is not None and origin not in CORS_ORIGINS:
+        raise HTTPException(status_code=403, detail=f"origin {origin} may not start runs")
+    if request.method == "POST" and not request.headers.get("content-type", "").startswith("application/json"):
+        raise HTTPException(status_code=415, detail="send JSON")
+
+
+def create_app(runs_dir: Path | str = "runs", launcher: Launcher | None = None) -> FastAPI:
     runs = Path(runs_dir)
-    app = FastAPI(title="Patchwork", description="Run logs for the Patchwork dashboard.")
-    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET"], allow_headers=["*"])
+    launcher = launcher or Launcher(runs)
+    app = FastAPI(title="Patchwork", description="Run logs for the Patchwork dashboard, and starting runs.")
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["*"])
 
     def run_dir(run_id: str) -> Path:
         directory = runs / run_id
@@ -269,5 +298,31 @@ def create_app(runs_dir: Path | str = "runs") -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/api/config", dependencies=[Depends(dashboard_only)])
+    def config() -> dict[str, Any]:
+        return launcher.config()
+
+    @app.get("/api/toy-repos", dependencies=[Depends(dashboard_only)])
+    def toy_repos() -> list[dict[str, Any]]:
+        return launcher.toy_repos()
+
+    @app.get("/api/repo-check", dependencies=[Depends(dashboard_only)])
+    def repo_check(path: str = Query(..., min_length=1, max_length=4096)) -> dict[str, Any]:
+        return launcher.check_repo(path)
+
+    @app.post("/api/runs", status_code=201, dependencies=[Depends(dashboard_only)])
+    def start_run(request: LaunchRequest) -> dict[str, str]:
+        try:
+            return {"run_id": launcher.start(request)}
+        except LaunchError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from None
+
+    @app.get("/api/launches/{run_id}", dependencies=[Depends(dashboard_only)])
+    def launch_status(run_id: str) -> dict[str, Any]:
+        status = launcher.status(run_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"run {run_id!r} wasn't started from this server")
+        return status
 
     return app

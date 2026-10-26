@@ -105,6 +105,7 @@ uv run patchwork usage [--days N]
 uv run patchwork serve [--port 8000] [--runs-dir runs]
 ```
 
+- `--runs-dir DIR` (run) writes the run, the run lock and `usage.json` under DIR instead of `runs/`. The dashboard also passes a hidden `--run-id` so it can open the run straight away.
 - `--issue-file` reads the issue from a UTF-8 file (a BOM is fine) instead of `--issue`; pass exactly one of them. Prefer it for issue text with non-ASCII characters: in Windows PowerShell 5, `--issue (Get-Content -Raw ISSUE.md)` decodes UTF-8 with the wrong encoding ('é' arrives as 'Ã©').
 - `PATH` must be the root of a git repo with a commit and no uncommitted changes (commit or stash first). `--init-git` turns a plain directory into one: `git init` plus an initial commit of everything in it.
 - `--sequential` runs the tester and coder one after the other instead of concurrently. The final table shows wall-clock time per agent and per phase, so the two modes can be compared.
@@ -140,6 +141,10 @@ The API base URL comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:800
 - `GET /api/runs/{run_id}/stream?speed=4&start=0`: server-sent events replaying the log at its original pace divided by `speed` (0 = no delays), each gap capped at 2s, then an `end` event. For a running run, once the replay catches up it sends a `live` event and then each new event as soon as it is written to `events.jsonl`, until `run_finished` or the run's process exits.
 
 The replay uses `/stream` for playback and `/events` for seeking: the scene is a pure reducer over events (`web/lib/office/reducer.ts`), so jumping to event N means reducing `events[0..N]`. `/runs/<run_id>?at=N` opens a run paused at event N.
+
+**New run.** `+ New run` on the runs list (or `/runs/new`) starts a crew run from the browser. Pick a toy repo (copied to a temp folder and git-initialised for each run, so the original is untouched) or type the path of your own repo: it is checked as you type (clean git repo, uncommitted changes listed, or "not a git repo yet" with an **Initialize git** option), and its `ISSUE.md` can fill the issue. Options: tester and coder together or one at a time, coder retries, and (advanced) steps per agent and the test command. A checklist beside the form shows what still blocks the start (API key, another run going, the repo, the issue); Ctrl/⌘+Enter starts. The page then shows "Getting the crew ready…" until the first event and switches to the live office; if `patchwork run` exits before writing any events, the page shows its console output instead. The draft is kept for the tab's session. `/runs/new?toy=text_utils`, `?repo=PATH` and `?from=<run_id>` (the result banner's **Run again**: the same repo, issue and options) prefill the form. Solo mode stays CLI-only, since it edits the repo in place.
+
+The server starts the run as `patchwork run` in its own process (`launcher.py`), from the server's working directory so it reads the same `.env`; stopping the server doesn't stop the run. Console output goes to `runs/.launch/<run_id>/console.log`. Starting runs is only allowed from the dashboard's origins (or from clients that send no Origin, like curl) and needs a JSON body, so other web pages can't start runs. Endpoints: `GET /api/config`, `GET /api/toy-repos`, `GET /api/repo-check?path=`, `POST /api/runs` (201 with the run id; 400 with a message for a bad request, 409 while another run is going) and `GET /api/launches/{run_id}`.
 
 **Live runs.** Start `patchwork serve` and the dashboard, then `patchwork run` in a third terminal: the run appears in the list with a blinking LIVE badge (the list refreshes every 3s while a run is going, every 10s otherwise). Opening it jumps to the present and follows along; the top bar says LIVE. Scrubbing back or pausing leaves live mode; **go live** (or the L key) jumps back to now. When the run finishes, the diff and result load on their own. A run that died shows STOPPED. The office code lives in `web/lib/office/`: `reducer` (scene state and what agents say), `status` (status tag lines), `phrases`, `animator` + `idle` (movement and office life), `bubbles` (how long bubbles stay up, where tags and bubbles go), and the art in `characters`, `furniture`, `scenery`, `renderer`. Frontend tests: `cd web && npm test`.
 
@@ -183,7 +188,8 @@ The LLM is mocked (scripted), so no API key or network is needed. Crew tests use
 - **Crew flow:** worktrees and cleanup, concurrency, merges, retries on test failure and review blockers, the retry cap, the user's tree staying untouched, sequential stopping after a tester failure, parallel cancelling the coder, a coder failure leading to integrate and a retry on `CODER_RETRY_MODEL`, a stuck retry moving on to the next retry, branches kept after a failed run, models used and today's usage in the final table.
 - **One run at a time and usage:** the lock refusing a second run and clearing a stale one, `runs/usage.json`, `patchwork usage`.
 - **Events:** the full event sequence, replay output and `--sequential` producing the same result.
-- **Dashboard API:** run list (skipping empty runs, newest first), detail and plan, events, SSE replay order and `end`, gap scaling and capping, CORS.
+- **Dashboard API:** run list (skipping empty runs, newest first), detail and plan, events, SSE replay order and `end`, gap scaling and capping, CORS, run status, following a live log.
+- **Starting runs:** the repo check's states, launching with the options (a fake `patchwork` script), toy repos copied with their issue and `--init-git`, a run that dies before its first event, refused requests (no repo, empty issue, dirty repo, plain folder without init, no API key, another run going), and other origins / non-JSON bodies being refused.
 
 Symlink tests are skipped on Windows unless Developer Mode is enabled.
 
@@ -209,7 +215,8 @@ src/patchwork/
   agents/tester.py   Tester role: new test files only + fail-first gate + auto-finish
   agents/coder.py    Coder role: prompt, tools, test gate and nudge; initial and retry tasks
   agents/reviewer.py Reviewer role: read-only tools + diff + submit_review
-  server.py          Read-only FastAPI over runs/ for the web dashboard (list, detail, events, SSE replay)
+  server.py          FastAPI over runs/ for the web dashboard (list, detail, events, SSE replay and live follow, starting runs)
+  launcher.py        Starts crew runs for the dashboard: request checks, toy repo copies, background `patchwork run`
   cli.py             Typer CLI: run, replay, usage, serve
 toy_repos/calculator/     Bug-planted package
 toy_repos/stats_feature/  Working package + a feature request (median)

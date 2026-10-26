@@ -14,6 +14,7 @@ model per day accumulates in ``runs/usage.json``.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -31,6 +32,7 @@ from patchwork.usage import UsageStore, format_day
 app = typer.Typer(help="Patchwork: a multi-agent coding system.", add_completion=False, no_args_is_help=True)
 
 RUNS_DIR = Path("runs")
+RUN_ID_PATTERN = re.compile(r"[\w.-]+")
 
 
 @app.callback()
@@ -77,6 +79,8 @@ def run(
     solo: Annotated[bool, typer.Option("--solo", help="Run only the coder, editing REPO in place (milestone 1 mode).")] = False,
     test_cmd: Annotated[str | None, typer.Option(help="Override TEST_COMMAND for this run.")] = None,
     max_steps: Annotated[int | None, typer.Option(min=1, help="Override MAX_STEPS_PER_AGENT.")] = None,
+    run_id: Annotated[str | None, typer.Option(hidden=True, help="Use this run id (the dashboard picks one so it can open the run at once).")] = None,
+    runs_dir: Annotated[Path | None, typer.Option(file_okay=False, help="Directory for runs/<run_id>/, the run lock and usage.json (default: runs).")] = None,
 ) -> None:
     """Resolve ISSUE in REPO with the crew, or only the coder with --solo.
 
@@ -93,18 +97,23 @@ def run(
         typer.secho("GROQ_API_KEY is not set. Copy .env.example to .env and add your key.", fg="red", err=True)
         raise typer.Exit(2)
 
-    bus = EventBus()
+    runs_dir = runs_dir or RUNS_DIR
+    if run_id is not None and not RUN_ID_PATTERN.fullmatch(run_id):
+        raise typer.BadParameter("letters, digits, '.', '_' and '-' only", param_hint="'--run-id'")
+    if run_id is not None and (runs_dir / run_id).exists():
+        raise typer.BadParameter(f"{runs_dir / run_id} already exists", param_hint="'--run-id'")
+    bus = EventBus(run_id)
     try:
-        with run_lock(RUNS_DIR, bus.run_id):
+        with run_lock(runs_dir, bus.run_id):
             bus.subscribe(CliRenderer())
-            writer = JsonlWriter(RUNS_DIR / bus.run_id)
+            writer = JsonlWriter(runs_dir / bus.run_id)
             bus.subscribe(writer)
             llm = LLMClient(
                 api_key=settings.api_key(),
                 max_concurrency=settings.max_concurrent_requests,
                 max_wait=settings.llm_max_wait_seconds,
                 throttle_mode=settings.throttle_mode,
-                usage=UsageStore(RUNS_DIR / "usage.json"),
+                usage=UsageStore(runs_dir / "usage.json"),
             )
             orchestrator = Orchestrator(
                 repo=repo, settings=settings, llm=llm, bus=bus, test_command=test_cmd,

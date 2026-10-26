@@ -103,7 +103,12 @@ export default function RunsPage() {
 
   return (
     <section className="pt-4">
-      <h1 className="mb-1 font-pixel text-xl font-bold">Runs</h1>
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-4">
+        <h1 className="font-pixel text-xl font-bold">Runs</h1>
+        <Link href="/runs/new" className="pixel-btn start-btn px-4 py-1.5 text-sm font-bold">
+          + New run
+        </Link>
+      </div>
       <p className="mb-8 text-sm text-ink-soft">
         Pick a run to watch the crew replay it in the office.
         {running && " A LIVE run opens at the present moment and follows along."}
@@ -120,9 +125,13 @@ export default function RunsPage() {
       )}
       {!error && runs === null && <p className="font-pixel text-ink-soft">Loading runs…</p>}
       {runs && runs.length === 0 && (
-        <p className="pixel-box bg-paper p-5 text-sm">
-          No runs yet. Run <code className="bg-cream-dark px-1">uv run patchwork run --repo …</code> first.
-        </p>
+        <div className="pixel-box flex flex-col items-start gap-3 bg-paper p-5 text-sm">
+          <p className="font-pixel text-base font-bold">No runs yet</p>
+          <p>Start one here, or from a terminal with <code className="bg-cream-dark px-1">uv run patchwork run --repo …</code>.</p>
+          <Link href="/runs/new" className="pixel-btn start-btn px-4 py-1.5 text-sm font-bold">
+            + New run
+          </Link>
+        </div>
       )}
       {runs && runs.length > 0 && (
         <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3">

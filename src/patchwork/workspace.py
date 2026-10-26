@@ -86,6 +86,50 @@ def ensure_repo(repo: str | os.PathLike[str], *, init_git: bool = False) -> None
         raise WorkspaceError(f"{repo} has uncommitted changes; commit or stash them first:\n{shown}")
 
 
+ISSUE_FILE_NAMES = ("ISSUE.md", "issue.md", "ISSUE.txt")
+
+
+def issue_files(folder: Path) -> list[str]:
+    """Issue files in ``folder``, by their real names (some file systems ignore case)."""
+    try:
+        names = {p.name for p in folder.iterdir() if p.is_file()}
+    except OSError:
+        return []
+    return [n for n in ISSUE_FILE_NAMES if n in names]
+
+
+def inspect_repo(path: str | os.PathLike[str]) -> dict[str, object]:
+    """What ``ensure_repo`` would say about ``path``, without changing anything.
+
+    ``state`` is ``ready`` (a clean git repo root with a commit), ``needs_init``
+    (a directory that isn't its own git repo: ``--init-git`` would fix it),
+    ``dirty`` (uncommitted changes), ``no_commits``, ``inside_repo`` (a
+    subdirectory of another repo) or ``missing``. ``message`` says it in words.
+    """
+    try:
+        repo = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return {"state": "missing", "path": str(path), "message": "No such folder."}
+    if not repo.is_dir():
+        return {"state": "missing", "path": str(repo), "message": "That's a file, not a folder."}
+    info: dict[str, object] = {"path": str(repo), "issue_files": issue_files(repo)}
+    top = git(repo, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode != 0:
+        return {**info, "state": "needs_init", "message": "Not a git repository yet: Patchwork can run git init and commit everything in it."}
+    if Path(top.stdout.strip()).resolve() != repo:
+        return {**info, "state": "inside_repo", "message": f"This folder is inside the git repo {top.stdout.strip()}; pick the repo's root."}
+    head = git(repo, "rev-parse", "--short", "HEAD", check=False)
+    if head.returncode != 0:
+        return {**info, "state": "no_commits", "message": "The repo has no commits yet; commit your code first."}
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+    info.update(branch=branch, head=head.stdout.strip())
+    dirty = [line[3:] for line in git(repo, "status", "--porcelain").stdout.splitlines() if line.strip()]
+    if dirty:
+        return {**info, "state": "dirty", "dirty_files": dirty[:10], "dirty_count": len(dirty),
+                "message": f"{len(dirty)} uncommitted change{'s' if len(dirty) != 1 else ''}: commit or stash first."}
+    return {**info, "state": "ready", "message": f"Clean git repo on {branch} at {head.stdout.strip()}."}
+
+
 class Workspace:
     """Branches and worktrees for one run. Call ``cleanup`` in a finally block."""
 

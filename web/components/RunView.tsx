@@ -2,18 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { API_URL, fetchEvents, fetchRun, streamEvents } from "@/lib/api";
+import { API_URL, ApiError, fetchEvents, fetchLaunch, fetchRun, streamEvents } from "@/lib/api";
 import { fileRoles } from "@/lib/diff";
 import { filterLog as filterEntries, logEntries, type LogFilter } from "@/lib/log";
 import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
 import { runOutcome } from "@/lib/outcome";
 import { agentStats, phaseDurations, phaseSegments } from "@/lib/stats";
-import type { CrewAgent, Plan, RunDetail, RunEvent, RunStatus } from "@/lib/types";
+import type { CrewAgent, LaunchStatus, Plan, RunDetail, RunEvent, RunStatus } from "@/lib/types";
 
 import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
 import EventDrawer from "./EventDrawer";
 import InfoPanels, { type InfoTab } from "./InfoPanels";
+import LaunchWaiting from "./LaunchWaiting";
 import OfficeCanvas, { type AgentLines } from "./OfficeCanvas";
 import ReplayControls, { SPEEDS } from "./ReplayControls";
 import ResultBanner from "./ResultBanner";
@@ -60,6 +61,9 @@ export default function RunView({ id }: { id: string }) {
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
   // The event open in the drawer, if any.
   const [inspect, setInspect] = useState<number | null>(null);
+  // A run started from the dashboard that hasn't written its first event yet.
+  const [launch, setLaunch] = useState<LaunchStatus | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const indexRef = useRef(0);
   const closeRef = useRef<(() => void) | null>(null);
   const panelsRef = useRef<HTMLElement>(null);
@@ -124,12 +128,14 @@ export default function RunView({ id }: { id: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     // The detail (plan, result with the diff, status) is optional: the scene works without it.
     const detailLoaded = fetchRun(id).catch(() => null);
     fetchEvents(id).then(
       async (loaded) => {
         const d = await detailLoaded;
         if (cancelled) return;
+        setLaunch(null);
         setEvents(loaded);
         setDetail(d);
         setRunStatus(d?.summary.status ?? null);
@@ -158,13 +164,29 @@ export default function RunView({ id }: { id: string }) {
           start(0, 4);
         }
       },
-      (e: Error) => !cancelled && setError(e.message),
+      (e: Error) => {
+        if (cancelled) return;
+        if (!(e instanceof ApiError && e.status === 404)) {
+          setError(e.message);
+          return;
+        }
+        // No events yet: if this server just started the run, wait for its first event.
+        fetchLaunch(id).then(
+          (status) => {
+            if (cancelled) return;
+            setLaunch(status);
+            if (status.state !== "exited" || status.has_events) retry = setTimeout(() => setReloadKey((k) => k + 1), 700);
+          },
+          () => !cancelled && setError(e.message),
+        );
+      },
     );
     return () => {
       cancelled = true;
+      clearTimeout(retry);
       stop();
     };
-  }, [id, start, stop]);
+  }, [id, start, stop, reloadKey]);
 
   const seek = useCallback(
     (n: number, resume = playing) => {
@@ -304,6 +326,8 @@ export default function RunView({ id }: { id: string }) {
   // Show it once the replay reaches the end of the run.
   const showOutcome = outcome && (outcome.verdict === "stopped" ? index >= (events?.length ?? 0) : scene.outcome !== null);
 
+  if (launch && !events) return <LaunchWaiting launch={launch} />;
+
   if (error && !events) {
     return (
       <div className="pixel-box mt-6 bg-paper p-5 text-sm">
@@ -353,7 +377,7 @@ export default function RunView({ id }: { id: string }) {
           </button>
         </p>
       )}
-      {showOutcome && <ResultBanner outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
+      {showOutcome && <ResultBanner runId={id} outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
       <section aria-label="Agents" className="flex flex-wrap gap-8">
         {shown.map((name) => (
           <AgentCard

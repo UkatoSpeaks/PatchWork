@@ -1,18 +1,47 @@
-import type { RunDetail, RunEvent, RunSummary } from "./types";
+import type { LaunchConfig, LaunchRequest, LaunchStatus, RepoCheck, RunDetail, RunEvent, RunSummary, ToyRepo } from "./types";
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
-async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, { cache: "no-store" });
+/** An error from the API, with its status and the server's message (FastAPI's `detail`). */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly detail: string | null = null,
+  ) {
+    super(message);
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText} from ${path}`);
+    let detail: string | null = null;
+    try {
+      const body = await response.json();
+      if (typeof body?.detail === "string") detail = body.detail;
+    } catch {
+      // not JSON
+    }
+    throw new ApiError(detail ?? `${response.status} ${response.statusText} from ${path}`, response.status, detail);
   }
   return response.json() as Promise<T>;
 }
 
+const getJson = <T,>(path: string) => request<T>(path);
+
 export const fetchRuns = () => getJson<RunSummary[]>("/api/runs");
 export const fetchRun = (id: string) => getJson<RunDetail>(`/api/runs/${encodeURIComponent(id)}`);
 export const fetchEvents = (id: string) => getJson<RunEvent[]>(`/api/runs/${encodeURIComponent(id)}/events`);
+
+export const fetchConfig = () => getJson<LaunchConfig>("/api/config");
+export const fetchToyRepos = () => getJson<ToyRepo[]>("/api/toy-repos");
+export const checkRepo = (path: string) => getJson<RepoCheck>(`/api/repo-check?path=${encodeURIComponent(path)}`);
+export const fetchLaunch = (id: string) => getJson<LaunchStatus>(`/api/launches/${encodeURIComponent(id)}`);
+
+/** Start a crew run; resolves to its run id. Errors carry the server's message. */
+export const startRun = (body: LaunchRequest) =>
+  request<{ run_id: string }>("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.run_id);
 
 /**
  * Replay events[start..] over SSE at `speed` (0: as fast as possible). For a run

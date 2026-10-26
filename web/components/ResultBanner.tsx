@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import type { Outcome } from "@/lib/outcome";
 
 import CopyButton from "./CopyButton";
@@ -18,13 +20,14 @@ const ATTEMPT_MARK = {
 } as const;
 
 interface Props {
+  runId: string;
   outcome: Outcome;
   onOpenEvent: (index: number) => void;
   onShowDiff: () => void;
 }
 
 /** How the run ended: verdict, why, checks, the coder's attempts, and what to do next. */
-export default function ResultBanner({ outcome, onOpenEvent, onShowDiff }: Props) {
+export default function ResultBanner({ runId, outcome, onOpenEvent, onShowDiff }: Props) {
   const look = LOOK[outcome.verdict];
   const commands = outcome.next?.lines.join("\n") ?? "";
   return (
@@ -51,6 +54,9 @@ export default function ResultBanner({ outcome, onOpenEvent, onShowDiff }: Props
                 {outcome.verdict === "stopped" ? "See the last event" : outcome.keyEvent.label} →
               </button>
             )}
+            <Link href={`/runs/new?from=${encodeURIComponent(runId)}`} className="pixel-btn px-3 py-1.5 text-sm" title="Open New run with this run's repo, issue and options">
+              ↻ Run again
+            </Link>
           </div>
         </div>
 
