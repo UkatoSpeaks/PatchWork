@@ -14,6 +14,7 @@ import type { CrewAgent, LaunchStatus, Plan, RunDetail, RunEvent, RunStatus } fr
 import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
 import EventDrawer from "./EventDrawer";
+import HelpOverlay from "./HelpOverlay";
 import InfoPanels, { type InfoTab } from "./InfoPanels";
 import LaunchWaiting from "./LaunchWaiting";
 import OfficeCanvas, { type AgentLines } from "./OfficeCanvas";
@@ -65,6 +66,7 @@ export default function RunView({ id }: { id: string }) {
   // A run started from the dashboard that hasn't written its first event yet.
   const [launch, setLaunch] = useState<LaunchStatus | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [help, setHelp] = useState(false);
   const indexRef = useRef(0);
   const closeRef = useRef<(() => void) | null>(null);
   const panelsRef = useRef<HTMLElement>(null);
@@ -284,13 +286,23 @@ export default function RunView({ id }: { id: string }) {
 
   // Keyboard: space plays / pauses, left / right step one event (or through the drawer
   // when it's open), 1-4 pick the speed, L goes live, Esc closes the drawer.
-  const keyState = { playPause, seek, changeSpeed, goLive, openEvent, index, inspect, neighbours, canGoLive: runStatus === "running" && !live };
+  const keyState = { playPause, seek, changeSpeed, goLive, openEvent, index, inspect, neighbours, help, canGoLive: runStatus === "running" && !live };
   const keys = useRef(keyState);
   keys.current = keyState;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey || typing(event.target)) return;
       const k = keys.current;
+      // The help panel takes the keys while it's open: ? or Esc closes it.
+      if (event.key === "?") {
+        event.preventDefault();
+        setHelp((open) => !open);
+        return;
+      }
+      if (k.help) {
+        if (event.key === "Escape") setHelp(false);
+        return;
+      }
       if (event.key === " " && !(event.target instanceof HTMLButtonElement)) {
         event.preventDefault();
         k.playPause();
@@ -344,33 +356,6 @@ export default function RunView({ id }: { id: string }) {
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-8 [&>*]:min-w-0">
       <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} live={live} status={runStatus} />
-      <OfficeCanvas
-        scene={scene}
-        snapKey={snapKey}
-        speed={speed}
-        playing={playing}
-        selected={selected}
-        onSelect={select}
-        onWhiteboard={openPlan}
-        onWalkingChange={setWalking}
-        onStatusChange={setStatus}
-      />
-      <ReplayControls
-        playing={playing}
-        speed={speed}
-        index={index}
-        total={events?.length ?? 0}
-        current={events ? describe(events[index - 1]) : "loading events…"}
-        phases={phases}
-        live={live}
-        canGoLive={runStatus === "running" && !live}
-        onGoLive={goLive}
-        onPlayPause={playPause}
-        onRestart={() => seek(0, true)}
-        onSpeed={changeSpeed}
-        onSeek={(n) => seek(n)}
-        onInspect={index > 0 ? () => openEvent(index - 1) : undefined}
-      />
       {error && (
         <p className="flex flex-wrap items-center gap-3 font-pixel text-sm text-terracotta" role="alert">
           {error}
@@ -379,36 +364,73 @@ export default function RunView({ id }: { id: string }) {
           </button>
         </p>
       )}
-      {showOutcome && <ResultBanner runId={id} outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
-      <section aria-label="Agents" className="flex flex-wrap gap-8">
-        {shown.map((name) => (
-          <AgentCard
-            key={name}
-            agent={scene.agents[name]}
-            walking={walking.includes(name)}
-            maxSteps={scene.maxSteps}
-            maxTokens={scene.maxTokens}
-            task={status[name]?.task ?? null}
-            now={status[name]?.now ?? null}
-            selected={selected === name}
-            onSelect={() => select(selected === name ? null : name)}
+      {/* Wide screens: the office (sized to fit the screen's height) with the log beside it. */}
+      <div className="run-grid grid min-w-0 grid-cols-1 gap-8">
+        <div className="flex min-w-0 flex-col gap-8">
+          <OfficeCanvas
+            scene={scene}
+            snapKey={snapKey}
+            speed={speed}
+            playing={playing}
+            selected={selected}
+            onSelect={select}
+            onWhiteboard={openPlan}
+            onWalkingChange={setWalking}
+            onStatusChange={setStatus}
           />
-        ))}
-      </section>
-      <div className="grid min-w-0 grid-cols-1 gap-8 lg:grid-cols-2 [&>*]:min-w-0">
-        <ActivityLog entries={entries} index={index} inspected={inspect} filter={logFilter} onFilter={filterLog} onOpen={openEvent} />
-        <InfoPanels
-          ref={panelsRef}
-          tab={tab}
-          onTab={setTab}
-          plan={plan}
-          snapshots={snapshots}
+          {showOutcome && <ResultBanner runId={id} outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
+          <section aria-label="Agents" className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+            {shown.map((name) => (
+              <AgentCard
+                key={name}
+                agent={scene.agents[name]}
+                walking={walking.includes(name)}
+                maxSteps={scene.maxSteps}
+                maxTokens={scene.maxTokens}
+                task={status[name]?.task ?? null}
+                now={status[name]?.now ?? null}
+                selected={selected === name}
+                onSelect={() => select(selected === name ? null : name)}
+              />
+            ))}
+          </section>
+        </div>
+        <div className="min-w-0 xl:sticky xl:top-4 xl:self-start">
+          <ActivityLog entries={entries} index={index} inspected={inspect} filter={logFilter} onFilter={filterLog} onOpen={openEvent} tall />
+        </div>
+      </div>
+      <InfoPanels
+        ref={panelsRef}
+        tab={tab}
+        onTab={setTab}
+        plan={plan}
+        snapshots={snapshots}
+        index={index}
+        roleOf={roleOf}
+        agents={stats}
+        phases={durations}
+      />
+      {/* Last in the page, so it stays pinned to the bottom of the screen all the way down. */}
+      <div className="sticky bottom-3 z-30">
+        <ReplayControls
+          playing={playing}
+          speed={speed}
           index={index}
-          roleOf={roleOf}
-          agents={stats}
-          phases={durations}
+          total={events?.length ?? 0}
+          current={events ? describe(events[index - 1]) : "loading events…"}
+          phases={phases}
+          live={live}
+          canGoLive={runStatus === "running" && !live}
+          onGoLive={goLive}
+          onPlayPause={playPause}
+          onRestart={() => seek(0, true)}
+          onSpeed={changeSpeed}
+          onSeek={(n) => seek(n)}
+          onInspect={index > 0 ? () => openEvent(index - 1) : undefined}
+          onHelp={() => setHelp(true)}
         />
       </div>
+      {help && <HelpOverlay onClose={() => setHelp(false)} />}
       {inspect !== null && events?.[inspect] && (
         <EventDrawer
           events={events}

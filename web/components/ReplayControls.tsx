@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useState } from "react";
+
 import { PHASE_COLORS, type PhaseSegment } from "@/lib/stats";
 
 export const SPEEDS = [1, 2, 4, 8];
@@ -22,9 +24,38 @@ interface Props {
   onSeek: (index: number) => void;
   // open the current event in the drawer
   onInspect?: () => void;
+  onHelp?: () => void;
 }
 
-export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek, onInspect }: Props) {
+const HINT_KEY = "patchwork:help-hint-seen";
+
+/** A one-time "press ? for shortcuts" nudge, remembered per browser. */
+function useHelpHint(): [boolean, () => void] {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    let seen = true;
+    try {
+      seen = localStorage.getItem(HINT_KEY) === "1";
+    } catch {
+      // no storage: don't nag
+    }
+    if (seen) return;
+    const timer = setTimeout(() => setShow(true), 1500);
+    return () => clearTimeout(timer);
+  }, []);
+  const dismiss = () => {
+    setShow(false);
+    try {
+      localStorage.setItem(HINT_KEY, "1");
+    } catch {
+      // fine
+    }
+  };
+  return [show, dismiss];
+}
+
+export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek, onInspect, onHelp }: Props) {
+  const [hint, dismissHint] = useHelpHint();
   return (
     <div className="pixel-box flex flex-col gap-4 bg-paper p-4">
       <div className="flex flex-wrap items-center gap-4">
@@ -88,6 +119,30 @@ export default function ReplayControls({ playing, speed, index, total, current, 
         <span className="shrink-0 font-pixel text-sm tabular-nums">
           {index} / {total}
         </span>
+        {onHelp && (
+          <span className="relative shrink-0">
+            <button
+              type="button"
+              className="pixel-btn h-7 w-7 text-sm font-bold"
+              onClick={() => {
+                dismissHint();
+                onHelp();
+              }}
+              title="Keys and clicks (?)"
+              aria-label="Keys and clicks"
+            >
+              ?
+            </button>
+            {hint && (
+              <span role="status" className="help-hint absolute bottom-full right-0 mb-3 flex w-max items-center gap-2 bg-ink px-2.5 py-1.5 font-pixel text-xs text-paper">
+                New here? Press ? for keys and clicks
+                <button type="button" onClick={dismissHint} className="text-paper/70 hover:text-paper" aria-label="Dismiss the tip">
+                  ✕
+                </button>
+              </span>
+            )}
+          </span>
+        )}
       </div>
     </div>
   );

@@ -464,3 +464,49 @@ body {
     animation: none;
   }
 }
+
+/* --- run page layout -------------------------------------------------------------- */
+/* Wide screens: the office column is as wide as fits the screen's height (the canvas
+   is 3:2), and the activity log takes the rest beside it. */
+@media (min-width: 80rem) {
+  .run-grid {
+    grid-template-columns: minmax(0, calc((100dvh - 25rem) * 1.5 + 1.5rem)) minmax(22rem, 1fr);
+  }
+}
+
+/* A key, as in the help panel. */
+.pixel-key {
+  display: inline-block;
+  min-width: 1.6rem;
+  padding: 1px 6px;
+  font-family: var(--font-pixel);
+  font-size: 12px;
+  text-align: center;
+  background: #fffdf7;
+  box-shadow:
+    -2px 0 0 0 var(--ink),
+    2px 0 0 0 var(--ink),
+    0 -2px 0 0 var(--ink),
+    0 2px 0 0 var(--ink),
+    inset 0 -3px 0 0 rgba(43, 37, 35, 0.15);
+}
+
+/* The tip's little tail, pointing at the ? button. */
+.help-hint::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  right: 10px;
+  border: 5px solid transparent;
+  border-top-color: var(--color-ink);
+}
+
+.help-panel {
+  animation: banner-in 160ms steps(3) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .help-panel {
+    animation: none;
+  }
+}

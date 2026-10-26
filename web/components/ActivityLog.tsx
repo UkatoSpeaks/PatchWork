@@ -29,10 +29,12 @@ interface Props {
   onFilter: (filter: LogFilter) => void;
   // open an event's details (and seek there)
   onOpen: (index: number) => void;
+  // as tall as the screen allows on wide screens (beside the office)
+  tall?: boolean;
 }
 
 /** Every event as a readable line. Future lines are dimmed; clicking one opens its details and seeks there. */
-export default function ActivityLog({ entries, index, inspected, filter, onFilter, onOpen }: Props) {
+export default function ActivityLog({ entries, index, inspected, filter, onFilter, onOpen, tall = false }: Props) {
   const listRef = useRef<HTMLOListElement>(null);
   const shown = useMemo(() => filterLog(entries, filter), [entries, filter]);
   const present = new Set(entries.map((e) => e.agent));
@@ -71,7 +73,7 @@ export default function ActivityLog({ entries, index, inspected, filter, onFilte
           ))}
         </div>
       </div>
-      <ol ref={listRef} className="pixel-scroll relative h-[22rem] overflow-y-auto overflow-x-hidden bg-cream/60 font-mono text-xs [font-variant-ligatures:none]" aria-label="Events">
+      <ol ref={listRef} className={`pixel-scroll relative h-[22rem] ${tall ? "xl:h-[calc(100dvh-17rem)] xl:min-h-[22rem]" : ""} overflow-y-auto overflow-x-hidden bg-cream/60 font-mono text-xs [font-variant-ligatures:none]`} aria-label="Events">
         {shown.length === 0 && <li className="p-3 text-ink-soft">No events for this agent.</li>}
         {shown.map((entry) => {
           const past = entry.index < index;

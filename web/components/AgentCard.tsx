@@ -63,7 +63,7 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens, task, n
       onClick={onSelect}
       aria-pressed={selected}
       title={selected ? "Show every agent in the log" : `Follow the ${ROLE[agent.name]} in the log`}
-      className={`pixel-box flex min-w-0 flex-1 basis-[15rem] cursor-pointer flex-col gap-2 p-3 text-left transition-transform hover:-translate-y-0.5 ${selected ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"} ${grey ? "opacity-70" : ""}`}
+      className={`pixel-box flex min-w-0 cursor-pointer flex-col gap-2 p-3 text-left transition-transform hover:-translate-y-0.5 ${selected ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"} ${grey ? "opacity-70" : ""}`}
     >
       <div className="flex w-full items-center gap-3">
         <Portrait agent={agent.name} animate={status !== "done" && status !== "cancelled"} grey={grey} />
