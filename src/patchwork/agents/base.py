@@ -159,6 +159,8 @@ class AgentEvent(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
     is_error: bool = False
+    # tool_result: the text the agent got back (the dashboard shows it, capped).
+    output: str = ""
     # Running total for the agent; for llm_call also this call's usage.
     tokens_used: int = 0
     prompt_tokens: int = 0
@@ -612,7 +614,7 @@ class Agent:
                         f"Do something different: {hint}"
                     ), summary)
                     self._emit(step, usage, "tool_result", tool=call.name, arguments=call.arguments, is_error=True,
-                               summary=summary)
+                               summary=summary, output=messages[-1]["content"])
                     blocks += 1
                     if blocks >= STUCK_BLOCKS:
                         return stuck(f"blocked {blocks} times by the repeated-call guard (last: {call.name})")
@@ -657,6 +659,7 @@ class Agent:
                     arguments=call.arguments,
                     summary=summary,
                     is_error=output.is_error or blocked,
+                    output=content,
                 )
                 if blocked:
                     blocks += 1

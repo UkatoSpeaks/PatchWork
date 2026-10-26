@@ -652,3 +652,40 @@ def test_a_stuck_last_retry_ends_the_run(stats_git: Path):
     assert not result.success and result.failed_agent is None and result.retries == 1
     assert result.attempts[-1].stop_reason == "stuck"
     assert of(events, "note", "orchestrator")[-1].payload["kind"] == "retry_limit"
+
+
+# --- what the dashboard gets from the log ------------------------------------------------
+
+
+def test_each_commit_logs_its_diff_and_a_retry_logs_its_own_change(stats_git: Path):
+    retry = [
+        reply(("edit_file", {"path": "stats/core.py", "old": "    ordered = sorted(values)",
+                             "new": "    ordered = sorted(values)  # copy"})),
+        reply(("run_tests", {})),
+        finish(summary="addressed review"),
+    ]
+    result, events, _, _ = crew(
+        stats_git,
+        {"lead": lead_script(), "tester": qa_script(), "coder": coder_script() + retry,
+         "reviewer": [submit_review(approved=False, issues=[BLOCKER], summary="Needs work."), submit_review()]},
+    )
+    finished = {e.payload["label"]: e.payload for e in of(events, "agent_finished")}
+    assert "+++ b/tests/test_median.py" in finished["tester"]["diff"] and "stats/core.py" not in finished["tester"]["diff"]
+    assert "+++ b/stats/core.py" in finished["coder"]["diff"] and "test_median" not in finished["coder"]["diff"]
+    merged = of(events, "merge")[-1].payload["diff"]
+    assert "+++ b/stats/core.py" in merged and "+++ b/tests/test_median.py" in merged
+    retried = finished["coder (retry 1: review)"]
+    assert retried["diff"] == result.diff
+    # The retry's own change is just its one-line edit.
+    assert "+    ordered = sorted(values)  # copy" in retried["change"] and "test_median" not in retried["change"]
+    assert "+def median" not in retried["change"]
+
+
+def test_tool_results_log_their_output_capped(stats_git: Path, monkeypatch):
+    monkeypatch.setattr("patchwork.orchestrator.TOOL_OUTPUT_LOG_CHARS", 50)
+    _, events, _, _ = crew(stats_git, {"lead": lead_script(), "tester": qa_script(), "coder": coder_script(),
+                                       "reviewer": [submit_review()]})
+    search = next(e for e in of(events, "tool_result", "lead") if e.payload["tool"] == "search_code")
+    assert "def mean" in search.payload["output"]
+    long = next(e for e in of(events, "tool_result") if e.payload.get("output_chars"))
+    assert len(long.payload["output"]) == 50 and long.payload["output_chars"] > 50

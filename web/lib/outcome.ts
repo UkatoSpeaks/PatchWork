@@ -110,7 +110,9 @@ export function runOutcome(result: Record<string, any> | null, events: RunEvent[
   const blockers = (verdict?.issues ?? []).filter((i) => i.severity === "blocker").map((i) => ({ file: String(i.file ?? ""), description: String(i.description ?? "") }));
   const testsIndex = lastIndex(events, (e) => e.type === "tests_run");
   const reviewIndex = lastIndex(events, (e) => e.type === "review_verdict");
-  const files = parseDiff(String(result.diff ?? ""));
+  // The final diff; a run that stopped before merging has its last logged commit instead.
+  const lastLogged = events.findLast((e) => typeof e.payload?.diff === "string")?.payload.diff;
+  const files = parseDiff(String(result.diff || lastLogged || ""));
   const changes = files.length
     ? { files: files.length, additions: files.reduce((n, f) => n + f.additions, 0), deletions: files.reduce((n, f) => n + f.deletions, 0) }
     : null;

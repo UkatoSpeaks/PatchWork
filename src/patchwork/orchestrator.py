@@ -45,6 +45,16 @@ from patchwork.tools import shell
 from patchwork.workspace import MergeConflict, Workspace, WorkspaceError, ensure_repo
 
 CREW = ("lead", "tester", "coder", "reviewer")
+# Caps on what goes into the event log for the dashboard: a tool's output, and a diff.
+TOOL_OUTPUT_LOG_CHARS = 4_000
+DIFF_LOG_CHARS = 100_000
+
+
+def _capped(key: str, text: str, limit: int) -> dict[str, Any]:
+    """``{key: text}``, cut to ``limit`` characters; then ``<key>_chars`` gives the full length."""
+    if len(text) <= limit:
+        return {key: text}
+    return {key: text[:limit], f"{key}_chars": len(text)}
 
 
 class Orchestrator:
@@ -166,7 +176,7 @@ class Orchestrator:
                                ok=False, conflicts=exc.files)
                     raise
                 self._emit("orchestrator", "merge", branch=workspace.branch(name), into=workspace.branch("result"),
-                           ok=True, files=files)
+                           ok=True, files=files, **_capped("diff", workspace.diff("result"), DIFF_LOG_CHARS))
         tester_files = workspace.changed_files("tester")
 
         review_round = 0
@@ -277,8 +287,9 @@ class Orchestrator:
         # Commit even after a failure, so the branch shows what was attempted.
         committed = workspace.commit_all("tester", f"patchwork {self.run_id}: tester")
         run.tests_written = [p for p in workspace.changed_files("tester") if is_test_module(p)]
+        diff = _capped("diff", workspace.diff("tester"), DIFF_LOG_CHARS) if committed else {}
         self._agent_finished(entry, tests_written=run.tests_written, committed=committed,
-                             branch=workspace.branch("tester"))
+                             branch=workspace.branch("tester"), **diff)
         return entry.result.success
 
     async def _implement_coder(self, run: RunResult, issue: str, plan: Plan, workspace: Workspace, path: Path) -> bool:
@@ -289,8 +300,9 @@ class Orchestrator:
         entry = await self._run_agent(run, "coder", "coder", coder, task, attempt=1)
         self._record_attempt(run, entry)
         committed = workspace.commit_all("coder", f"patchwork {self.run_id}: coder")
+        diff = _capped("diff", workspace.diff("coder"), DIFF_LOG_CHARS) if committed else {}
         self._agent_finished(entry, committed=committed, branch=workspace.branch("coder"),
-                             files=workspace.changed_files("coder"))
+                             files=workspace.changed_files("coder"), **diff)
         return entry.result.success
 
     async def _retry(
@@ -326,7 +338,9 @@ class Orchestrator:
                                           attempt=len(run.attempts) + 1, retry=attempt, escalated=escalated)
             self._record_attempt(run, entry, retry=attempt, reason=reason)
             committed = workspace.commit_all("result", f"patchwork {self.run_id}: coder retry {attempt} ({reason})")
-            self._agent_finished(entry, committed=committed, attempt=attempt, reason=reason)
+            diffs = ({**_capped("diff", workspace.diff("result"), DIFF_LOG_CHARS),
+                      **_capped("change", workspace.commit_diff("result"), DIFF_LOG_CHARS)} if committed else {})
+            self._agent_finished(entry, committed=committed, attempt=attempt, reason=reason, **diffs)
         if entry.result.success or committed:
             return "changed"
         left = self.max_retries - self._retries_used(run)
@@ -447,7 +461,7 @@ class Orchestrator:
                 self._emit(agent, "tool_called", step=event.step, tool=event.tool, arguments=event.arguments)
             elif event.kind == "tool_result":
                 self._emit(agent, "tool_result", step=event.step, tool=event.tool, summary=event.summary,
-                           is_error=event.is_error)
+                           is_error=event.is_error, **_capped("output", event.output, TOOL_OUTPUT_LOG_CHARS))
             elif event.kind == "model_switch":
                 self._emit(agent, "note", step=event.step, kind="model_switch", text=event.summary,
                            is_error=event.is_error, from_model=event.arguments.get("from"),

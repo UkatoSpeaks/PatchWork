@@ -176,11 +176,19 @@ class Workspace:
         out = git(self.repo, "diff", "--name-only", "--no-renames", self.base, self.branch(name)).stdout
         return sorted(line for line in out.splitlines() if line.strip())
 
-    def diff(self, name: str) -> str:
+    def _diff(self, old: str, new: str) -> str:
         return git(
             self.repo, "diff", "--no-color", "--no-ext-diff", "--no-renames",
-            "--src-prefix=a/", "--dst-prefix=b/", self.base, self.branch(name),
+            "--src-prefix=a/", "--dst-prefix=b/", old, new,
         ).stdout
+
+    def diff(self, name: str) -> str:
+        """Branch ``name`` against the run's base commit."""
+        return self._diff(self.base, self.branch(name))
+
+    def commit_diff(self, name: str) -> str:
+        """What the last commit on branch ``name`` changed."""
+        return self._diff(f"{self.branch(name)}~1", self.branch(name))
 
     def merge(self, into: str, name: str) -> list[str]:
         """Merge branch ``name`` into worktree ``into``. Returns the files it brought in."""

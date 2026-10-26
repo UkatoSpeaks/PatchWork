@@ -34,6 +34,14 @@ describe("tool call pairing", () => {
     expect(detail.related).toEqual({ index: call + 1, label: "Go to its result" });
     expect(eventDetail(events, call + 1).related).toEqual({ index: call, label: "Go to the call" });
   });
+
+  it("shows what the agent got back, noting when it was cut", () => {
+    const call = indexOf((e) => e.type === "tool_called" && e.payload.tool === "search_code");
+    const withOutput = events.map((e, i) => (i === call + 1 ? { ...e, payload: { ...e.payload, output: "stats/core.py:3: def mean", output_chars: 9000 } } : e));
+    const code = ofKind(eventDetail(withOutput, call).blocks, "code");
+    expect(code).toEqual([{ kind: "code", title: "What the agent got back (first 25 of 9,000 characters)", text: "stats/core.py:3: def mean" }]);
+    expect(ofKind(eventDetail(events, call).blocks, "code")).toEqual([]); // old logs: no output
+  });
 });
 
 describe("toolCallBlocks", () => {

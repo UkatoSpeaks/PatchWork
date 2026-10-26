@@ -7,6 +7,7 @@ import { fileRoles } from "@/lib/diff";
 import { filterLog as filterEntries, logEntries, type LogFilter } from "@/lib/log";
 import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
 import { runOutcome } from "@/lib/outcome";
+import { diffSnapshots } from "@/lib/snapshots";
 import { agentStats, phaseDurations, phaseSegments } from "@/lib/stats";
 import type { CrewAgent, LaunchStatus, Plan, RunDetail, RunEvent, RunStatus } from "@/lib/types";
 
@@ -323,6 +324,7 @@ export default function RunView({ id }: { id: string }) {
     () => runOutcome(detail?.result ?? finishedResult, events ?? [], runStatus),
     [detail, finishedResult, events, runStatus],
   );
+  const snapshots = useMemo(() => diffSnapshots(events ?? [], detail?.result ?? finishedResult), [events, detail, finishedResult]);
   // Show it once the replay reaches the end of the run.
   const showOutcome = outcome && (outcome.verdict === "stopped" ? index >= (events?.length ?? 0) : scene.outcome !== null);
 
@@ -400,7 +402,8 @@ export default function RunView({ id }: { id: string }) {
           tab={tab}
           onTab={setTab}
           plan={plan}
-          diff={String(detail?.result?.diff ?? "")}
+          snapshots={snapshots}
+          index={index}
           roleOf={roleOf}
           agents={stats}
           phases={durations}

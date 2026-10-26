@@ -178,6 +178,12 @@ function toolDetail(events: RunEvent[], index: number): EventDetail {
   const blocks: Block[] = call ? toolCallBlocks(tool, call.payload?.arguments) : [];
   if (result) {
     blocks.push({ kind: "text", title: "Result", text: String(result.payload?.summary ?? "done"), tone: result.payload?.is_error ? "bad" : "neutral" });
+    const output = result.payload?.output;
+    if (isText(output) && output.trim()) {
+      const full = Number(result.payload?.output_chars);
+      const title = Number.isFinite(full) && full > output.length ? `What the agent got back (first ${num(output.length)} of ${num(full)} characters)` : "What the agent got back";
+      blocks.push({ kind: "code", title, text: output });
+    }
   } else if (isCall) {
     blocks.push({ kind: "text", title: "Result", text: "No result yet.", tone: "wait" });
   }
