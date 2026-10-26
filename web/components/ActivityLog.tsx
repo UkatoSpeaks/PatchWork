@@ -14,7 +14,7 @@ const FILTERS: LogFilter[] = ["all", "lead", "tester", "coder", "reviewer", "orc
 const TONE: Record<LogEntry["tone"], string> = {
   info: "",
   tool: "",
-  wait: "text-[#8b6f55]",
+  wait: "text-wait",
   phase: "font-bold",
   good: "text-moss",
   bad: "text-terracotta",
@@ -99,11 +99,11 @@ export default function ActivityLog({ entries, index, inspected, filter, onFilte
                 aria-current={current ? "step" : undefined}
                 aria-expanded={open}
                 title={`Details of event ${entry.index + 1}`}
-                className={`group flex w-full min-w-0 items-baseline gap-2 border-l-4 px-2 py-1 text-left hover:bg-[#fff6dc] ${current ? "bg-[#fff1c7]" : ""} ${open ? "outline-2 -outline-offset-2 outline-ink" : ""} ${past ? "" : "opacity-45"}`}
+                className={`group flex w-full min-w-0 items-baseline gap-2 border-l-4 px-2 py-1 text-left hover:bg-hover ${current ? "bg-now" : ""} ${open ? "outline-2 -outline-offset-2 outline-ink" : ""} ${past ? "" : "opacity-45"}`}
                 style={{ borderColor: AGENT_COLORS[entry.agent] }}
               >
                 <span className="w-9 shrink-0 tabular-nums text-ink-soft">{clockLabel(entry.at)}</span>
-                <span className="w-16 shrink-0 truncate font-pixel text-[11px] font-bold" style={{ color: entry.agent === "orchestrator" ? "#5a4f4a" : undefined }}>
+                <span className="w-16 shrink-0 truncate font-pixel text-[11px] font-bold" style={{ color: entry.agent === "orchestrator" ? "var(--color-ink-soft)" : undefined }}>
                   <span aria-hidden className="mr-1 inline-block h-2 w-2" style={{ background: AGENT_COLORS[entry.agent] }} />
                   {ROLE[entry.agent] ?? entry.agent}
                 </span>

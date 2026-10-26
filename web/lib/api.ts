@@ -43,6 +43,10 @@ export const fetchLaunch = (id: string) => getJson<LaunchStatus>(`/api/launches/
 export const startRun = (body: LaunchRequest) =>
   request<{ run_id: string }>("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.run_id);
 
+/** Ask a running run to stop; it cleans up and writes its result within a few seconds. */
+export const stopRun = (id: string) =>
+  request<{ run_id: string; state: "stopping" }>(`/api/runs/${encodeURIComponent(id)}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
 /**
  * Replay events[start..] over SSE at `speed` (0: as fast as possible). For a run
  * that is still going, `onLive` fires once the replay has caught up; after that,

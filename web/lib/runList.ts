@@ -24,6 +24,7 @@ export const SORTS: { key: SortKey; label: string }[] = [
 
 export function stateOf(run: RunSummary): RunState {
   if (run.status === "running") return "live";
+  if (run.status === "stopped") return "stopped";
   if (run.success === true) return "pass";
   if (run.success === false) return "fail";
   return "stopped";

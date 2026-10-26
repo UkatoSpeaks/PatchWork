@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { API_URL, ApiError, fetchEvents, fetchLaunch, fetchRun, streamEvents } from "@/lib/api";
+import { API_URL, ApiError, fetchEvents, fetchLaunch, fetchRun, stopRun, streamEvents } from "@/lib/api";
 import { fileRoles } from "@/lib/diff";
 import { filterLog as filterEntries, logEntries, type LogFilter } from "@/lib/log";
 import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
@@ -65,6 +65,8 @@ export default function RunView({ id }: { id: string }) {
   const [tab, setTab] = useState<InfoTab>("plan");
   const [live, setLive] = useState(false);
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
+  // A stop was asked for (here or elsewhere) and the run hasn't ended yet.
+  const [stopRequested, setStopRequested] = useState(false);
   // The event open in the drawer, if any.
   const [inspect, setInspect] = useState<number | null>(null);
   // A run started from the dashboard that hasn't written its first event yet.
@@ -88,8 +90,9 @@ export default function RunView({ id }: { id: string }) {
         (d) => {
           setDetail(d);
           setRunStatus(d.summary.status);
+          setStopRequested(!!d.summary.stop_requested);
           // result.json is written just after the run_finished line; try once more if we beat it.
-          if (retry && d.summary.status === "finished" && !d.result) setTimeout(() => refreshDetail(false), 1500);
+          if (retry && d.summary.finished && !d.result) setTimeout(() => refreshDetail(false), 1500);
         },
         () => undefined,
       );
@@ -146,6 +149,7 @@ export default function RunView({ id }: { id: string }) {
         setEvents(loaded);
         setDetail(d);
         setRunStatus(d?.summary.status ?? null);
+        setStopRequested(!!d?.summary.stop_requested);
         // ?tab=plan|diff|stats opens that panel.
         const tabParam = new URLSearchParams(window.location.search).get("tab");
         if (tabParam === "plan" || tabParam === "diff" || tabParam === "stats") setTab(tabParam);
@@ -211,6 +215,14 @@ export default function RunView({ id }: { id: string }) {
   );
 
   /** Jump to the newest event and follow the run from there. */
+  const requestStop = () => {
+    setStopRequested(true);
+    stopRun(id).catch((e: Error) => {
+      setStopRequested(false);
+      setError(`Couldn't stop the run: ${e.message}`);
+    });
+  };
+
   const goLive = () => {
     if (!events) return;
     stop();
@@ -361,7 +373,16 @@ export default function RunView({ id }: { id: string }) {
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-8 [&>*]:min-w-0">
-      <TopBar runId={id} scene={scene} issue={detail?.result?.issue ?? ""} live={live} status={runStatus} loading={!events} />
+      <TopBar
+        runId={id}
+        scene={scene}
+        issue={detail?.result?.issue ?? ""}
+        live={live}
+        status={runStatus}
+        loading={!events}
+        stopping={stopRequested}
+        onStop={requestStop}
+      />
       {error && (
         <p className="flex flex-wrap items-center gap-3 font-pixel text-sm text-terracotta" role="alert">
           {error}
@@ -385,19 +406,24 @@ export default function RunView({ id }: { id: string }) {
             onStatusChange={setStatus}
           />
           {showOutcome && <ResultBanner runId={id} outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
-          <section aria-label="Agents" className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+          {/* Phones: a row of cards to swipe through; wider: a grid. */}
+          <section
+            aria-label="Agents"
+            className="-mx-4 flex snap-x snap-mandatory scroll-px-4 gap-4 overflow-x-auto px-4 pt-1 pb-4 sm:mx-0 sm:grid sm:grid-cols-2 sm:gap-6 sm:overflow-visible sm:p-0 lg:grid-cols-4"
+          >
             {shown.map((name) => (
-              <AgentCard
-                key={name}
-                agent={scene.agents[name]}
-                walking={walking.includes(name)}
-                maxSteps={scene.maxSteps}
-                maxTokens={scene.maxTokens}
-                task={status[name]?.task ?? null}
-                now={status[name]?.now ?? null}
-                selected={selected === name}
-                onSelect={() => select(selected === name ? null : name)}
-              />
+              <div key={name} className="flex w-[15.5rem] shrink-0 snap-start sm:w-auto">
+                <AgentCard
+                  agent={scene.agents[name]}
+                  walking={walking.includes(name)}
+                  maxSteps={scene.maxSteps}
+                  maxTokens={scene.maxTokens}
+                  task={status[name]?.task ?? null}
+                  now={status[name]?.now ?? null}
+                  selected={selected === name}
+                  onSelect={() => select(selected === name ? null : name)}
+                />
+              </div>
             ))}
           </section>
         </div>

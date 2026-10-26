@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
+import ThemeToggle from "./ThemeToggle";
+
 /** The header and page width: a run's page is wide (office beside the log), the others are narrower. */
 export default function PageFrame({ children }: { children: React.ReactNode }) {
   const path = usePathname();
@@ -21,7 +23,10 @@ export default function PageFrame({ children }: { children: React.ReactNode }) {
           </span>
           Patchwork Office
         </Link>
-        <span className="hidden font-pixel text-sm text-ink-soft sm:block">a crew of four, fixing issues</span>
+        <div className="flex items-center gap-4">
+          <span className="hidden font-pixel text-sm text-ink-soft md:block">a crew of four, fixing issues</span>
+          <ThemeToggle />
+        </div>
       </header>
       <main id="main" tabIndex={-1} className={`mx-auto ${width} px-4 pb-16 outline-none sm:px-6`}>{children}</main>
     </>

@@ -84,7 +84,7 @@ export const PHASE_ORDER = ["plan", "implement", "integrate", "verify", "review"
 
 // Categorical slots in fixed phase order (validated for colour-blind separation).
 export const PHASE_COLORS: Record<string, string> = {
-  setup: "#cbbf9f",
+  setup: "var(--color-track)",
   plan: "#2a78d6",
   implement: "#eb6834",
   integrate: "#1baf7a",

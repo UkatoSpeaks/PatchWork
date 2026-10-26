@@ -171,7 +171,8 @@ class AgentEvent(BaseModel):
 # "cancelled": stopped by the orchestrator (e.g. its parallel sibling failed).
 # "stuck": going in circles (repeated-call blocks or the same tool error in a row).
 StopReason = Literal[
-    "finished", "max_steps", "max_tokens", "invalid_output", "error", "daily_limit", "cancelled", "stuck"
+    "finished", "max_steps", "max_tokens", "invalid_output", "error", "daily_limit", "cancelled", "stuck",
+    "stopped",
 ]
 
 

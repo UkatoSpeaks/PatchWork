@@ -12,14 +12,14 @@ export type Status = "idle" | "walking" | "thinking" | "typing" | "testing" | "w
 
 const STATUS_STYLE: Record<Status, string> = {
   idle: "bg-cream-dark text-ink",
-  walking: "bg-sage text-ink",
-  thinking: "bg-slate text-paper",
-  typing: "bg-mustard text-ink",
-  testing: "bg-plum text-paper",
-  waiting: "bg-[#8b6f55] text-paper",
-  done: "bg-moss text-paper",
-  failed: "bg-terracotta text-paper",
-  cancelled: "bg-[#9a948c] text-paper",
+  walking: "bg-sage text-onlight",
+  thinking: "bg-slate text-on",
+  typing: "bg-mustard text-onlight",
+  testing: "bg-plum text-on",
+  waiting: "bg-wait text-on",
+  done: "bg-moss text-on",
+  failed: "bg-terracotta text-on",
+  cancelled: "bg-mute text-on",
 };
 
 export const ROLE: Record<string, string> = { lead: "Lead", tester: "Tester", coder: "Coder", reviewer: "Reviewer", orchestrator: "System" };
@@ -63,7 +63,7 @@ export default function AgentCard({ agent, walking, maxSteps, maxTokens, task, n
       onClick={onSelect}
       aria-pressed={selected}
       title={selected ? "Show every agent in the log" : `Follow the ${ROLE[agent.name]} in the log`}
-      className={`pixel-box flex min-w-0 cursor-pointer flex-col gap-2 p-3 text-left transition-transform hover:-translate-y-0.5 ${selected ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"} ${grey ? "opacity-70" : ""}`}
+      className={`pixel-box flex w-full min-w-0 cursor-pointer flex-col gap-2 p-3 text-left transition-transform hover:-translate-y-0.5 ${selected ? "bg-hover outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"} ${grey ? "opacity-70" : ""}`}
     >
       <div className="flex w-full items-center gap-3">
         <Portrait agent={agent.name} animate={status !== "done" && status !== "cancelled"} grey={grey} />

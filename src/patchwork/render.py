@@ -250,7 +250,9 @@ class CliRenderer:
     def _render_outcome(self, result: dict[str, Any]) -> None:
         self._section("Result")
         self._line(f"success:       {result['success']}", fg="green" if result["success"] else "red", bold=True)
-        if result.get("error"):
+        if result.get("stopped"):
+            self._line(f"stopped:       {result.get('error') or 'on request'}", fg="yellow")
+        elif result.get("error"):
             self._line(f"error:         {result['error']}", fg="red")
         elif result.get("failed_agent"):
             self._line(f"stopped at:    {result['failed_agent']} (agent failed)", fg="red")

@@ -57,16 +57,25 @@ function useHelpHint(): [boolean, () => void] {
 export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek, onInspect, onHelp }: Props) {
   const [hint, dismissHint] = useHelpHint();
   return (
-    <div className="pixel-box flex flex-col gap-4 bg-paper p-4">
-      <div className="flex flex-wrap items-center gap-4">
+    <div className="pixel-box relative flex flex-col gap-3 bg-paper p-3 sm:gap-4 sm:p-4">
+      {hint && (
+        // Above the bar, pointing down at the ? button, so it never hides the controls.
+        <span role="status" className="help-hint absolute bottom-full right-2 mb-4 flex w-max max-w-[calc(100%-1rem)] items-center gap-2 bg-ink px-2.5 py-1.5 font-pixel text-xs text-paper">
+          New here? Press ? for keys and clicks
+          <button type="button" onClick={dismissHint} className="text-paper/70 hover:text-paper" aria-label="Dismiss the tip">
+            ✕
+          </button>
+        </span>
+      )}
+      <div className="flex flex-wrap items-center gap-3 sm:gap-4">
         <button type="button" className="pixel-btn min-w-24 px-3 py-1.5 text-sm font-bold" onClick={onPlayPause} title="Play / pause (space)">
           {playing ? "❚❚ pause" : "▶ play"}
         </button>
-        <button type="button" className="pixel-btn px-3 py-1.5 text-sm" onClick={onRestart}>
-          ↺ restart
+        <button type="button" className="pixel-btn px-3 py-1.5 text-sm" onClick={onRestart} aria-label="Restart" title="Restart">
+          ↺<span className="hidden sm:inline"> restart</span>
         </button>
         {live && (
-          <span className="inline-flex items-center gap-1.5 bg-terracotta px-2 py-1 font-pixel text-sm font-bold text-paper" role="status">
+          <span className="inline-flex items-center gap-1.5 bg-terracotta px-2 py-1 font-pixel text-sm font-bold text-on" role="status">
             <span aria-hidden className="live-dot" /> live
           </span>
         )}
@@ -75,7 +84,7 @@ export default function ReplayControls({ playing, speed, index, total, current, 
             <span aria-hidden className="live-dot" /> go live
           </button>
         )}
-        <div className={`flex items-center gap-3 ${live ? "opacity-50" : ""}`} role="group" aria-label="Replay speed">
+        <div className={`flex items-center gap-2 sm:gap-3 ${live ? "opacity-50" : ""}`} role="group" aria-label="Replay speed">
           {SPEEDS.map((s, i) => (
             <button
               key={s}
@@ -94,16 +103,16 @@ export default function ReplayControls({ playing, speed, index, total, current, 
           <button
             type="button"
             onClick={onInspect}
-            className="pixel-link ml-auto min-w-0 max-w-full truncate font-mono text-xs text-ink-soft underline decoration-dotted underline-offset-4 hover:text-terracotta"
+            className="pixel-link ml-auto hidden min-w-0 max-w-full truncate font-mono text-xs text-ink-soft underline decoration-dotted underline-offset-4 hover:text-terracotta sm:block"
             title="Show this event's details"
           >
             {current} ›
           </button>
         ) : (
-          <span className="ml-auto min-w-0 max-w-full truncate font-mono text-xs text-ink-soft">{current}</span>
+          <span className="ml-auto hidden min-w-0 max-w-full truncate font-mono text-xs text-ink-soft sm:block">{current}</span>
         )}
       </div>
-      <div className="flex items-start gap-4 px-1">
+      <div className="flex items-start gap-3 px-1 sm:gap-4">
         <div className="flex min-w-0 flex-1 flex-col gap-3">
           <input
             type="range"
@@ -115,13 +124,17 @@ export default function ReplayControls({ playing, speed, index, total, current, 
             aria-label="Event position (left / right arrow keys step one event)"
             aria-valuetext={total ? `Event ${index} of ${total}${current && index ? `: ${current}` : ""}` : "No events yet"}
           />
-          {phases.length > 0 && total > 0 && <PhaseTimeline phases={phases} index={index} total={total} onSeek={onSeek} />}
+          {phases.length > 0 && total > 0 && (
+            <div className="hidden sm:block">
+              <PhaseTimeline phases={phases} index={index} total={total} onSeek={onSeek} />
+            </div>
+          )}
         </div>
         <span className="shrink-0 font-pixel text-sm tabular-nums">
           {index} / {total}
         </span>
         {onHelp && (
-          <span className="relative shrink-0">
+          <span className="shrink-0">
             <button
               type="button"
               className="pixel-btn h-7 w-7 text-sm font-bold"
@@ -134,14 +147,6 @@ export default function ReplayControls({ playing, speed, index, total, current, 
             >
               ?
             </button>
-            {hint && (
-              <span role="status" className="help-hint absolute bottom-full right-0 mb-3 flex w-max items-center gap-2 bg-ink px-2.5 py-1.5 font-pixel text-xs text-paper">
-                New here? Press ? for keys and clicks
-                <button type="button" onClick={dismissHint} className="text-paper/70 hover:text-paper" aria-label="Dismiss the tip">
-                  ✕
-                </button>
-              </span>
-            )}
           </span>
         )}
       </div>
@@ -165,7 +170,7 @@ function PhaseTimeline({ phases, index, total, onSeek }: { phases: PhaseSegment[
             aria-label={`Jump to ${segment.label}`}
             aria-current={current ? "step" : undefined}
             className={`group relative min-w-[6px] overflow-hidden text-left font-pixel text-[10px] leading-5 text-ink ${current ? "outline-2 outline-ink" : "opacity-75 hover:opacity-100"}`}
-            style={{ flexGrow: share, flexBasis: 0, background: PHASE_COLORS[segment.phase] ?? "#cbbf9f" }}
+            style={{ flexGrow: share, flexBasis: 0, background: PHASE_COLORS[segment.phase] ?? "var(--color-track)" }}
           >
             {share > 0.07 && <span className="absolute inset-y-0 left-1 truncate rounded-none bg-paper/80 px-0.5 leading-4 my-0.5">{segment.label}</span>}
           </button>

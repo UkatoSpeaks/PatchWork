@@ -30,6 +30,8 @@ const runs = [
 describe("runs list", () => {
   it("knows each run's state and repo name", () => {
     expect(runs.map(stateOf)).toEqual(["pass", "fail", "stopped", "live"]);
+    // Stopped on request: it has a result (success false) but counts as stopped, not failed.
+    expect(stateOf(run("5", { success: false, status: "stopped" }))).toBe("stopped");
     expect(runs.map((r) => repoName(r.repo))).toEqual(["stats_feature", "text_utils", "app", "calculator"]);
     expect(repoName("")).toBe("");
   });

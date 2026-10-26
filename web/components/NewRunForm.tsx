@@ -50,8 +50,8 @@ function Step({ n, title, hint, children }: { n: number; title: string; hint?: s
 }
 
 const MARK: Record<string, { mark: string; className: string }> = {
-  true: { mark: "✓", className: "bg-moss text-paper" },
-  false: { mark: "✗", className: "bg-terracotta text-paper" },
+  true: { mark: "✓", className: "bg-moss text-on" },
+  false: { mark: "✗", className: "bg-terracotta text-on" },
   null: { mark: "…", className: "bg-cream-dark text-ink" },
 };
 
@@ -325,11 +325,11 @@ export default function NewRunForm() {
                         tabIndex={focusable ? 0 : -1}
                         data-toy={toy.name}
                         onClick={() => pickToy(toy)}
-                        className={`pixel-box-sm flex min-w-0 flex-col gap-1.5 p-3 text-left transition-transform hover:-translate-y-0.5 ${picked ? "bg-[#fff6dc] outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"}`}
+                        className={`pixel-box-sm flex min-w-0 flex-col gap-1.5 p-3 text-left transition-transform hover:-translate-y-0.5 ${picked ? "bg-hover outline-3 outline-dashed outline-offset-4 outline-mustard" : "bg-paper"}`}
                       >
                         <span className="font-mono text-sm font-bold">{toy.name}</span>
                         {toy.about && <span className="line-clamp-2 text-xs text-ink-soft">{toy.about}</span>}
-                        <span className={`mt-auto self-start px-1.5 font-pixel text-[10px] uppercase tracking-wider ${toy.issue ? "bg-moss text-paper" : "bg-cream-dark text-ink"}`}>
+                        <span className={`mt-auto self-start px-1.5 font-pixel text-[10px] uppercase tracking-wider ${toy.issue ? "bg-moss text-on" : "bg-cream-dark text-ink"}`}>
                           {toy.issue ? "has ISSUE.md" : "write your own issue"}
                         </span>
                       </button>

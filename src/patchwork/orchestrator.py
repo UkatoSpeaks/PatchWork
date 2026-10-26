@@ -15,6 +15,10 @@ Crew flow:
    fresh coder retry in the result worktree (on CODER_RETRY_MODEL), up to
    ``max_retries`` in total.
 
+``stop`` ends a run early: the agent at work is cancelled, its work so far is
+committed and recorded with stop reason "stopped", and the run unwinds through
+the usual cleanup and ``run_finished`` with ``stopped`` set.
+
 Success = the full suite passes in the result worktree and the reviewer
 approved. The diff and changed files come from git. Worktrees are always
 removed; a failed run keeps the branches that have commits for inspection.
@@ -50,6 +54,10 @@ TOOL_OUTPUT_LOG_CHARS = 4_000
 DIFF_LOG_CHARS = 100_000
 
 
+class RunStopped(Exception):
+    """Raised after a stopped agent is recorded, to unwind the run."""
+
+
 def _capped(key: str, text: str, limit: int) -> dict[str, Any]:
     """``{key: text}``, cut to ``limit`` characters; then ``<key>_chars`` gives the full length."""
     if len(text) <= limit:
@@ -80,6 +88,9 @@ class Orchestrator:
         self.max_retries = settings.max_retries if max_retries is None else max_retries
         # Agents the orchestrator is cancelling (their sibling failed).
         self._cancelling: set[str] = set()
+        # Set by stop(); the task running run() / run_solo(), which stop() cancels.
+        self._stop_reason: str | None = None
+        self._task: asyncio.Task[Any] | None = None
         # Models whose proportional-throttling fallback has been announced.
         self._throttle_fallbacks: set[str] = set()
         if isinstance(llm, LLMClient):
@@ -92,19 +103,54 @@ class Orchestrator:
     def run_id(self) -> str:
         return self.bus.run_id
 
+    @property
+    def stopping(self) -> bool:
+        return self._stop_reason is not None
+
+    def stop(self, reason: str = "stop requested") -> bool:
+        """Stop the run as soon as possible. Call it from the event loop the run
+        is on (not from inside the run). The agent at work is cancelled: an LLM
+        call or rate-limit wait ends at once, a tool already running (e.g. the
+        tests) finishes in the background. Before the run has started, it stops
+        as soon as it starts. False if it is already stopping or has finished."""
+        if self._stop_reason is not None or (self._task is not None and self._task.done()):
+            return False
+        self._stop_reason = reason
+        self._emit("orchestrator", "note", kind="stopping", text=f"stopping: {reason}")
+        if self._task is not None:
+            self._task.cancel()
+        return True
+
+    def _stopped(self, run: RunResult, exc: BaseException) -> bool:
+        """Record a stop on ``run``. True if it was asked for with stop(), so the
+        cancellation is ours to absorb; False for a cancellation from outside."""
+        task = asyncio.current_task()
+        ours = self._stop_reason is not None
+        if ours and isinstance(exc, asyncio.CancelledError) and task is not None and task.cancelling():
+            task.uncancel()
+        run.stopped = True
+        run.error = f"stopped: {self._stop_reason or 'cancelled'}"
+        return ours
+
     # --- crew -------------------------------------------------------------------
 
     async def run(self, issue: str) -> RunResult:
         run = RunResult(run_id=self.run_id, issue=issue, mode="crew", sequential=self.sequential)
         self._run_started(run, roles=CREW)
         workspace: Workspace | None = None
+        self._task = asyncio.current_task()
+        reraise = False
         try:
+            if self.stopping:
+                raise RunStopped
             ensure_repo(self.repo, init_git=self.init_git)
             workspace = Workspace(self.repo, self.run_id)
             run.base_commit = workspace.base
             await self._crew(issue, run, workspace)
         except WorkspaceError as exc:
             run.error = str(exc)
+        except (RunStopped, asyncio.CancelledError) as exc:
+            reraise = not self._stopped(run, exc)
         finally:
             run.success = (
                 run.error is None
@@ -117,6 +163,8 @@ class Orchestrator:
                 self._finish_workspace(run, workspace)
         run.usage_today = self._usage_today()
         self._emit("orchestrator", "run_finished", result=run.model_dump(mode="json"))
+        if reraise:
+            raise asyncio.CancelledError
         return run
 
     def _finish_workspace(self, run: RunResult, workspace: Workspace) -> None:
@@ -265,7 +313,7 @@ class Orchestrator:
 
     def _record_attempt(self, run: RunResult, entry: AgentRun, retry: int = 0, reason: str | None = None) -> None:
         result = entry.result
-        outcome = "cancelled" if result.stop_reason == "cancelled" else "passed" if result.success else "failed"
+        outcome = "cancelled" if result.stop_reason in ("cancelled", "stopped") else "passed" if result.success else "failed"
         run.attempts.append(CoderAttempt(attempt=len(run.attempts) + 1, retry=retry, reason=reason,
                                          models=entry.models, outcome=outcome, stop_reason=result.stop_reason))
 
@@ -355,21 +403,29 @@ class Orchestrator:
         """Only the coder, editing the repo in place as in milestone 1."""
         run = RunResult(run_id=self.run_id, issue=issue, mode="solo")
         self._run_started(run, roles=("coder",))
+        self._task = asyncio.current_task()
+        reraise = False
         with Snapshot(self.repo) as snapshot:
             try:
+                if self.stopping:
+                    raise RunStopped
                 with self._phase(run, "implement"):
                     coder = build_coder(repo=self.repo, settings=self.settings, llm=self.llm,
                                         test_command=self.test_command, on_event=self._forward("coder"))
                     entry = await self._run_agent(run, "coder", "coder", coder, build_task(self.repo, issue))
                     self._agent_finished(entry)
+                run.success = entry.result.success
+                if not run.success:
+                    run.failed_agent = "coder"
+            except (RunStopped, asyncio.CancelledError) as exc:
+                reraise = not self._stopped(run, exc)
             finally:
                 changes = snapshot.diff()
                 run.diff, run.files_changed = changes.diff, changes.files_changed
-        run.success = entry.result.success
-        if not run.success:
-            run.failed_agent = "coder"
         run.usage_today = self._usage_today()
         self._emit("orchestrator", "run_finished", result=run.model_dump(mode="json"))
+        if reraise:
+            raise asyncio.CancelledError
         return run
 
     # --- agents and events ---------------------------------------------------------
@@ -378,7 +434,9 @@ class Orchestrator:
         self, run: RunResult, name: AgentName, label: str, agent: Agent, task: str, **info: Any
     ) -> AgentRun:
         """Run ``agent``. If the orchestrator cancels it (see ``_run_concurrently``),
-        the run so far is returned as a failure with stop reason "cancelled".
+        the run so far is returned as a failure with stop reason "cancelled", or
+        "stopped" when the run is being stopped; the caller then commits and
+        records it, and ``_agent_finished`` unwinds the run.
         ``info`` is added to the agent_started event."""
         token = llm_caller.set(name)
         model = agent.model
@@ -387,15 +445,18 @@ class Orchestrator:
         try:
             result = await agent.run(task)
         except asyncio.CancelledError:
-            if name not in self._cancelling:
+            if name not in self._cancelling and not self.stopping:
                 raise
             asyncio.current_task().uncancel()
-            summary = "cancelled: the other implement-phase agent failed"
+            if self.stopping:
+                summary, reason = f"stopped: {self._stop_reason}", "stopped"
+            else:
+                summary, reason = "cancelled: the other implement-phase agent failed", "cancelled"
             if agent.partial_result is not None:
-                result = agent.partial_result(summary, "cancelled")
+                result = agent.partial_result(summary, reason)
             else:
                 result = AgentResult(role=name, success=False, summary=summary, files_changed=[], steps_used=0,
-                                     tokens_used=0, prompt_tokens=0, completion_tokens=0, stop_reason="cancelled")
+                                     tokens_used=0, prompt_tokens=0, completion_tokens=0, stop_reason=reason)
         finally:
             llm_caller.reset(token)
         entry = AgentRun(agent=name, label=label, model=model, result=result,
@@ -423,6 +484,8 @@ class Orchestrator:
             output=result.output,
             **extra,
         )
+        if self.stopping:
+            raise RunStopped
 
     def _run_started(self, run: RunResult, roles: tuple[str, ...]) -> None:
         self._emit(

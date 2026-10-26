@@ -18,6 +18,17 @@ describe("runOutcome", () => {
     expect(runOutcome(null, events.slice(0, 20), null)).toBeNull();
   });
 
+  it("says a run was stopped on request, and points at where it stopped", () => {
+    const note: RunEvent = { ...events[0], seq: 999, type: "note", agent: "orchestrator", payload: { kind: "stopping", text: "stopping: Ctrl+C" } };
+    const stoppedEvents = [...events.slice(0, 10), note, ...events.slice(10, 12)];
+    const stopped = { ...result, success: false, stopped: true, error: "stopped: Ctrl+C", verdict: null };
+    const outcome = runOutcome(stopped, stoppedEvents, "stopped")!;
+    expect(outcome.verdict).toBe("stopped");
+    expect(outcome.headline).toBe("Run stopped");
+    expect(outcome.reason).toBe("The run was stopped before it finished (Ctrl+C). Work that was committed is kept on its branches.");
+    expect(outcome.keyEvent).toEqual({ index: 10, label: "See where it stopped" });
+  });
+
   it("explains a success, points at the approval and gives the merge commands", () => {
     const outcome = runOutcome(result, events, "finished")!;
     expect(outcome.verdict).toBe("success");

@@ -46,8 +46,10 @@ export interface RunSummary {
   retries: number | null;
   success: boolean | null;
   finished: boolean;
-  // finished: has a result; running: its process is alive; stopped: it crashed or was killed
+  // finished: has a result; running: its process is alive; stopped: stopped on request, crashed or was killed
   status: RunStatus;
+  // a stop was asked for and the run hasn't ended yet
+  stop_requested?: boolean;
   total_tokens: number;
   duration_s: number | null;
   events: number;

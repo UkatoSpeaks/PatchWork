@@ -65,14 +65,14 @@ export default function StatsPanel({ agents, phases }: { agents: AgentStats[]; p
                 key={p.phase}
                 title={`${p.phase}: ${secs(p.seconds)} (${Math.round((p.seconds / Math.max(phaseTotal, 0.001)) * 100)}%)`}
                 className="min-w-[3px] hover:brightness-110"
-                style={{ flexGrow: p.seconds, flexBasis: 0, background: PHASE_COLORS[p.phase] ?? "#cbbf9f" }}
+                style={{ flexGrow: p.seconds, flexBasis: 0, background: PHASE_COLORS[p.phase] ?? "var(--color-track)" }}
               />
             ))}
           </div>
           <ul className="flex flex-wrap gap-x-4 gap-y-1 font-pixel text-xs">
             {phases.map((p) => (
               <li key={p.phase} className="flex items-center gap-1.5">
-                <Swatch color={PHASE_COLORS[p.phase] ?? "#cbbf9f"} />
+                <Swatch color={PHASE_COLORS[p.phase] ?? "var(--color-track)"} />
                 {p.phase} <span className="tabular-nums text-ink-soft">{secs(p.seconds)}</span>
               </li>
             ))}

@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from patchwork.config import Role, Settings
 from patchwork.events import new_run_id
-from patchwork.runlock import LOCK_NAME, pid_alive, read_lock
+from patchwork.runlock import LOCK_NAME, pid_alive, read_lock, request_stop
 from patchwork.workspace import inspect_repo, issue_files
 
 TOY_REPOS = Path(__file__).resolve().parents[2] / "toy_repos"
@@ -69,8 +69,16 @@ class Launch:
     started: float = field(default_factory=time.time)
 
 
-def _first_line(text: str) -> str:
-    return next((line.strip().lstrip("#").strip() for line in text.splitlines() if line.strip()), "")
+def describe_readme(text: str, max_chars: int = 160) -> str:
+    """A short description from a README: its first paragraph after the title,
+    up to two sentences, without "for testing Patchwork" or code backticks."""
+    paragraphs = [" ".join(p.split()) for p in text.split("\n\n") if p.strip() and not p.lstrip().startswith("#")]
+    if not paragraphs:
+        return ""
+    first = paragraphs[0].replace("`", "").replace(" for testing Patchwork", "")
+    sentences = [s for s in first.replace(". ", ".\n").splitlines() if s.strip()]
+    about = " ".join(sentences[:2])
+    return about if len(about) <= max_chars else about[: max_chars - 1].rstrip() + "…"
 
 
 def read_issue_file(repo: Path) -> str | None:
@@ -130,7 +138,7 @@ class Launcher:
                 continue
             issue = read_issue_file(path)
             readme = path / "README.md"
-            about = _first_line(readme.read_text(encoding="utf-8", errors="replace")) if readme.is_file() else ""
+            about = describe_readme(readme.read_text(encoding="utf-8", errors="replace")) if readme.is_file() else ""
             toys.append({"name": path.name, "about": about, "issue": issue})
         return toys
 
@@ -226,6 +234,23 @@ class Launcher:
             process = subprocess.Popen(args, cwd=self.cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env, **detach)
         self.launches[run_id] = Launch(run_id=run_id, process=process, log_path=log_path, repo=str(repo))
         return run_id
+
+    def stop(self, run_id: str) -> None:
+        """Ask a running run to stop (it cleans up and writes its result), or
+        end one this server started that hasn't begun its run yet."""
+        holder = read_lock(self.runs / LOCK_NAME) or {}
+        pid = holder.get("pid")
+        if holder.get("run_id") == run_id and isinstance(pid, int) and pid_alive(pid):
+            request_stop(self.runs, run_id, by="dashboard")
+            return
+        launch = self.launches.get(run_id)
+        if launch is not None and launch.process.poll() is None:
+            # Still starting (no run lock yet): there is nothing to clean up.
+            launch.process.terminate()
+            return
+        if launch is None and not (self.runs / run_id / "events.jsonl").is_file():
+            raise LaunchError(404, f"no run {run_id!r}")
+        raise LaunchError(409, f"Run {run_id} isn't running.")
 
     def status(self, run_id: str) -> dict[str, Any] | None:
         """How a run started here is doing: ``starting`` (process up, no events

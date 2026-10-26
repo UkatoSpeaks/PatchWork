@@ -32,21 +32,21 @@ const FILTERS: { key: StatusFilter; label: string; dot?: string }[] = [
   { key: "pass", label: "Pass", dot: "bg-moss" },
   { key: "fail", label: "Fail", dot: "bg-terracotta" },
   { key: "live", label: "Live", dot: "bg-mustard" },
-  { key: "stopped", label: "Stopped", dot: "bg-[#9a948c]" },
+  { key: "stopped", label: "Stopped", dot: "bg-mute" },
 ];
 
 function OutcomeBadge({ run }: { run: RunSummary }) {
   if (run.status === "running") {
     return (
-      <span className="pixel-box-sm inline-flex items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper">
+      <span className="pixel-box-sm inline-flex items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-on">
         <span aria-hidden className="live-dot" /> LIVE
       </span>
     );
   }
   const [label, color, title] =
-    run.success === true ? ["PASS", "bg-moss text-paper", "Tests pass and the reviewer approved"]
-    : run.success === false ? ["FAIL", "bg-terracotta text-paper", "The run finished without a fix"]
-    : ["STOPPED", "bg-[#9a948c] text-paper", "The run ended without a result: it crashed or was stopped"];
+    run.success === true ? ["PASS", "bg-moss text-on", "Tests pass and the reviewer approved"]
+    : run.success === false ? ["FAIL", "bg-terracotta text-on", "The run finished without a fix"]
+    : ["STOPPED", "bg-mute text-on", "The run ended without a result: it crashed or was stopped"];
   return <span title={title} className={`pixel-box-sm px-2 py-0.5 font-pixel text-xs font-bold tracking-wider ${color}`}>{label}</span>;
 }
 
@@ -62,7 +62,7 @@ function Marked({ text, q }: { text: string; q: string }) {
     <>
       {highlight(text, q).map((part, i) =>
         part.hit ? (
-          <mark key={i} className="bg-mustard/60 text-ink">{part.text}</mark>
+          <mark key={i} className="bg-mustard/60 text-onlight">{part.text}</mark>
         ) : (
           <span key={i}>{part.text}</span>
         ),

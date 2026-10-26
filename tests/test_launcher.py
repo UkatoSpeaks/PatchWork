@@ -136,6 +136,8 @@ def test_toy_repos_are_listed_with_their_issue(launcher: Launcher) -> None:
     assert {"calculator", "stats_feature", "text_utils"} <= set(toys)
     assert "median" in toys["stats_feature"]["issue"]
     assert toys["calculator"]["issue"] is None
+    assert toys["calculator"]["about"] == "A tiny package with planted bugs. Run python -m pytest -q here: 3 tests fail until the bugs are fixed."
+    assert toys["stats_feature"]["about"] == "A small, working statistics package. Its test suite passes."
 
 
 def test_a_run_that_dies_before_writing_events_reports_its_output(launcher: Launcher, tmp_path: Path, git_env) -> None:

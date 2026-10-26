@@ -62,11 +62,11 @@ export default function DiffPanel({ snapshots, index, roleOf }: Props) {
                 onClick={() => setPinned(s.id)}
                 aria-current={selected ? "true" : undefined}
                 title={`${s.label}: ${s.detail}${future ? " (later in the replay)" : ""}`}
-                className={`flex items-center gap-1.5 px-2 py-1 font-pixel text-xs ${selected ? "bg-ink text-paper" : "bg-cream-dark hover:bg-[#fff1c7]"} ${future && !selected ? "opacity-50" : ""}`}
+                className={`flex items-center gap-1.5 px-2 py-1 font-pixel text-xs ${selected ? "bg-ink text-paper" : "bg-cream-dark hover:bg-now"} ${future && !selected ? "opacity-50" : ""}`}
               >
                 <span aria-hidden className="inline-block h-2 w-2 shrink-0" style={{ background: AGENT_COLORS[s.agent] }} />
                 {s.label}
-                {s.final && <span className={`px-1 text-[9px] uppercase ${selected ? "bg-paper text-ink" : "bg-moss text-paper"}`}>final</span>}
+                {s.final && <span className={`px-1 text-[9px] uppercase ${selected ? "bg-paper text-ink" : "bg-moss text-on"}`}>final</span>}
               </button>
             </li>
           );

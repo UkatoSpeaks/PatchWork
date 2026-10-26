@@ -25,6 +25,10 @@ Starting runs (the "New run" page):
   while another run is going.
 - ``GET /api/launches/{run_id}``: a started run's process: ``starting``,
   ``running`` or ``exited`` (with the end of its console output).
+- ``POST /api/runs/{run_id}/stop``: ask a running run to stop (202). It
+  cancels the agent at work, cleans up and writes its result within a few
+  seconds; until then its summary has ``stop_requested``. 409 if it isn't
+  running.
 
 These are only served to the dashboard's origins (and to clients that send no
 Origin, like curl), and POST requires a JSON body, so other web pages can't
@@ -32,7 +36,8 @@ start runs.
 
 Every summary has a ``status``: ``finished`` (it has a result or a
 ``run_finished`` event), ``running`` (the run lock in ``runs/`` names it and
-its process is alive) or ``stopped`` (neither: it crashed or was killed).
+its process is alive) or ``stopped`` (stopped on request, with a result, or
+neither of the others: it crashed or was killed).
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from patchwork.launcher import LaunchError, Launcher, LaunchRequest
-from patchwork.runlock import LOCK_NAME, pid_alive, read_lock
+from patchwork.runlock import LOCK_NAME, pid_alive, read_lock, stop_requested
 
 # Longest pause between two replayed events, after dividing by the speed, so
 # long rate-limit waits don't stall the replay.
@@ -157,7 +162,11 @@ def run_is_alive(runs: Path, run_id: str) -> bool:
 
 
 def summarize(
-    run_id: str, events: list[dict[str, Any]], result: dict[str, Any] | None, alive: bool = False
+    run_id: str,
+    events: list[dict[str, Any]],
+    result: dict[str, Any] | None,
+    alive: bool = False,
+    stop_requested: bool = False,
 ) -> dict[str, Any]:
     started = next((e for e in events if e["type"] == "run_started"), None)
     info = (started or {}).get("payload") or {}
@@ -170,6 +179,9 @@ def summarize(
         total_tokens = sum(int((e.get("payload") or {}).get("tokens") or 0) for e in events if e["type"] == "agent_finished")
     first, last = _timestamp(events[0]), _timestamp(events[-1])
     finished = result is not None or events[-1]["type"] == "run_finished"
+    if result is None and finished:
+        result = (events[-1].get("payload") or {}).get("result")
+    stopped = bool((result or {}).get("stopped"))
     return {
         "run_id": run_id,
         "started_at": events[0].get("timestamp"),
@@ -180,7 +192,8 @@ def summarize(
         "retries": int(result.get("retries") or 0) if result else None,
         "success": result.get("success") if result else None,
         "finished": finished,
-        "status": "finished" if finished else "running" if alive else "stopped",
+        "status": "stopped" if stopped else "finished" if finished else "running" if alive else "stopped",
+        "stop_requested": stop_requested and not finished,
         "total_tokens": total_tokens,
         "duration_s": round((last - first).total_seconds(), 3) if first and last else None,
         "events": len(events),
@@ -258,6 +271,10 @@ def create_app(runs_dir: Path | str = "runs", launcher: Launcher | None = None) 
             raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
         return directory
 
+    def summary_of(run_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+        return summarize(run_id, events, _read_json(runs / run_id / "result.json"),
+                         run_is_alive(runs, run_id), stop_requested(runs, run_id))
+
     def run_events(run_id: str) -> list[dict[str, Any]]:
         events = read_event_dicts(run_dir(run_id) / "events.jsonl")
         if not events:
@@ -271,8 +288,7 @@ def create_app(runs_dir: Path | str = "runs", launcher: Launcher | None = None) 
             for directory in runs.iterdir():
                 events = read_event_dicts(directory / "events.jsonl") if directory.is_dir() else []
                 if events:
-                    alive = run_is_alive(runs, directory.name)
-                    summaries.append(summarize(directory.name, events, _read_json(directory / "result.json"), alive))
+                    summaries.append(summary_of(directory.name, events))
         summaries.sort(key=lambda s: (s["started_at"] or "", s["run_id"]), reverse=True)
         return summaries
 
@@ -280,7 +296,7 @@ def create_app(runs_dir: Path | str = "runs", launcher: Launcher | None = None) 
     def run_detail(run_id: str) -> dict[str, Any]:
         events = run_events(run_id)
         result = _read_json(run_dir(run_id) / "result.json")
-        summary = summarize(run_id, events, result, run_is_alive(runs, run_id))
+        summary = summary_of(run_id, events)
         return {"summary": summary, "result": result, "plan": _plan(events, result)}
 
     @app.get("/api/runs/{run_id}/events")
@@ -319,6 +335,16 @@ def create_app(runs_dir: Path | str = "runs", launcher: Launcher | None = None) 
             return {"run_id": launcher.start(request)}
         except LaunchError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.message) from None
+
+    @app.post("/api/runs/{run_id}/stop", status_code=202, dependencies=[Depends(dashboard_only)])
+    def stop_run(run_id: str) -> dict[str, str]:
+        if not _RUN_ID.match(run_id):
+            raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+        try:
+            launcher.stop(run_id)
+        except LaunchError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from None
+        return {"run_id": run_id, "state": "stopping"}
 
     @app.get("/api/launches/{run_id}", dependencies=[Depends(dashboard_only)])
     def launch_status(run_id: str) -> dict[str, Any]:

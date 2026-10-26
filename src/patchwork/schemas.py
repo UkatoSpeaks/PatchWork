@@ -149,6 +149,9 @@ class RunResult(BaseModel):
     failed_agent: str | None = None
     # A run-level problem (not a git repo, merge conflict, ...).
     error: str | None = None
+    # Stopped before it finished (Orchestrator.stop: the dashboard, `patchwork
+    # stop`, Ctrl+C or SIGTERM); ``error`` says why.
+    stopped: bool = False
 
     @property
     def agents(self) -> dict[str, AgentResult]:

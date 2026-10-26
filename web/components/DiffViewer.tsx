@@ -3,7 +3,7 @@ import { useMemo } from "react";
 import { parseDiff, type DiffFile, type FileRole } from "@/lib/diff";
 
 const STATUS: Record<DiffFile["status"], string | null> = { added: "new", deleted: "deleted", renamed: "renamed", binary: "binary", modified: null };
-const ROLE_STYLE: Record<FileRole, string> = { tests: "bg-moss text-paper", code: "bg-slate text-paper" };
+const ROLE_STYLE: Record<FileRole, string> = { tests: "bg-moss text-on", code: "bg-slate text-on" };
 
 /** The run's final diff, GitHub-style: a header per file, line numbers, green additions, red deletions. */
 export default function DiffViewer({ diff, roleOf }: { diff: string; roleOf: (path: string) => FileRole }) {
@@ -45,13 +45,13 @@ export default function DiffViewer({ diff, roleOf }: { diff: string; roleOf: (pa
   );
 }
 
-const ROW: Record<string, string> = { add: "bg-[#e6f4e1]", del: "bg-[#fbe4dd]", ctx: "", meta: "text-ink-soft italic" };
+const ROW: Record<string, string> = { add: "bg-add", del: "bg-del", ctx: "", meta: "text-ink-soft italic" };
 const SIGN: Record<string, string> = { add: "+", del: "−", ctx: " ", meta: "" };
 
 function HunkRows({ header, lines }: { header: string; lines: { kind: string; text: string; oldNo: number | null; newNo: number | null }[] }) {
   return (
     <>
-      <tr className="bg-[#e3ecf3] text-ink-soft">
+      <tr className="bg-hunk text-ink-soft">
         <td colSpan={4} className="px-3 py-0.5">{header}</td>
       </tr>
       {lines.map((line, i) => (

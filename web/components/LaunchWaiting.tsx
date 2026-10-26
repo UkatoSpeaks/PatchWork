@@ -38,7 +38,7 @@ export default function LaunchWaiting({ launch }: { launch: LaunchStatus }) {
                 <h2 className="font-pixel text-[11px] uppercase tracking-wider text-ink-soft">Console output</h2>
                 <CopyButton text={launch.log} />
               </div>
-              <pre className="pixel-scroll max-h-96 overflow-auto bg-charcoal px-4 py-3 font-mono text-xs leading-[1.6] text-cream">{launch.log}</pre>
+              <pre className="pixel-scroll max-h-96 overflow-auto bg-term px-4 py-3 font-mono text-xs leading-[1.6] text-term-text">{launch.log}</pre>
             </div>
           )}
           <div className="flex flex-wrap gap-3">
@@ -74,7 +74,7 @@ export default function LaunchWaiting({ launch }: { launch: LaunchStatus }) {
       <ol className="flex flex-col gap-2 text-left text-sm">
         {steps.map((step) => (
           <li key={step.text} className="flex items-center gap-2.5">
-            <span aria-hidden className={`grid h-5 w-5 place-items-center font-pixel text-xs font-bold ${step.done ? "bg-moss text-paper" : "bg-cream-dark text-ink"}`}>
+            <span aria-hidden className={`grid h-5 w-5 place-items-center font-pixel text-xs font-bold ${step.done ? "bg-moss text-on" : "bg-cream-dark text-ink"}`}>
               {step.done ? "✓" : "…"}
             </span>
             {step.text}

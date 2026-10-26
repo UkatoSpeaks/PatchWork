@@ -190,7 +190,7 @@ export default function OfficeCanvas({ scene, snapKey, speed, playing, selected,
   };
 
   return (
-    <div className="w-full min-w-0 bg-charcoal p-2 sm:p-3" style={{ boxShadow: "0 0 0 4px #2b2523, 8px 8px 0 4px rgba(43,37,35,0.22)" }}>
+    <div className="w-full min-w-0 bg-charcoal p-2 sm:p-3" style={{ boxShadow: "0 0 0 4px var(--ink), 8px 8px 0 4px var(--shade)" }}>
       <div className="relative">
         <canvas
           ref={canvasRef}

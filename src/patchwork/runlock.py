@@ -4,6 +4,12 @@ Groq's rate limits are per account and model, so concurrent runs only starve
 each other. ``run_lock`` takes ``runs/.patchwork.lock`` (holding the PID and
 run id) for the duration of a run. A lock whose PID is no longer running is
 stale and is replaced.
+
+Stopping a run: ``request_stop`` writes ``runs/<run_id>/stop.json``. The run's
+process watches for that file and stops cleanly (see ``Orchestrator.stop``).
+A file rather than a signal, so it works for runs started anywhere (the CLI or
+the dashboard) and on Windows, where a detached process has no console to
+send Ctrl+C to.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 LOCK_NAME = ".patchwork.lock"
+STOP_NAME = "stop.json"
 
 
 class RunLocked(RuntimeError):
@@ -107,3 +114,19 @@ def run_lock(runs_dir: str | os.PathLike[str], run_id: str) -> Iterator[Path]:
     finally:
         if read_lock(path) == mine:
             path.unlink(missing_ok=True)
+
+
+def stop_path(runs_dir: str | os.PathLike[str], run_id: str) -> Path:
+    return Path(runs_dir) / run_id / STOP_NAME
+
+
+def request_stop(runs_dir: str | os.PathLike[str], run_id: str, by: str = "cli") -> Path:
+    """Ask run ``run_id`` to stop. Its process picks this up within a second."""
+    path = stop_path(runs_dir, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"by": by, "requested": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
+    return path
+
+
+def stop_requested(runs_dir: str | os.PathLike[str], run_id: str) -> bool:
+    return stop_path(runs_dir, run_id).is_file()

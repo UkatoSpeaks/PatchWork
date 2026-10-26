@@ -8,9 +8,9 @@ import CopyButton from "./CopyButton";
 import { TONE_PILL } from "./DetailBlocks";
 
 const LOOK: Record<Outcome["verdict"], { edge: string; badge: string; mark: string }> = {
-  success: { edge: "bg-moss", badge: "bg-moss text-paper", mark: "✓" },
-  failure: { edge: "bg-terracotta", badge: "bg-terracotta text-paper", mark: "✗" },
-  stopped: { edge: "bg-[#9a948c]", badge: "bg-[#9a948c] text-paper", mark: "■" },
+  success: { edge: "bg-moss", badge: "bg-moss text-on", mark: "✓" },
+  failure: { edge: "bg-terracotta", badge: "bg-terracotta text-on", mark: "✗" },
+  stopped: { edge: "bg-mute", badge: "bg-mute text-on", mark: "■" },
 };
 
 const ATTEMPT_MARK = {
@@ -51,7 +51,7 @@ export default function ResultBanner({ runId, outcome, onOpenEvent, onShowDiff }
             )}
             {outcome.keyEvent && (
               <button type="button" className="pixel-btn px-3 py-1.5 text-sm" onClick={() => onOpenEvent(outcome.keyEvent!.index)} title={outcome.keyEvent.label}>
-                {outcome.verdict === "stopped" ? "See the last event" : outcome.keyEvent.label} →
+                {outcome.verdict === "stopped" && !outcome.keyEvent.label.startsWith("See") ? "See the last event" : outcome.keyEvent.label} →
               </button>
             )}
             <Link href={`/runs/new?from=${encodeURIComponent(runId)}`} className="pixel-btn px-3 py-1.5 text-sm" title="Open New run with this run's repo, issue and options">
@@ -137,14 +137,14 @@ export default function ResultBanner({ runId, outcome, onOpenEvent, onShowDiff }
             </div>
             {outcome.next.note && <p className="text-sm text-ink-soft">{outcome.next.note}</p>}
             {commands && (
-              <pre className="pixel-scroll overflow-x-auto bg-charcoal px-4 py-3 font-mono text-xs leading-[1.7] text-cream">
+              <pre className="pixel-scroll overflow-x-auto bg-term px-4 py-3 font-mono text-xs leading-[1.7] text-term-text">
                 {outcome.next.lines.map((line, i) => {
                   const [cmd, comment] = line.split(/(?=\s+#)/);
                   return (
                     <div key={i}>
                       <span aria-hidden className="select-none text-mustard">$ </span>
                       {cmd}
-                      {comment && <span className="text-cream/45">{comment}</span>}
+                      {comment && <span className="text-term-text/45">{comment}</span>}
                     </div>
                   );
                 })}

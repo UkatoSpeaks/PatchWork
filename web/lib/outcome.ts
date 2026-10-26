@@ -137,7 +137,12 @@ export function runOutcome(result: Record<string, any> | null, events: RunEvent[
   let failingTests: string[] = [];
   let openBlockers: Outcome["blockers"] = [];
 
-  if (result.success) {
+  if (result.stopped) {
+    const why = String(result.error ?? "").replace(/^stopped: /, "");
+    reason = `The run was stopped before it finished${why ? ` (${why})` : ""}. Work that was committed is kept on its branches.`;
+    const i = lastIndex(events, (e) => e.type === "note" && e.payload?.kind === "stopping");
+    keyEvent = { index: i >= 0 ? i : events.length - 1, label: "See where it stopped" };
+  } else if (result.success) {
     reason = crew
       ? `The full test suite passes and the reviewer approved, ${retryCount ? `after ${retries(retryCount)}` : "on the first try"}.`
       : "The coder finished and the tests pass.";
@@ -171,8 +176,8 @@ export function runOutcome(result: Record<string, any> | null, events: RunEvent[
   }
 
   return {
-    verdict: result.success ? "success" : "failure",
-    headline: result.success ? "Issue fixed" : "Not fixed",
+    verdict: result.stopped ? "stopped" : result.success ? "success" : "failure",
+    headline: result.stopped ? "Run stopped" : result.success ? "Issue fixed" : "Not fixed",
     reason,
     checks,
     attempts: attemptsOf(result),

@@ -103,12 +103,14 @@ uv run patchwork run --repo PATH --issue "TEXT" --solo
 uv run patchwork replay runs/<run_id>/events.jsonl
 uv run patchwork usage [--days N]
 uv run patchwork serve [--port 8000] [--runs-dir runs]
+uv run patchwork stop [RUN_ID]
 ```
 
 - `--runs-dir DIR` (run) writes the run, the run lock and `usage.json` under DIR instead of `runs/`. The dashboard also passes a hidden `--run-id` so it can open the run straight away.
 - `--issue-file` reads the issue from a UTF-8 file (a BOM is fine) instead of `--issue`; pass exactly one of them. Prefer it for issue text with non-ASCII characters: in Windows PowerShell 5, `--issue (Get-Content -Raw ISSUE.md)` decodes UTF-8 with the wrong encoding ('é' arrives as 'Ã©').
 - `PATH` must be the root of a git repo with a commit and no uncommitted changes (commit or stash first). `--init-git` turns a plain directory into one: `git init` plus an initial commit of everything in it.
 - `--sequential` runs the tester and coder one after the other instead of concurrently. The final table shows wall-clock time per agent and per phase, so the two modes can be compared.
+- **Stopping a run.** `patchwork stop` (or **■ STOP** in the dashboard, or Ctrl+C / SIGTERM on the run's process) stops the run that is going. The agent at work is cancelled at once (an LLM call or rate-limit wait ends; a tool already running, like the tests, finishes in the background), its work so far is committed and recorded with stop reason `stopped`, and the run ends the usual way: worktrees removed, branches with commits kept, `run_finished` written with `stopped: true` and `error` saying why. A second Ctrl+C interrupts at once. The request is a file, `runs/<run_id>/stop.json`, which the run checks twice a second, so it works for runs started anywhere and on Windows.
 - `--solo` runs only the coder, editing `PATH` **in place** as in milestone 1 (no git needed; the diff comes from a temp-dir snapshot). It's kept for single-vs-crew evals.
 
 The CLI shows each phase as it happens. Lines from agents are prefixed with the agent name, so parallel output stays readable. At the end it prints the diff, a table of tokens and time per agent run (retries included), the phase durations, and the outcome. The exit code is 0 if the run succeeds and 1 otherwise.
@@ -137,12 +139,15 @@ cd web && npm install && npm run dev
 
 The API base URL comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`; see `web/.env.example`). Endpoints:
 
-- `GET /api/runs`: run summaries (issue, mode, success, status, tokens, duration), newest first. `status` is `finished`, `running` (the run lock in `runs/` names the run and its process is alive) or `stopped` (no result and no live process: it crashed or was killed).
+- `GET /api/runs`: run summaries (issue, mode, success, status, tokens, duration), newest first. `status` is `finished`, `running` (the run lock in `runs/` names the run and its process is alive) or `stopped` (stopped on request, or no result and no live process: it crashed or was killed).
 - `GET /api/runs/{run_id}`: the summary, `result.json` (null while unfinished) and the plan.
 - `GET /api/runs/{run_id}/events`: every event.
+- `POST /api/runs/{run_id}/stop`: ask a running run to stop (202, `{"state": "stopping"}`); 409 if it isn't running. Until it ends, its summary has `stop_requested: true`; afterwards its `status` is `stopped`. Same origin and JSON rules as starting a run.
 - `GET /api/runs/{run_id}/stream?speed=4&start=0`: server-sent events replaying the log at its original pace divided by `speed` (0 = no delays), each gap capped at 2s, then an `end` event. For a running run, once the replay catches up it sends a `live` event and then each new event as soon as it is written to `events.jsonl`, until `run_finished` or the run's process exits.
 
 The replay uses `/stream` for playback and `/events` for seeking: the scene is a pure reducer over events (`web/lib/office/reducer.ts`), so jumping to event N means reducing `events[0..N]`. `/runs/<run_id>?at=N` opens a run paused at event N.
+
+**Themes and phones.** The dashboard follows the system's light or dark setting; the button in the header cycles system → light → dark and the browser remembers the choice (applied before the first paint, so there's no flash). Colours are CSS variables in `web/app/globals.css` (one block per theme); the office art keeps its colours in both. On phones the agent cards are a row to swipe through, and the pinned replay controls shrink to one line (play, restart, speed, scrubber, ?), without the phase bar and the current-event text.
 
 **Loading and accessibility.** While data loads, pages show pixel placeholders shaped like what's coming (run cards and the summary, the run's top bar, log and tabs, the toy repos and the crew), marked `aria-busy`. The run's tabs are real tabs (arrow keys, Home, End) and the toy picker is a radio group (arrow keys). Speech bubbles and status tags are hidden from screen readers (the agent cards carry the same text); a polite live region announces only the phase and the result. With reduced motion turned on in the OS, characters move straight to where they're going instead of walking, and the decorative animations stop. The help panel keeps focus inside it; the scrubber reads "Event 12 of 76: …"; a "Skip to content" link comes first on every page.
 
@@ -192,6 +197,7 @@ The LLM is mocked (scripted), so no API key or network is needed. Crew tests use
 - **Agent loop:** structured submits, text tool calls, aliases (including `repo_browser.<tool>`), parse failures handled as replies, 400 retries, switching models after repeated 400s or a daily limit with the conversation intact, the error when every model is used up, the repeated-call guard (re-running a trimmed read, showing the lines when it blocks one), stuck detection, and history trimming.
 - **Role rules:** the tester's restrictions and fail-first gate, the coder's protection of tester files.
 - **Crew flow:** worktrees and cleanup, concurrency, merges, retries on test failure and review blockers, the retry cap, the user's tree staying untouched, sequential stopping after a tester failure, parallel cancelling the coder, a coder failure leading to integrate and a retry on `CODER_RETRY_MODEL`, a stuck retry moving on to the next retry, branches kept after a failed run, models used and today's usage in the final table.
+- **Stopping:** stopping during the plan, the parallel and sequential implement phase, the review and a solo run (work committed, branches kept, worktrees removed, `run_finished` written); a stop before the run starts; a cancellation from outside still cleaning up; the stop file; `patchwork stop`; the stop endpoint and the `stopped` status.
 - **One run at a time and usage:** the lock refusing a second run and clearing a stale one, `runs/usage.json`, `patchwork usage`.
 - **Events:** the full event sequence, replay output and `--sequential` producing the same result.
 - **Dashboard API:** run list (skipping empty runs, newest first), detail and plan, events, SSE replay order and `end`, gap scaling and capping, CORS, run status, following a live log.
@@ -206,7 +212,7 @@ src/patchwork/
   config.py          Settings from .env (pydantic-settings)
   llm.py             Async LiteLLM wrapper: tool calls, tokens, 400/429 handling, throttling, per-model state shared by all agents
   usage.py           Daily token usage per model (runs/usage.json)
-  runlock.py         One run at a time (runs/.patchwork.lock)
+  runlock.py         One run at a time (runs/.patchwork.lock), stop requests (runs/<run_id>/stop.json)
   events.py          Event model, EventBus, JSONL writer, run ids
   render.py          Terminal renderer for events (live and replay)
   workspace.py       git checks, per-run branches/worktrees, commits, merges, cleanup
@@ -223,7 +229,7 @@ src/patchwork/
   agents/reviewer.py Reviewer role: read-only tools + diff + submit_review
   server.py          FastAPI over runs/ for the web dashboard (list, detail, events, SSE replay and live follow, starting runs)
   launcher.py        Starts crew runs for the dashboard: request checks, toy repo copies, background `patchwork run`
-  cli.py             Typer CLI: run, replay, usage, serve
+  cli.py             Typer CLI: run, replay, usage, serve, stop
 toy_repos/calculator/     Bug-planted package
 toy_repos/stats_feature/  Working package + a feature request (median)
 tests/

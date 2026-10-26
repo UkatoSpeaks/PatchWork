@@ -14,14 +14,94 @@
   --color-moss: #5f9a57;
   --color-slate: #4f7cac;
   --color-plum: #8e6bb0;
+  /* surfaces and states */
+  --color-hover: #fff6dc;
+  --color-now: #fff1c7;
+  --color-field: #fffdf7;
+  --color-shimmer: var(--color-shimmer);
+  --color-add: #e6f4e1;
+  --color-del: #fbe4dd;
+  --color-hunk: #e3ecf3;
+  --color-wait: #8b6f55;
+  --color-mute: #9a948c;
+  --color-track: #cbbf9f;
+  /* text on accent colours: light on the dark accents, dark on the light ones */
+  --color-on: #fbf7ee;
+  --color-onlight: #2b2523;
+  /* terminal-style blocks: light text on dark, in both themes */
+  --color-term: #3d3533;
+  --color-term-text: #f4ead5;
+  /* the office overlay (bubbles, tags) sits on the light office art in both themes */
+  --color-bubble: #fffaf0;
+  --color-bubble-text: #2b2523;
+  --color-tag: #eef3f6;
   --font-pixel: var(--font-pixelify), "Courier New", monospace;
   --font-mono: var(--font-jetbrains), ui-monospace, monospace;
 }
 
 :root {
+  /* pixel borders and their drop shadows */
   --ink: #2b2523;
   --shade: rgba(43, 37, 35, 0.22);
+  --checker: var(--checker);
+  --inset: rgba(43, 37, 35, 0.18);
+  --placeholder: rgba(90, 79, 74, 0.55);
   color-scheme: light;
+}
+
+/* Dark theme: follows the system unless the header toggle picked one (data-theme). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-cream: #1d1917;
+    --color-cream-dark: #383029;
+    --color-paper: #29231f;
+    --color-ink: #f1e6d2;
+    --color-ink-soft: #b8aa96;
+    --color-charcoal: #110e0d;
+    --color-hover: #3b3025;
+    --color-now: #4b3c22;
+    --color-field: #1f1a17;
+    --color-shimmer: #4a4038;
+    --color-add: #233620;
+    --color-del: #46241d;
+    --color-hunk: #2a3440;
+    --color-wait: #c99d74;
+    --color-mute: #7f776f;
+    --color-track: #5d5246;
+    --color-term: #110e0d;
+    --ink: #0b0908;
+    --shade: rgba(0, 0, 0, 0.45);
+    --checker: rgba(255, 245, 230, 0.018);
+    --inset: rgba(0, 0, 0, 0.35);
+    --placeholder: rgba(184, 170, 150, 0.5);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-cream: #1d1917;
+  --color-cream-dark: #383029;
+  --color-paper: #29231f;
+  --color-ink: #f1e6d2;
+  --color-ink-soft: #b8aa96;
+  --color-charcoal: #110e0d;
+  --color-hover: #3b3025;
+  --color-now: #4b3c22;
+  --color-field: #1f1a17;
+  --color-shimmer: #4a4038;
+  --color-add: #233620;
+  --color-del: #46241d;
+  --color-hunk: #2a3440;
+  --color-wait: #c99d74;
+  --color-mute: #7f776f;
+  --color-track: #5d5246;
+  --color-term: #110e0d;
+  --ink: #0b0908;
+  --shade: rgba(0, 0, 0, 0.45);
+  --checker: rgba(255, 245, 230, 0.018);
+  --inset: rgba(0, 0, 0, 0.35);
+  --placeholder: rgba(184, 170, 150, 0.5);
+  color-scheme: dark;
 }
 
 html,
@@ -39,8 +119,8 @@ body {
   font-family: var(--font-mono);
   /* faint checker so the cream doesn't look flat */
   background-image:
-    linear-gradient(45deg, rgba(43, 37, 35, 0.025) 25%, transparent 25%, transparent 75%, rgba(43, 37, 35, 0.025) 75%),
-    linear-gradient(45deg, rgba(43, 37, 35, 0.025) 25%, transparent 25%, transparent 75%, rgba(43, 37, 35, 0.025) 75%);
+    linear-gradient(45deg, var(--checker) 25%, transparent 25%, transparent 75%, var(--checker) 75%),
+    linear-gradient(45deg, var(--checker) 25%, transparent 25%, transparent 75%, var(--checker) 75%);
   background-size: 16px 16px;
   background-position: 0 0, 8px 8px;
 }
@@ -78,7 +158,7 @@ body {
     3px 0 0 0 var(--ink),
     0 -3px 0 0 var(--ink),
     0 3px 0 0 var(--ink),
-    inset -3px -3px 0 0 rgba(43, 37, 35, 0.18);
+    inset -3px -3px 0 0 var(--inset);
   transition: transform 60ms steps(1);
   cursor: pointer;
   user-select: none;
@@ -93,7 +173,7 @@ body {
 }
 
 .pixel-btn:hover:not(:disabled) {
-  background: #fff6dc;
+  background: var(--color-hover);
 }
 
 .pixel-btn:active,
@@ -105,12 +185,13 @@ body {
     3px 0 0 0 var(--ink),
     0 -3px 0 0 var(--ink),
     0 3px 0 0 var(--ink),
-    inset 3px 3px 0 0 rgba(43, 37, 35, 0.18);
+    inset 3px 3px 0 0 var(--inset);
 }
 
 .pixel-btn[aria-pressed="true"],
 .pixel-btn[aria-selected="true"] {
   background: var(--color-mustard);
+  color: var(--color-onlight);
 }
 
 .pixel-btn:focus-visible,
@@ -175,7 +256,7 @@ body {
   font-family: var(--font-pixel);
   font-size: clamp(10px, calc(var(--office-scale, 1.8) * 6.6px), 14px);
   line-height: 1.15;
-  color: var(--color-ink);
+  color: var(--color-bubble-text);
   will-change: transform;
 }
 
@@ -189,7 +270,7 @@ body {
   -webkit-line-clamp: 2;
   overflow: hidden;
   padding: 3px 7px 4px;
-  background: #fffaf0;
+  background: var(--color-bubble);
   /* a stepped pixel border, like the panels */
   box-shadow:
     -2px 0 0 0 var(--ink),
@@ -219,13 +300,13 @@ body {
   width: 4px;
   height: 2px;
   margin-top: 0;
-  background: #fffaf0;
+  background: var(--color-bubble);
   clip-path: none;
 }
 
 /* Thought cloud: a puffier, cooler bubble with trailing dots instead of a tail. */
 .office-bubble[data-style="thought"] .office-bubble-body {
-  background: #eef3f6;
+  background: var(--color-tag);
   padding: 4px 9px 5px;
   display: flex;
   gap: 3px;
@@ -239,7 +320,7 @@ body {
   height: 5px;
   margin-top: 4px;
   left: calc(var(--tail, 50%) - 1px);
-  background: #eef3f6;
+  background: var(--color-tag);
   clip-path: none;
   box-shadow: 0 0 0 2px var(--ink);
 }
@@ -249,7 +330,7 @@ body {
   height: 3px;
   margin-top: 12px;
   left: calc(var(--tail, 50%) + 1px);
-  background: #eef3f6;
+  background: var(--color-tag);
   box-shadow: 0 0 0 2px var(--ink);
 }
 
@@ -299,11 +380,11 @@ body {
   width: max-content;
   max-width: 34ch;
   padding: 2px 5px 3px;
-  background: #fffaf0;
+  background: var(--color-bubble);
   font-family: var(--font-mono);
   font-size: clamp(9px, calc(var(--office-scale, 1.8) * 5.4px), 12px);
   line-height: 1.2;
-  color: var(--color-ink);
+  color: var(--color-bubble-text);
   box-shadow:
     -2px 0 0 0 var(--agent),
     2px 0 0 0 var(--agent),
@@ -399,7 +480,7 @@ body {
 .pixel-input {
   width: 100%;
   padding: 8px 10px;
-  background: #fffdf7;
+  background: var(--color-field);
   color: var(--color-ink);
   box-shadow:
     -2px 0 0 0 var(--ink),
@@ -410,7 +491,7 @@ body {
 }
 
 .pixel-input::placeholder {
-  color: rgba(90, 79, 74, 0.55);
+  color: var(--placeholder);
 }
 
 .pixel-input:focus {
@@ -423,7 +504,7 @@ body {
   width: 16px;
   height: 16px;
   flex-shrink: 0;
-  background: #fffdf7;
+  background: var(--color-field);
   box-shadow: 0 0 0 2px var(--ink);
   cursor: pointer;
 }
@@ -432,7 +513,7 @@ body {
   background: var(--color-moss);
   box-shadow:
     0 0 0 2px var(--ink),
-    inset 0 0 0 3px #fffdf7;
+    inset 0 0 0 3px var(--color-field);
 }
 
 .pixel-check:focus-visible {
@@ -442,15 +523,15 @@ body {
 
 .start-btn:not(:disabled) {
   background: var(--color-terracotta);
-  color: var(--color-paper);
+  color: var(--color-on);
 }
 
 .start-btn:not(:disabled):hover {
-  background: #cf6449;
+  background: color-mix(in srgb, var(--color-terracotta) 88%, white);
 }
 
 .start-btn:disabled {
-  color: rgba(90, 79, 74, 0.6);
+  color: var(--placeholder);
   background: var(--color-cream-dark);
 }
 
@@ -488,7 +569,7 @@ body {
   font-family: var(--font-pixel);
   font-size: 12px;
   text-align: center;
-  background: #fffdf7;
+  background: var(--color-field);
   box-shadow:
     -2px 0 0 0 var(--ink),
     2px 0 0 0 var(--ink),
@@ -502,7 +583,7 @@ body {
   content: "";
   position: absolute;
   top: 100%;
-  right: 10px;
+  right: 12px;
   border: 5px solid transparent;
   border-top-color: var(--color-ink);
 }
@@ -520,7 +601,7 @@ body {
 /* --- loading placeholders --------------------------------------------------------- */
 .skeleton {
   min-height: 0.75rem;
-  background: linear-gradient(90deg, var(--color-cream-dark) 0 35%, #f6eedc 50%, var(--color-cream-dark) 65% 100%);
+  background: linear-gradient(90deg, var(--color-cream-dark) 0 35%, var(--color-shimmer) 50%, var(--color-cream-dark) 65% 100%);
   background-size: 300% 100%;
   animation: skeleton 1.4s steps(8) infinite;
 }

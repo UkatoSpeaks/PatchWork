@@ -10,21 +10,21 @@ import Skeleton from "./Skeleton";
 function StatusBadge({ live, status }: { live: boolean; status: RunStatus | null }) {
   if (live) {
     return (
-      <span className="pixel-box-sm inline-flex shrink-0 items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper" title="Following the run as it happens">
+      <span className="pixel-box-sm inline-flex shrink-0 items-center gap-1.5 bg-terracotta px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-on" title="Following the run as it happens">
         <span aria-hidden className="live-dot" /> LIVE
       </span>
     );
   }
   if (status === "running") {
     return (
-      <span className="pixel-box-sm shrink-0 bg-mustard px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-ink" title="The run is still going; you're watching an earlier moment">
+      <span className="pixel-box-sm shrink-0 bg-mustard px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-onlight" title="The run is still going; you're watching an earlier moment">
         RUNNING
       </span>
     );
   }
   if (status === "stopped") {
     return (
-      <span className="pixel-box-sm shrink-0 bg-[#9a948c] px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-paper" title="The run ended without a result: it crashed or was stopped">
+      <span className="pixel-box-sm shrink-0 bg-mute px-2 py-0.5 font-pixel text-xs font-bold tracking-wider text-on" title="The run was stopped before it finished, or crashed">
         STOPPED
       </span>
     );
@@ -41,7 +41,24 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-export default function TopBar({ runId, scene, issue, live, status, loading = false }: {
+/** Stop a running run: asks once, then shows that it's stopping. */
+function StopButton({ stopping, onStop }: { stopping: boolean; onStop: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        if (window.confirm("Stop this run? The agent at work is stopped and its work so far is kept on its branch.")) onStop();
+      }}
+      disabled={stopping}
+      className="pixel-btn shrink-0 px-2 py-0.5 text-xs font-bold tracking-wider hover:text-terracotta disabled:cursor-wait"
+      title={stopping ? "Stopping: the run is cleaning up" : "Stop the run"}
+    >
+      {stopping ? "STOPPING…" : "■ STOP"}
+    </button>
+  );
+}
+
+export default function TopBar({ runId, scene, issue, live, status, loading = false, stopping = false, onStop }: {
   runId: string;
   scene: SceneState;
   issue: string;
@@ -49,9 +66,12 @@ export default function TopBar({ runId, scene, issue, live, status, loading = fa
   status: RunStatus | null;
   // the events are still loading: the numbers aren't known yet
   loading?: boolean;
+  // a stop was asked for; onStop asks for one (shown while the run is going)
+  stopping?: boolean;
+  onStop?: () => void;
 }) {
   const phaseColor =
-    scene.outcome === "success" ? "bg-moss text-paper" : scene.outcome === "failure" ? "bg-terracotta text-paper" : "bg-mustard text-ink";
+    scene.outcome === "success" ? "bg-moss text-on" : scene.outcome === "failure" ? "bg-terracotta text-on" : "bg-mustard text-ink";
   const text = (issue || scene.issue).trim();
   const oneLine = text.replace(/\s+/g, " ");
   return (
@@ -65,7 +85,8 @@ export default function TopBar({ runId, scene, issue, live, status, loading = fa
             {oneLine}
           </p>
         )}
-        <span className="ml-auto shrink-0">
+        <span className="ml-auto flex shrink-0 items-center gap-2">
+          {status === "running" && onStop && <StopButton stopping={stopping} onStop={onStop} />}
           <StatusBadge live={live} status={status} />
         </span>
       </div>

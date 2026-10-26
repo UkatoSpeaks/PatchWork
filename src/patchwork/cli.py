@@ -4,6 +4,7 @@
 ``patchwork replay runs/<run_id>/events.jsonl``
 ``patchwork usage [--days N]``
 ``patchwork serve [--port 8000] [--runs-dir runs]``
+``patchwork stop [RUN_ID]``
 
 All output is rendered from run events (see ``render.py``); every run is
 also logged to ``runs/<run_id>/events.jsonl`` and ``runs/<run_id>/result.json``.
@@ -15,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Annotated
 
@@ -26,13 +29,47 @@ from patchwork.events import EventBus, JsonlWriter, read_events
 from patchwork.llm import LLMClient
 from patchwork.orchestrator import CREW, Orchestrator
 from patchwork.render import CliRenderer
-from patchwork.runlock import RunLocked, run_lock
+from patchwork.runlock import LOCK_NAME, RunLocked, pid_alive, read_lock, request_stop, run_lock, stop_requested
+from patchwork.schemas import RunResult
 from patchwork.usage import UsageStore, format_day
 
 app = typer.Typer(help="Patchwork: a multi-agent coding system.", add_completion=False, no_args_is_help=True)
 
 RUNS_DIR = Path("runs")
 RUN_ID_PATTERN = re.compile(r"[\w.-]+")
+# How often a run checks for runs/<run_id>/stop.json.
+STOP_POLL_S = 0.5
+
+
+async def run_stoppable(orchestrator: Orchestrator, issue: str, solo: bool, runs_dir: Path, run_id: str) -> RunResult:
+    """Run the orchestrator, stopping it cleanly when runs/<run_id>/stop.json
+    appears (the dashboard or `patchwork stop`), on SIGTERM, or on the first
+    Ctrl+C. A second Ctrl+C interrupts at once, as usual."""
+    loop = asyncio.get_running_loop()
+
+    def on_signal(signum: int, _frame: object) -> None:
+        signal.signal(signal.SIGINT, signal.default_int_handler)  # the next Ctrl+C is the hard stop
+        why = "Ctrl+C" if signum == signal.SIGINT else "terminated"
+        loop.call_soon_threadsafe(orchestrator.stop, why)
+
+    async def watch() -> None:
+        while True:
+            await asyncio.sleep(STOP_POLL_S)
+            if stop_requested(runs_dir, run_id) and orchestrator.stop("stop requested"):
+                return
+
+    # Signal handlers can only be set from the main thread.
+    signals = (signal.SIGINT, signal.SIGTERM) if threading.current_thread() is threading.main_thread() else ()
+    previous = {s: signal.getsignal(s) for s in signals}
+    for signum in previous:
+        signal.signal(signum, on_signal)
+    watcher = asyncio.create_task(watch())
+    try:
+        return await (orchestrator.run_solo(issue) if solo else orchestrator.run(issue))
+    finally:
+        watcher.cancel()
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 @app.callback()
@@ -119,12 +156,34 @@ def run(
                 repo=repo, settings=settings, llm=llm, bus=bus, test_command=test_cmd,
                 init_git=init_git, sequential=sequential, max_retries=max_retries,
             )
-            result = asyncio.run(orchestrator.run_solo(issue) if solo else orchestrator.run(issue))
+            result = asyncio.run(run_stoppable(orchestrator, issue, solo, runs_dir, bus.run_id))
     except RunLocked as exc:
         typer.secho(str(exc), fg="red", err=True)
         raise typer.Exit(2) from None
+    except KeyboardInterrupt:  # a second Ctrl+C while stopping
+        typer.secho("\nInterrupted.", fg="red", err=True)
+        raise typer.Exit(130) from None
     typer.secho(f"\nEvent log: {writer.events_path}  (replay: patchwork replay {writer.events_path})", dim=True)
     raise typer.Exit(0 if result.success else 1)
+
+
+@app.command()
+def stop(
+    run_id: Annotated[str | None, typer.Argument(help="The run to stop (default: the one going now).")] = None,
+    runs_dir: Annotated[Path, typer.Option(file_okay=False, help="Directory holding the runs and the run lock.")] = RUNS_DIR,
+) -> None:
+    """Ask a running run to stop. It cleans up and keeps its branches with commits."""
+    holder = read_lock(runs_dir / LOCK_NAME) or {}
+    pid = holder.get("pid")
+    current = str(holder.get("run_id") or "") if isinstance(pid, int) and pid_alive(pid) else ""
+    if not current:
+        typer.secho("No run is going.", fg="yellow", err=True)
+        raise typer.Exit(1)
+    if run_id is not None and run_id != current:
+        typer.secho(f"Run {run_id} isn't running (the run going now is {current}).", fg="yellow", err=True)
+        raise typer.Exit(1)
+    request_stop(runs_dir, current, by="cli")
+    typer.echo(f"Asked run {current} to stop; it stops within a few seconds.")
 
 
 @app.command()

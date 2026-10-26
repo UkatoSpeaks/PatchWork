@@ -6,14 +6,14 @@ export const TONE_TEXT: Record<Tone, string> = {
   neutral: "",
   good: "text-moss",
   bad: "text-terracotta",
-  wait: "text-[#8b6f55]",
+  wait: "text-wait",
 };
 
 export const TONE_PILL: Record<Tone, string> = {
   neutral: "bg-cream-dark text-ink",
-  good: "bg-moss text-paper",
-  bad: "bg-terracotta text-paper",
-  wait: "bg-mustard text-ink",
+  good: "bg-moss text-on",
+  bad: "bg-terracotta text-on",
+  wait: "bg-mustard text-onlight",
 };
 
 const TONE_EDGE: Record<Tone, string> = {
@@ -24,9 +24,9 @@ const TONE_EDGE: Record<Tone, string> = {
 };
 
 const CODE_STYLE = {
-  del: { box: "bg-[#fbe4dd]", gutter: "text-terracotta/70", sign: "−" },
-  add: { box: "bg-[#e6f4e1]", gutter: "text-moss/80", sign: "+" },
-  plain: { box: "bg-charcoal text-cream", gutter: "text-cream/40", sign: "" },
+  del: { box: "bg-del", gutter: "text-terracotta/70", sign: "−" },
+  add: { box: "bg-add", gutter: "text-moss/80", sign: "+" },
+  plain: { box: "bg-term text-term-text", gutter: "text-term-text/40", sign: "" },
 } as const;
 
 function Heading({ children }: { children: React.ReactNode }) {
