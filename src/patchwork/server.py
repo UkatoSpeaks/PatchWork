@@ -176,6 +176,8 @@ def summarize(
         "mode": mode,
         "sequential": sequential,
         "issue": issue.strip().splitlines()[0] if issue.strip() else "",
+        "repo": str(info.get("repo") or ""),
+        "retries": int(result.get("retries") or 0) if result else None,
         "success": result.get("success") if result else None,
         "finished": finished,
         "status": "finished" if finished else "running" if alive else "stopped",

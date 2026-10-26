@@ -40,6 +40,10 @@ export interface RunSummary {
   mode: "crew" | "solo";
   sequential: boolean;
   issue: string;
+  // the repo folder the run worked on ("" in old logs)
+  repo: string;
+  // coder retries (null while a run has no result)
+  retries: number | null;
   success: boolean | null;
   finished: boolean;
   // finished: has a result; running: its process is alive; stopped: it crashed or was killed

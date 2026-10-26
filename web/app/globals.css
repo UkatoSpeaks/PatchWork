@@ -88,6 +88,10 @@ body {
   cursor: not-allowed;
 }
 
+.pixel-btn:disabled:not(.start-btn) {
+  opacity: 0.45;
+}
+
 .pixel-btn:hover:not(:disabled) {
   background: #fff6dc;
 }

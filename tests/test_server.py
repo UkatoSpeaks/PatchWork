@@ -62,6 +62,8 @@ def test_list_runs_newest_first_skipping_empty(client: TestClient) -> None:
     live, done = runs
     assert done["mode"] == "crew" and done["sequential"] is False
     assert done["issue"] == "Add a median() function."
+    assert done["repo"] == "C:/tmp/stats" and done["retries"] == 1
+    assert live["retries"] is None
     assert done["success"] is True and done["finished"] is True
     assert done["total_tokens"] == 12990
     assert done["duration_s"] == 32.2
