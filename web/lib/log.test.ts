@@ -52,18 +52,24 @@ describe("ActivityLog", () => {
   function render(props: Partial<Parameters<typeof ActivityLog>[0]> = {}) {
     container = document.createElement("div");
     document.body.appendChild(container);
-    const onSeek = vi.fn();
+    const onOpen = vi.fn();
     const onFilter = vi.fn();
     const root = createRoot(container);
-    act(() => root.render(createElement(ActivityLog, { entries: logEntries(events), index: 20, filter: "all", onFilter, onSeek, ...props })));
-    return { onSeek, onFilter, root };
+    act(() => root.render(createElement(ActivityLog, { entries: logEntries(events), index: 20, inspected: null, filter: "all", onFilter, onOpen, ...props })));
+    return { onOpen, onFilter, root };
   }
 
-  it("seeks the replay when a line is clicked", () => {
-    const { onSeek } = render();
+  it("opens an event's details when its line is clicked", () => {
+    const { onOpen } = render();
     const line = container.querySelector<HTMLButtonElement>('[data-index="30"] button')!;
     act(() => line.click());
-    expect(onSeek).toHaveBeenCalledWith(31);
+    expect(onOpen).toHaveBeenCalledWith(30);
+  });
+
+  it("marks the line open in the drawer", () => {
+    render({ inspected: 12 });
+    expect(container.querySelector('[data-index="12"] button')!.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector('[data-index="13"] button')!.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("shows only the chosen agent's lines and reports chip clicks", () => {

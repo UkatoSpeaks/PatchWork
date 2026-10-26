@@ -20,9 +20,11 @@ interface Props {
   onRestart: () => void;
   onSpeed: (speed: number) => void;
   onSeek: (index: number) => void;
+  // open the current event in the drawer
+  onInspect?: () => void;
 }
 
-export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek }: Props) {
+export default function ReplayControls({ playing, speed, index, total, current, phases, live, canGoLive, onGoLive, onPlayPause, onRestart, onSpeed, onSeek, onInspect }: Props) {
   return (
     <div className="pixel-box flex flex-col gap-4 bg-paper p-4">
       <div className="flex flex-wrap items-center gap-4">
@@ -57,7 +59,18 @@ export default function ReplayControls({ playing, speed, index, total, current, 
             </button>
           ))}
         </div>
-        <span className="ml-auto min-w-0 max-w-full truncate font-mono text-xs text-ink-soft">{current}</span>
+        {onInspect ? (
+          <button
+            type="button"
+            onClick={onInspect}
+            className="pixel-link ml-auto min-w-0 max-w-full truncate font-mono text-xs text-ink-soft underline decoration-dotted underline-offset-4 hover:text-terracotta"
+            title="Show this event's details"
+          >
+            {current} ›
+          </button>
+        ) : (
+          <span className="ml-auto min-w-0 max-w-full truncate font-mono text-xs text-ink-soft">{current}</span>
+        )}
       </div>
       <div className="flex items-start gap-4 px-1">
         <div className="flex min-w-0 flex-1 flex-col gap-3">

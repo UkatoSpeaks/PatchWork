@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 
-import { clockLabel, filterLog, seekTargetFor, type LogEntry, type LogFilter } from "@/lib/log";
+import { clockLabel, filterLog, type LogEntry, type LogFilter } from "@/lib/log";
 import { AGENT_COLORS } from "@/lib/office/sprites";
 import type { AgentName } from "@/lib/types";
 
@@ -23,13 +23,16 @@ interface Props {
   entries: LogEntry[];
   // events applied so far: entries[index - 1] is the current one
   index: number;
+  // the event open in the drawer
+  inspected: number | null;
   filter: LogFilter;
   onFilter: (filter: LogFilter) => void;
-  onSeek: (index: number) => void;
+  // open an event's details (and seek there)
+  onOpen: (index: number) => void;
 }
 
-/** Every event as a readable line. Future lines are dimmed; clicking one seeks there. */
-export default function ActivityLog({ entries, index, filter, onFilter, onSeek }: Props) {
+/** Every event as a readable line. Future lines are dimmed; clicking one opens its details and seeks there. */
+export default function ActivityLog({ entries, index, inspected, filter, onFilter, onOpen }: Props) {
   const listRef = useRef<HTMLOListElement>(null);
   const shown = useMemo(() => filterLog(entries, filter), [entries, filter]);
   const present = new Set(entries.map((e) => e.agent));
@@ -73,14 +76,16 @@ export default function ActivityLog({ entries, index, filter, onFilter, onSeek }
         {shown.map((entry) => {
           const past = entry.index < index;
           const current = entry.index === index - 1;
+          const open = entry.index === inspected;
           return (
             <li key={entry.index} data-index={entry.index}>
               <button
                 type="button"
-                onClick={() => onSeek(seekTargetFor(entry))}
+                onClick={() => onOpen(entry.index)}
                 aria-current={current ? "step" : undefined}
-                title={`Jump to event ${entry.index + 1}`}
-                className={`flex w-full min-w-0 items-baseline gap-2 border-l-4 px-2 py-1 text-left hover:bg-[#fff6dc] ${current ? "bg-[#fff1c7]" : ""} ${past ? "" : "opacity-45"}`}
+                aria-expanded={open}
+                title={`Details of event ${entry.index + 1}`}
+                className={`group flex w-full min-w-0 items-baseline gap-2 border-l-4 px-2 py-1 text-left hover:bg-[#fff6dc] ${current ? "bg-[#fff1c7]" : ""} ${open ? "outline-2 -outline-offset-2 outline-ink" : ""} ${past ? "" : "opacity-45"}`}
                 style={{ borderColor: AGENT_COLORS[entry.agent] }}
               >
                 <span className="w-9 shrink-0 tabular-nums text-ink-soft">{clockLabel(entry.at)}</span>
@@ -89,6 +94,7 @@ export default function ActivityLog({ entries, index, filter, onFilter, onSeek }
                   {ROLE[entry.agent] ?? entry.agent}
                 </span>
                 <span className={`min-w-0 flex-1 break-words ${TONE[entry.tone]}`}>{entry.text}</span>
+                <span aria-hidden className={`shrink-0 font-pixel text-ink-soft ${open ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100"}`}>›</span>
               </button>
             </li>
           );

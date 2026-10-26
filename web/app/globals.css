@@ -30,6 +30,11 @@ body {
   color: var(--color-ink);
 }
 
+/* Pixelify Sans draws "fi" as a ligature that reads like "A" ("Axed" for "fixed"). */
+html {
+  font-variant-ligatures: none;
+}
+
 body {
   font-family: var(--font-mono);
   /* faint checker so the cream doesn't look flat */
@@ -349,6 +354,37 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .live-dot {
+    animation: none;
+  }
+}
+
+/* --- event drawer and result banner ------------------------------------------- */
+.event-drawer {
+  box-shadow:
+    -4px 0 0 0 var(--ink),
+    -12px 0 0 0 var(--shade);
+  animation: drawer-in 180ms steps(4) both;
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(100%);
+  }
+}
+
+.result-banner {
+  animation: banner-in 240ms steps(4) both;
+}
+
+@keyframes banner-in {
+  from {
+    transform: translateY(8px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .event-drawer,
+  .result-banner {
     animation: none;
   }
 }

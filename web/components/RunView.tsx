@@ -4,16 +4,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { API_URL, fetchEvents, fetchRun, streamEvents } from "@/lib/api";
 import { fileRoles } from "@/lib/diff";
-import { logEntries, type LogFilter } from "@/lib/log";
+import { filterLog as filterEntries, logEntries, type LogFilter } from "@/lib/log";
 import { CREW, initialScene, isCrew, officeReducer, reduceEvents, type SceneState } from "@/lib/office/reducer";
+import { runOutcome } from "@/lib/outcome";
 import { agentStats, phaseDurations, phaseSegments } from "@/lib/stats";
 import type { CrewAgent, Plan, RunDetail, RunEvent, RunStatus } from "@/lib/types";
 
 import ActivityLog from "./ActivityLog";
 import AgentCard from "./AgentCard";
+import EventDrawer from "./EventDrawer";
 import InfoPanels, { type InfoTab } from "./InfoPanels";
 import OfficeCanvas, { type AgentLines } from "./OfficeCanvas";
 import ReplayControls, { SPEEDS } from "./ReplayControls";
+import ResultBanner from "./ResultBanner";
 import TopBar from "./TopBar";
 
 function describe(event: RunEvent | undefined): string {
@@ -55,6 +58,8 @@ export default function RunView({ id }: { id: string }) {
   const [tab, setTab] = useState<InfoTab>("plan");
   const [live, setLive] = useState(false);
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
+  // The event open in the drawer, if any.
+  const [inspect, setInspect] = useState<number | null>(null);
   const indexRef = useRef(0);
   const closeRef = useRef<(() => void) | null>(null);
   const panelsRef = useRef<HTMLElement>(null);
@@ -131,8 +136,11 @@ export default function RunView({ id }: { id: string }) {
         // ?tab=plan|diff|stats opens that panel.
         const tabParam = new URLSearchParams(window.location.search).get("tab");
         if (tabParam === "plan" || tabParam === "diff" || tabParam === "stats") setTab(tabParam);
-        // ?at=N opens the run paused after N events.
-        const at = Number(new URLSearchParams(window.location.search).get("at"));
+        // ?event=N opens event N's details, paused right after it; ?at=N opens the run paused after N events.
+        const eventParam = new URLSearchParams(window.location.search).get("event");
+        const opened = eventParam === null ? NaN : Number(eventParam);
+        const at = Number.isInteger(opened) && opened >= 0 && opened < loaded.length ? opened + 1 : Number(new URLSearchParams(window.location.search).get("at"));
+        if (Number.isInteger(opened) && opened >= 0 && opened < loaded.length) setInspect(opened);
         if (Number.isInteger(at) && at > 0) {
           const target = Math.min(at, loaded.length);
           indexRef.current = target;
@@ -215,14 +223,47 @@ export default function RunView({ id }: { id: string }) {
     setSelected(isCrew(filter) ? filter : null);
   };
 
+  /** Open an event in the drawer and show the office right after it. */
+  const openEvent = (i: number) => {
+    seek(i + 1, false);
+    setInspect(i);
+  };
+
+  // Keep ?event=N in the address bar in step with the drawer, so the link can be shared.
+  useEffect(() => {
+    if (!events) return;
+    const url = new URL(window.location.href);
+    if (inspect === null) url.searchParams.delete("event");
+    else url.searchParams.set("event", String(inspect));
+    if (url.href !== window.location.href) window.history.replaceState(window.history.state, "", url);
+  }, [inspect, events]);
+
+  const showDiff = () => {
+    setTab("diff");
+    panelsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
   const openPlan = () => {
     setTab("plan");
     panelsRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   };
 
-  // Keyboard: space plays / pauses, left / right step one event, 1-4 pick the speed, L goes live.
-  const keys = useRef({ playPause, seek, changeSpeed, goLive, index, canGoLive: false });
-  keys.current = { playPause, seek, changeSpeed, goLive, index, canGoLive: runStatus === "running" && !live };
+  const entries = useMemo(() => logEntries(events ?? []), [events]);
+  // Drawer neighbours: the previous / next event in the log as it's filtered now.
+  const neighbours = useMemo(() => {
+    if (inspect === null) return { prev: null, next: null };
+    const visible = filterEntries(entries, logFilter).map((e) => e.index);
+    return {
+      prev: visible.findLast((i) => i < inspect) ?? null,
+      next: visible.find((i) => i > inspect) ?? null,
+    };
+  }, [entries, logFilter, inspect]);
+
+  // Keyboard: space plays / pauses, left / right step one event (or through the drawer
+  // when it's open), 1-4 pick the speed, L goes live, Esc closes the drawer.
+  const keyState = { playPause, seek, changeSpeed, goLive, openEvent, index, inspect, neighbours, canGoLive: runStatus === "running" && !live };
+  const keys = useRef(keyState);
+  keys.current = keyState;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey || typing(event.target)) return;
@@ -230,6 +271,12 @@ export default function RunView({ id }: { id: string }) {
       if (event.key === " " && !(event.target instanceof HTMLButtonElement)) {
         event.preventDefault();
         k.playPause();
+      } else if (event.key === "Escape" && k.inspect !== null) {
+        setInspect(null);
+      } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && k.inspect !== null) {
+        event.preventDefault();
+        const to = event.key === "ArrowLeft" ? k.neighbours.prev : k.neighbours.next;
+        if (to !== null) k.openEvent(to);
       } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
         event.preventDefault();
         k.seek(k.index + (event.key === "ArrowLeft" ? -1 : 1), false);
@@ -243,12 +290,19 @@ export default function RunView({ id }: { id: string }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const entries = useMemo(() => logEntries(events ?? []), [events]);
   const phases = useMemo(() => phaseSegments(events ?? []), [events]);
   const stats = useMemo(() => agentStats(events ?? []), [events]);
   const durations = useMemo(() => phaseDurations(events ?? [], detail?.result ?? null), [events, detail]);
   const roleOf = useMemo(() => fileRoles(events ?? [], detail?.result ?? null), [events, detail]);
   const plan = planFrom(detail, events);
+  // The result: result.json, else the run_finished event (e.g. before result.json is read).
+  const finishedResult = useMemo(() => events?.findLast((e) => e.type === "run_finished")?.payload?.result ?? null, [events]);
+  const outcome = useMemo(
+    () => runOutcome(detail?.result ?? finishedResult, events ?? [], runStatus),
+    [detail, finishedResult, events, runStatus],
+  );
+  // Show it once the replay reaches the end of the run.
+  const showOutcome = outcome && (outcome.verdict === "stopped" ? index >= (events?.length ?? 0) : scene.outcome !== null);
 
   if (error && !events) {
     return (
@@ -289,6 +343,7 @@ export default function RunView({ id }: { id: string }) {
         onRestart={() => seek(0, true)}
         onSpeed={changeSpeed}
         onSeek={(n) => seek(n)}
+        onInspect={index > 0 ? () => openEvent(index - 1) : undefined}
       />
       {error && (
         <p className="flex flex-wrap items-center gap-3 font-pixel text-sm text-terracotta" role="alert">
@@ -298,6 +353,7 @@ export default function RunView({ id }: { id: string }) {
           </button>
         </p>
       )}
+      {showOutcome && <ResultBanner outcome={outcome} onOpenEvent={openEvent} onShowDiff={showDiff} />}
       <section aria-label="Agents" className="flex flex-wrap gap-8">
         {shown.map((name) => (
           <AgentCard
@@ -314,7 +370,7 @@ export default function RunView({ id }: { id: string }) {
         ))}
       </section>
       <div className="grid min-w-0 grid-cols-1 gap-8 lg:grid-cols-2 [&>*]:min-w-0">
-        <ActivityLog entries={entries} index={index} filter={logFilter} onFilter={filterLog} onSeek={(n) => seek(n, false)} />
+        <ActivityLog entries={entries} index={index} inspected={inspect} filter={logFilter} onFilter={filterLog} onOpen={openEvent} />
         <InfoPanels
           ref={panelsRef}
           tab={tab}
@@ -326,6 +382,16 @@ export default function RunView({ id }: { id: string }) {
           phases={durations}
         />
       </div>
+      {inspect !== null && events?.[inspect] && (
+        <EventDrawer
+          events={events}
+          index={inspect}
+          prev={neighbours.prev}
+          next={neighbours.next}
+          onOpen={openEvent}
+          onClose={() => setInspect(null)}
+        />
+      )}
     </div>
   );
 }
